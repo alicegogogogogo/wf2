@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "digital-resource-provenance"
+version = "0.1.0"
+description = "Backend baseline for a unified digital resource supply-chain and provenance platform"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "alicegogogogogo" }]
+dependencies = []
+
+[project.scripts]
+provenance-api = "provenance_api.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["provenance_api*"]
+
