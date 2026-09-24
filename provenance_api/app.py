@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
+from .cache import CacheError, CacheStore
 from .content import ContentError, ContentStore
 from .lifecycle import (
     BLOCKING_STATES,
@@ -90,6 +91,15 @@ policy_store = PolicyStore()
 #: Process-local notification records; cleared on restart like the rest.
 notification_store = NotificationStore()
 
+#: Process-local image layer cache; entries and counters never persisted.
+cache_store = CacheStore()
+
+
+def configure_cache_quota(quota: int) -> None:
+    """Set the cache byte quota (startup option ``--cache-quota``)."""
+
+    cache_store.set_quota(quota)
+
 
 def reset_state() -> None:
     """Clear every in-process store (test and tooling helper)."""
@@ -102,6 +112,7 @@ def reset_state() -> None:
     provenance_store.reset()
     policy_store.reset()
     notification_store.reset()
+    cache_store.reset()
 
 #: Listing defaults and bounds.
 DEFAULT_LIMIT = 50
@@ -2172,6 +2183,158 @@ def _handle_notifications(
     )
 
 
+def _handle_cache_layer_post(
+    environ: dict[str, Any], raw_digest: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    # An invalid path digest is rejected before the request body is read.
+    if _DIGEST_PATTERN.fullmatch(raw_digest) is None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Path digest must be a 64-character hexadecimal string.",
+        )
+    digest = raw_digest.lower()
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    content_type = str(environ.get("CONTENT_TYPE", ""))
+    if content_type.lower() != _OCTET_STREAM_CONTENT_TYPE:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Content-Type must be application/octet-stream.",
+        )
+
+    body, body_error = _read_declared_body(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+    assert body is not None
+
+    if hashlib.sha256(body).hexdigest() != digest:
+        return _error(
+            start_response,
+            "409 Conflict",
+            "digest_mismatch",
+            "Content digest does not match the path digest.",
+        )
+
+    try:
+        created, entries = cache_store.put(digest, body)
+    except CacheError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created" if created else "200 OK",
+        {"digest": digest, "size": len(body), "entries": entries},
+        trailing_newline=True,
+    )
+
+
+def _handle_cache_layer_get(
+    environ: dict[str, Any], raw_digest: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    if _DIGEST_PATTERN.fullmatch(raw_digest) is None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Path digest must be a 64-character hexadecimal string.",
+        )
+    digest = raw_digest.lower()
+
+    # Rejected before any lookup so counters never move on a bad request.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    data = cache_store.get(digest)
+    if data is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "cache_miss",
+            "No cached layer exists for the requested digest.",
+        )
+
+    # Cache hits return raw bytes only: no JSON wrapper, no trailing newline.
+    start_response(
+        "200 OK",
+        [
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", str(len(data))),
+        ],
+    )
+    return [data]
+
+
+def _handle_cache_layer(
+    method: str,
+    environ: dict[str, Any],
+    raw_digest: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_cache_layer_post(environ, raw_digest, start_response)
+    if method == "GET":
+        return _handle_cache_layer_get(environ, raw_digest, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
+def _handle_cache_status(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Read-only: reporting never changes entries, usage or counters.
+    status = cache_store.status()
+    return _json_response(
+        start_response,
+        "200 OK",
+        {
+            "entries": status.entries,
+            "used_bytes": status.used_bytes,
+            "quota": status.quota,
+            "hits": status.hits,
+            "misses": status.misses,
+        },
+        trailing_newline=True,
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -2182,6 +2345,14 @@ def application(
         if method == "GET" and path == "/health":
             # Kept byte-for-byte compatible with the documented baseline.
             return _json_response(start_response, "200 OK", {"status": "ok"})
+
+        if path == "/cache/status":
+            return _handle_cache_status(method, environ, start_response)
+
+        if path.startswith("/cache/layers/"):
+            return _handle_cache_layer(
+                method, environ, path[len("/cache/layers/"):], start_response
+            )
 
         if path == "/resources":
             if method == "GET":
