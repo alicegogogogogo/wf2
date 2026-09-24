@@ -16,6 +16,7 @@ def call(
     body: bytes | str | dict[str, object] | None = None,
     *,
     content_length: int | None = None,
+    query: str = "",
 ) -> tuple[str, list[tuple[str, str]], bytes]:
     if body is None:
         payload = b""
@@ -30,6 +31,7 @@ def call(
     environ: dict[str, object] = {
         "REQUEST_METHOD": method,
         "PATH_INFO": path,
+        "QUERY_STRING": query,
         "wsgi.input": io.BytesIO(payload),
         "CONTENT_LENGTH": length if content_length is None else str(content_length),
     }
@@ -44,9 +46,13 @@ def call(
 
 
 def call_json(
-    method: str, path: str, body: bytes | str | dict[str, object] | None = None
+    method: str,
+    path: str,
+    body: bytes | str | dict[str, object] | None = None,
+    *,
+    query: str = "",
 ) -> tuple[str, list[tuple[str, str]], dict[str, object]]:
-    status, headers, raw = call(method, path, body)
+    status, headers, raw = call(method, path, body, query=query)
     return status, headers, json.loads(raw.decode("utf-8"))
 
 
@@ -364,6 +370,210 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(status, "405 Method Not Allowed")
         self.assertEqual(body["error"], "method_not_allowed")
         self.assertIn(("Allow", "GET, POST"), headers)
+
+    # --- Filtering and pagination ------------------------------------------
+
+    def _create(self, name: str, category: str, digest: str) -> str:
+        status, _h, body = call_json(
+            "POST",
+            "/resources",
+            {"name": name, "category": category, "digest": digest},
+        )
+        self.assertEqual(status, "201 Created")
+        return str(body["id"])
+
+    def _seed_three(self) -> list[str]:
+        return [
+            self._create("alpha", "code", DIGEST_A),
+            self._create("beta", "Model", DIGEST_B),
+            self._create("gamma", "code", "c" * 64),
+        ]
+
+    def test_filter_by_category_ignores_case(self) -> None:
+        ids = self._seed_three()
+        status, _h, body = call_json("GET", "/resources", query="category=CODE")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(
+            [r["id"] for r in body["resources"]], [ids[0], ids[2]]
+        )
+        # Categories are still reported in their canonical lowercase form.
+        self.assertTrue(
+            all(r["category"] == "code" for r in body["resources"])
+        )
+        self.assertIsNone(body["next_cursor"])
+
+    def test_filter_by_name_is_exact(self) -> None:
+        ids = self._seed_three()
+        _s, _h, body = call_json("GET", "/resources", query="name=beta")
+        self.assertEqual([r["id"] for r in body["resources"]], [ids[1]])
+        # No partial, folded or trimmed matching.
+        for query in ["name=bet", "name=Beta", "name=%20beta%20"]:
+            _s, _h, body = call_json("GET", "/resources", query=query)
+            self.assertEqual(body["resources"], [], query)
+            self.assertIsNone(body["next_cursor"])
+
+    def test_filter_by_digest_accepts_mixed_case(self) -> None:
+        ids = self._seed_three()
+        mixed = "A" * 32 + "a" * 32
+        _s, _h, body = call_json("GET", "/resources", query=f"digest={mixed}")
+        self.assertEqual([r["id"] for r in body["resources"]], [ids[0]])
+
+    def test_filters_combine_with_and(self) -> None:
+        self._seed_three()
+        _s, _h, body = call_json(
+            "GET", "/resources", query="category=code&name=alpha"
+        )
+        self.assertEqual([r["name"] for r in body["resources"]], ["alpha"])
+        _s, _h, body = call_json(
+            "GET", "/resources", query="category=code&name=beta"
+        )
+        self.assertEqual(body["resources"], [])
+
+    def test_no_match_is_empty_page_not_error(self) -> None:
+        self._seed_three()
+        status, _h, body = call_json(
+            "GET", "/resources", query="category=dataset"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body, {"resources": [], "next_cursor": None})
+
+    def test_unfiltered_listing_keeps_original_shape(self) -> None:
+        self._seed_three()
+        _s, _h, raw = call("GET", "/resources")
+        body = json.loads(raw.decode("utf-8"))
+        self.assertEqual(list(body), ["resources"])
+        self.assertEqual(len(body["resources"]), 3)
+
+    def test_pagination_walks_all_pages_without_gaps_or_repeats(self) -> None:
+        ids = [self._create(f"r{i}", "code", f"{i:064x}") for i in range(5)]
+        seen: list[str] = []
+        query = "limit=2"
+        for _ in range(4):
+            status, _h, body = call_json("GET", "/resources", query=query)
+            self.assertEqual(status, "200 OK")
+            self.assertEqual(list(body), ["resources", "next_cursor"])
+            seen.extend(r["id"] for r in body["resources"])
+            cursor = body["next_cursor"]
+            if cursor is None:
+                break
+            self.assertIsInstance(cursor, str)
+            self.assertNotEqual(cursor, "")
+            query = f"limit=2&cursor={cursor}"
+        self.assertEqual(seen, ids)
+
+    def test_filtered_pagination_keeps_creation_order(self) -> None:
+        ids = [
+            self._create("keep-1", "code", DIGEST_A),
+            self._create("skip", "model", DIGEST_B),
+            self._create("keep-2", "code", "c" * 64),
+            self._create("keep-3", "code", "d" * 64),
+        ]
+        _s, _h, first = call_json(
+            "GET", "/resources", query="category=code&limit=2"
+        )
+        self.assertEqual(
+            [r["id"] for r in first["resources"]], [ids[0], ids[2]]
+        )
+        cursor = first["next_cursor"]
+        self.assertIsNotNone(cursor)
+        _s, _h, second = call_json(
+            "GET", "/resources", query=f"category=code&limit=2&cursor={cursor}"
+        )
+        self.assertEqual([r["id"] for r in second["resources"]], [ids[3]])
+        self.assertIsNone(second["next_cursor"])
+
+    def test_default_limit_is_fifty(self) -> None:
+        for i in range(55):
+            self._create(f"r{i}", "code", f"{i:064x}")
+        _s, _h, body = call_json("GET", "/resources", query="category=code")
+        self.assertEqual(len(body["resources"]), 50)
+        self.assertIsNotNone(body["next_cursor"])
+
+    def test_limit_validation(self) -> None:
+        for query in [
+            "limit=",
+            "limit=0",
+            "limit=-1",
+            "limit=1.5",
+            "limit=abc",
+            "limit=+5",
+            "limit=101",
+            "limit=1000",
+        ]:
+            with self.subTest(query=query):
+                status, _h, body = call_json("GET", "/resources", query=query)
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+        status, _h, body = call_json("GET", "/resources", query="limit=100")
+        self.assertEqual(status, "200 OK")
+
+    def test_unknown_and_duplicate_parameters_rejected(self) -> None:
+        for query in ["page=1", "limit=2&limit=3", "category=code&category=code"]:
+            with self.subTest(query=query):
+                status, _h, body = call_json("GET", "/resources", query=query)
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+    def test_empty_and_invalid_filters_rejected(self) -> None:
+        for query in [
+            "category=",
+            "category=image",
+            "name=",
+            "digest=",
+            "digest=" + "z" * 64,
+            "digest=" + "a" * 63,
+        ]:
+            with self.subTest(query=query):
+                status, _h, body = call_json("GET", "/resources", query=query)
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+    def test_forged_or_corrupt_cursor_rejected(self) -> None:
+        self._seed_three()
+        _s, _h, page = call_json("GET", "/resources", query="limit=2")
+        cursor = str(page["next_cursor"])
+        for bad in [
+            "not-a-cursor",
+            cursor[:-1] + ("a" if cursor[-1] != "a" else "b"),
+            cursor.split(".")[0] + "." + "0" * 64,
+            "",
+        ]:
+            with self.subTest(bad=bad):
+                status, _h, body = call_json(
+                    "GET", "/resources", query=f"cursor={bad}"
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+    def test_cursor_with_mismatched_conditions_rejected(self) -> None:
+        self._seed_three()
+        _s, _h, page = call_json(
+            "GET", "/resources", query="category=code&limit=2"
+        )
+        cursor = str(page["next_cursor"])
+        for query in [
+            f"category=model&limit=2&cursor={cursor}",
+            f"limit=2&cursor={cursor}",
+            f"category=code&limit=3&cursor={cursor}",
+        ]:
+            with self.subTest(query=query):
+                status, _h, body = call_json("GET", "/resources", query=query)
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+    def test_failed_list_request_does_not_change_resources(self) -> None:
+        ids = self._seed_three()
+        call_json("GET", "/resources", query="limit=0")
+        call_json("GET", "/resources", query="category=nope")
+        call_json("GET", "/resources", query="cursor=forged")
+        _s, _h, body = call_json("GET", "/resources")
+        self.assertEqual([r["id"] for r in body["resources"]], ids)
+
+    def test_list_response_is_compact_with_trailing_newline(self) -> None:
+        self._seed_three()
+        _s, _h, raw = call("GET", "/resources", query="limit=2")
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertNotIn(b" ", raw[:-1])
 
 
 if __name__ == "__main__":

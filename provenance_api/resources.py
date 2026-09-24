@@ -43,6 +43,26 @@ class Resource:
         }
 
 
+def normalize_category(value: object) -> str | None:
+    """Return the canonical lowercase category, or ``None`` if invalid."""
+
+    if not isinstance(value, str):
+        return None
+    candidate = value.lower()
+    if candidate not in _CATEGORY_VALUES:
+        return None
+    return candidate
+
+
+def normalize_digest(value: object) -> str | None:
+    """Return the canonical lowercase digest, or ``None`` if malformed."""
+
+    if not isinstance(value, str) or _DIGEST_PATTERN.fullmatch(value) is None:
+        return None
+    # Hexadecimal digests are case-insensitive; compare them canonically.
+    return value.lower()
+
+
 def _require_non_empty_string(value: object, label: str) -> str:
     if not isinstance(value, str):
         raise ResourceValidationError(f"{label} must be a string.")
