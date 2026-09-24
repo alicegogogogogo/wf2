@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import unittest
@@ -15,7 +16,9 @@ def call(
     path: str,
     body: bytes | str | dict[str, object] | None = None,
     *,
-    content_length: int | None = None,
+    content_length: int | str | None = None,
+    content_type: str | None = None,
+    omit_content_length: bool = False,
     query_string: str | None = None,
 ) -> tuple[str, list[tuple[str, str]], bytes]:
     if body is None:
@@ -32,8 +35,13 @@ def call(
         "REQUEST_METHOD": method,
         "PATH_INFO": path,
         "wsgi.input": io.BytesIO(payload),
-        "CONTENT_LENGTH": length if content_length is None else str(content_length),
     }
+    if not omit_content_length:
+        environ["CONTENT_LENGTH"] = (
+            length if content_length is None else str(content_length)
+        )
+    if content_type is not None:
+        environ["CONTENT_TYPE"] = content_type
     if query_string is not None:
         environ["QUERY_STRING"] = query_string
     captured: dict[str, object] = {}
@@ -52,9 +60,10 @@ def call_json(
     body: bytes | str | dict[str, object] | None = None,
     *,
     query_string: str | None = None,
+    **kwargs: object,
 ) -> tuple[str, list[tuple[str, str]], dict[str, object]]:
     status, headers, raw = call(
-        method, path, body, query_string=query_string
+        method, path, body, query_string=query_string, **kwargs
     )
     return status, headers, json.loads(raw.decode("utf-8"))
 
@@ -1029,6 +1038,283 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual(deps["dependencies"], [b])
         _s, _h, impact = call_json("GET", f"/resources/{b}/impact")
         self.assertEqual(impact["resources"], [a])
+
+
+class VerifyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        store.reset()
+
+    def _create(self, digest: str) -> str:
+        _s, _h, body = call_json(
+            "POST",
+            "/resources",
+            {"name": "r", "category": "code", "digest": digest},
+        )
+        return str(body["id"])
+
+    def _verify(
+        self,
+        resource_id: str,
+        body: bytes | None = b"",
+        **kwargs: object,
+    ) -> tuple[str, list[tuple[str, str]], bytes]:
+        kwargs.setdefault("content_type", "application/octet-stream")
+        return call("POST", f"/resources/{resource_id}/verify", body, **kwargs)
+
+    # --- Success paths -----------------------------------------------------
+
+    def test_matching_content_is_valid(self) -> None:
+        content = b"hello provenance"
+        resource_id = self._create(hashlib.sha256(content).hexdigest())
+        status, headers, raw = self._verify(resource_id, content)
+
+        self.assertEqual(status, "200 OK")
+        self.assertIn(
+            ("Content-Type", "application/json; charset=utf-8"), headers
+        )
+        self.assertTrue(raw.endswith(b"\n"))
+        body = json.loads(raw.decode("utf-8"))
+        self.assertEqual(body["id"], resource_id)
+        self.assertEqual(body["digest"], hashlib.sha256(content).hexdigest())
+        self.assertIs(body["valid"], True)
+
+    def test_response_key_order_and_compactness(self) -> None:
+        content = b"abc"
+        resource_id = self._create(hashlib.sha256(content).hexdigest())
+        _s, _h, raw = self._verify(resource_id, content)
+        text = raw.decode("utf-8").rstrip("\n")
+        self.assertLess(text.index('"id"'), text.index('"digest"'))
+        self.assertLess(text.index('"digest"'), text.index('"valid"'))
+        self.assertNotIn(" ", text)
+
+    def test_mismatched_content_is_invalid_but_ok(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, _headers, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/verify",
+            b"some other bytes",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["id"], resource_id)
+        self.assertEqual(
+            body["digest"], hashlib.sha256(b"some other bytes").hexdigest()
+        )
+        self.assertIs(body["valid"], False)
+
+    def test_empty_body_is_verified_not_rejected(self) -> None:
+        empty_digest = hashlib.sha256(b"").hexdigest()
+        resource_id = self._create(empty_digest)
+        status, _headers, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/verify",
+            b"",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["digest"], empty_digest)
+        self.assertIs(body["valid"], True)
+
+    def test_empty_body_against_nonempty_digest_is_invalid(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, _headers, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/verify",
+            b"",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertIs(body["valid"], False)
+
+    def test_binary_content_round_trips(self) -> None:
+        content = bytes(range(256)) * 3
+        resource_id = self._create(hashlib.sha256(content).hexdigest())
+        status, _headers, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/verify",
+            content,
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertIs(body["valid"], True)
+
+    # --- Not found ---------------------------------------------------------
+
+    def test_unknown_id_is_not_found(self) -> None:
+        status, _headers, body = call_json(
+            "POST",
+            "/resources/missing/verify",
+            b"data",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "resource_not_found")
+
+    # --- Bad requests ------------------------------------------------------
+
+    def test_invalid_path_id_is_bad_request(self) -> None:
+        for path in ("/resources//verify", "/resources/a/b/verify"):
+            with self.subTest(path=path):
+                status, _headers, body = call_json(
+                    "POST",
+                    path,
+                    b"data",
+                    content_type="application/octet-stream",
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+    def test_backslash_id_is_bad_request(self) -> None:
+        status, _headers, body = call_json(
+            "POST",
+            "/resources/a\\b/verify",
+            b"data",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_any_query_parameter_is_bad_request(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, _headers, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/verify",
+            b"data",
+            content_type="application/octet-stream",
+            query_string="anything=1",
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_wrong_or_missing_content_type_is_bad_request(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        for content_type in (
+            "application/json",
+            "text/plain",
+            "application/octet-stream; charset=binary",
+        ):
+            with self.subTest(content_type=content_type):
+                status, _headers, body = call_json(
+                    "POST",
+                    f"/resources/{resource_id}/verify",
+                    b"data",
+                    content_type=content_type,
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+        status, _headers, body = call_json(
+            "POST", f"/resources/{resource_id}/verify", b"data"
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_content_type_is_case_insensitive(self) -> None:
+        content = b"case"
+        resource_id = self._create(hashlib.sha256(content).hexdigest())
+        status, _headers, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/verify",
+            content,
+            content_type="Application/Octet-Stream",
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertIs(body["valid"], True)
+
+    def test_missing_content_length_is_bad_request(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, _headers, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/verify",
+            b"data",
+            content_type="application/octet-stream",
+            omit_content_length=True,
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_malformed_content_length_is_bad_request(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        for bad in ("", "abc", "-1", "1.5", " 2"):
+            with self.subTest(content_length=bad):
+                status, _headers, body = call_json(
+                    "POST",
+                    f"/resources/{resource_id}/verify",
+                    b"data",
+                    content_type="application/octet-stream",
+                    content_length=bad,
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+    def test_incomplete_body_is_bad_request(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        # Declares 10 bytes but only 4 are provided.
+        status, _headers, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/verify",
+            b"data",
+            content_type="application/octet-stream",
+            content_length=10,
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+
+    # --- Method handling ---------------------------------------------------
+
+    def test_unsupported_methods_return_405_with_allow_post(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        for method in ("GET", "PUT", "DELETE", "PATCH"):
+            with self.subTest(method=method):
+                status, headers, body = call_json(
+                    method, f"/resources/{resource_id}/verify"
+                )
+                self.assertEqual(status, "405 Method Not Allowed")
+                self.assertEqual(body["error"], "method_not_allowed")
+                self.assertIn(("Allow", "POST"), headers)
+
+    # --- State isolation ---------------------------------------------------
+
+    def test_failed_requests_change_nothing(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        other_id = self._create(DIGEST_B)
+        call_json(
+            "POST",
+            f"/resources/{resource_id}/dependencies",
+            {"dependency_id": other_id},
+        )
+
+        # A spread of rejected verify requests.
+        self._verify(resource_id, b"data", query_string="x=1")
+        self._verify(resource_id, b"data", content_type="text/plain")
+        self._verify(resource_id, b"data", omit_content_length=True)
+        self._verify(resource_id, b"data", content_length=99)
+        self._verify("missing", b"data")
+        call_json("GET", f"/resources/{resource_id}/verify")
+
+        _s, _h, listing = call_json("GET", "/resources")
+        self.assertEqual(len(listing["resources"]), 2)
+        _s, _h, deps = call_json(
+            "GET", f"/resources/{resource_id}/dependencies"
+        )
+        self.assertEqual(deps["dependencies"], [other_id])
+        # A cursor issued before the failures still works afterwards.
+        _s, _h, first = call_json("GET", "/resources", query_string="limit=1")
+        _s, _h, second = call_json(
+            "GET",
+            "/resources",
+            query_string="limit=1&cursor=" + first["next_cursor"],
+        )
+        self.assertEqual(len(second["resources"]), 1)
+
+    def test_successful_verify_changes_nothing(self) -> None:
+        content = b"immutable"
+        resource_id = self._create(hashlib.sha256(content).hexdigest())
+        self._verify(resource_id, content)
+        _s, _h, fetched = call_json("GET", f"/resources/{resource_id}")
+        self.assertEqual(fetched["digest"], hashlib.sha256(content).hexdigest())
+        _s, _h, listing = call_json("GET", "/resources")
+        self.assertEqual(len(listing["resources"]), 1)
 
 
 if __name__ == "__main__":

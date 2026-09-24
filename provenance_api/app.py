@@ -32,6 +32,8 @@ _LIST_PARAMS = frozenset({"category", "name", "digest", "limit", "cursor"})
 _CATEGORY_VALUES = frozenset(CATEGORIES)
 _DIGEST_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 _POSITIVE_INT_PATTERN = re.compile(r"[1-9][0-9]*")
+_NON_NEGATIVE_INT_PATTERN = re.compile(r"0|[1-9][0-9]*")
+_OCTET_STREAM_CONTENT_TYPE = "application/octet-stream"
 
 #: Random per-process key so cursors cannot be forged and never survive a
 #: restart; nothing here is persisted to disk.
@@ -591,6 +593,91 @@ def _handle_impact(
     )
 
 
+def _read_declared_body(environ: dict[str, Any]) -> tuple[bytes | None, str | None]:
+    """Read exactly the declared request body for content verification.
+
+    Returns ``(body, None)`` on success or ``(None, message)`` when the
+    ``Content-Length`` header is missing or malformed, the stream cannot be
+    read, or fewer bytes than declared are available. An explicitly declared
+    length of zero is a valid empty body, not a missing one.
+    """
+
+    raw_length = environ.get("CONTENT_LENGTH")
+    if not isinstance(raw_length, str):
+        return None, "Content-Length header is required."
+    if _NON_NEGATIVE_INT_PATTERN.fullmatch(raw_length) is None:
+        return None, "Content-Length header must be a non-negative integer."
+    length = int(raw_length)
+
+    try:
+        body = environ["wsgi.input"].read(length)
+    except Exception:
+        return None, "Request body could not be read."
+    if not isinstance(body, (bytes, bytearray)) or len(body) != length:
+        return None, "Request body is incomplete."
+    return bytes(body), None
+
+
+def _handle_verify(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    content_type = str(environ.get("CONTENT_TYPE", ""))
+    if content_type.lower() != _OCTET_STREAM_CONTENT_TYPE:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Content-Type must be application/octet-stream.",
+        )
+
+    body, body_error = _read_declared_body(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+    assert body is not None
+
+    resource = store.get(raw_id)
+    if resource is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    digest = hashlib.sha256(body).hexdigest()
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"id": resource.id, "digest": digest, "valid": digest == resource.digest},
+        trailing_newline=True,
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -625,6 +712,16 @@ def application(
             if separator and tail == "impact":
                 return _handle_impact(
                     method, environ, head, start_response
+                )
+            if separator and tail == "verify":
+                return _handle_verify(
+                    method, environ, head, start_response
+                )
+            if separator and suffix.endswith("/verify"):
+                # The id segment itself contained a path separator; let the
+                # verify handler reject it without reading business data.
+                return _handle_verify(
+                    method, environ, suffix[: -len("/verify")], start_response
                 )
             # Any other suffix keeps the baseline item semantics (embedded
             # separators are rejected by the item handler).
