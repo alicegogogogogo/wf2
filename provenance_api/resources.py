@@ -6,6 +6,8 @@ import re
 import uuid
 from dataclasses import dataclass
 
+from .content import ContentStore
+
 #: The four resource categories exposed by the service.
 CATEGORIES: tuple[str, ...] = ("code", "model", "dataset", "artifact")
 _CATEGORY_VALUES = frozenset(CATEGORIES)
@@ -122,6 +124,8 @@ class ResourceStore:
         # resource id -> ids it directly depends on, and the reverse view.
         self._dependencies: dict[str, set[str]] = {}
         self._dependents: dict[str, set[str]] = {}
+        # Chunk sessions and finished content for this registry; memory only.
+        self.content = ContentStore()
 
     def reset(self) -> None:
         self._resources.clear()
@@ -130,6 +134,7 @@ class ResourceStore:
         self._key_to_id = {}
         self._dependencies = {}
         self._dependents = {}
+        self.content.reset()
 
     def list_all(self) -> list[Resource]:
         return list(self._resources)

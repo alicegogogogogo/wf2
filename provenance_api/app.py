@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
+from .content import ContentError, ContentStore
 from .resources import (
     CATEGORIES,
     DependencyError,
@@ -25,6 +26,10 @@ StartResponse = Callable[[str, list[tuple[str, str]]], Any]
 #: Process-local storage; records are not persisted across restarts.
 store = ResourceStore()
 
+#: Process-local chunk sessions and finished content; memory only. Composed
+#: into the registry so ``store.reset()`` clears both layers together.
+content_store = store.content
+
 #: Listing defaults and bounds.
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
@@ -34,6 +39,8 @@ _DIGEST_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 _POSITIVE_INT_PATTERN = re.compile(r"[1-9][0-9]*")
 _NON_NEGATIVE_INT_PATTERN = re.compile(r"0|[1-9][0-9]*")
 _OCTET_STREAM_CONTENT_TYPE = "application/octet-stream"
+_CHUNK_TOTAL_HEADER = "HTTP_X_CHUNK_TOTAL"
+_CONTENT_DIGEST_HEADER = "HTTP_X_CONTENT_DIGEST"
 
 #: Random per-process key so cursors cannot be forged and never survive a
 #: restart; nothing here is persisted to disk.
@@ -678,6 +685,241 @@ def _handle_verify(
     )
 
 
+def _handle_chunks(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_index: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "PUT":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="PUT",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # The index segment must be a non-negative decimal integer.
+    if _NON_NEGATIVE_INT_PATTERN.fullmatch(raw_index) is None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Chunk index must be a non-negative decimal integer.",
+        )
+    index = int(raw_index)
+
+    raw_total = environ.get(_CHUNK_TOTAL_HEADER)
+    if not isinstance(raw_total, str) or _POSITIVE_INT_PATTERN.fullmatch(raw_total) is None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "X-Chunk-Total header must be a positive decimal integer.",
+        )
+    total_chunks = int(raw_total)
+    if index >= total_chunks:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Chunk index must be smaller than the total chunk count.",
+        )
+
+    raw_digest = environ.get(_CONTENT_DIGEST_HEADER)
+    if (
+        not isinstance(raw_digest, str)
+        or _DIGEST_PATTERN.fullmatch(raw_digest) is None
+    ):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "X-Content-Digest header must be a 64-character hexadecimal string.",
+        )
+    digest = raw_digest.lower()
+
+    content_type = str(environ.get("CONTENT_TYPE", ""))
+    if content_type.lower() != _OCTET_STREAM_CONTENT_TYPE:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Content-Type must be application/octet-stream.",
+        )
+
+    body, body_error = _read_declared_body(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+    assert body is not None
+
+    resource = store.get(raw_id)
+    if resource is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Once finished, no upload may alter the bytes, regardless of any other
+    # well-formed metadata it carries.
+    if content_store.is_complete(raw_id):
+        return _error(
+            start_response,
+            "409 Conflict",
+            "content_already_complete",
+            "Content for this resource is already complete.",
+        )
+
+    # The declared target digest must agree with the registered digest before
+    # any bytes are stored; differing content is never written.
+    if digest != resource.digest:
+        return _error(
+            start_response,
+            "409 Conflict",
+            "digest_conflict",
+            "The declared digest does not match the registered digest.",
+        )
+
+    try:
+        created = content_store.put_chunk(
+            raw_id, index, total_chunks, digest, body
+        )
+    except ContentError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created" if created else "200 OK",
+        {
+            "id": resource.id,
+            "chunk_index": index,
+            "total_chunks": total_chunks,
+            "digest": digest,
+        },
+        trailing_newline=True,
+    )
+
+
+def _handle_assemble(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    try:
+        digest, size = content_store.assemble(raw_id)
+    except ContentError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created",
+        {"id": raw_id, "digest": digest, "size": size},
+        trailing_newline=True,
+    )
+
+
+def _handle_content(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    content = content_store.get_content(raw_id)
+    if content is None:
+        return _error(
+            start_response,
+            "409 Conflict",
+            "content_not_complete",
+            "Content for this resource is not complete yet.",
+        )
+
+    # A successful read returns raw bytes only: no JSON wrapper, no newline.
+    start_response(
+        "200 OK",
+        [
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", str(len(content))),
+        ],
+    )
+    return [content]
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -716,6 +958,44 @@ def application(
             if separator and tail == "verify":
                 return _handle_verify(
                     method, environ, head, start_response
+                )
+            if separator and tail == "assemble":
+                return _handle_assemble(
+                    method, environ, head, start_response
+                )
+            if separator and tail == "content":
+                return _handle_content(
+                    method, environ, head, start_response
+                )
+            if separator and tail.startswith("chunks/"):
+                # The handler validates the trailing index segment, including
+                # empty or separator-bearing values, as a bad request.
+                return _handle_chunks(
+                    method, environ, head, tail[len("chunks/") :], start_response
+                )
+            if separator and tail == "chunks":
+                # Missing chunk index: a malformed chunk entry point.
+                return _handle_chunks(
+                    method, environ, head, "", start_response
+                )
+            if separator and suffix.endswith("/assemble"):
+                # The id segment itself contained a path separator; let the
+                # handler reject it as a bad identifier.
+                return _handle_assemble(
+                    method, environ, suffix[: -len("/assemble")], start_response
+                )
+            if separator and suffix.endswith("/content"):
+                return _handle_content(
+                    method, environ, suffix[: -len("/content")], start_response
+                )
+            if separator and "/chunks/" in suffix:
+                embedded_id, embedded_index = suffix.rsplit("/chunks/", 1)
+                return _handle_chunks(
+                    method,
+                    environ,
+                    embedded_id,
+                    embedded_index,
+                    start_response,
                 )
             if separator and suffix.endswith("/verify"):
                 # The id segment itself contained a path separator; let the
