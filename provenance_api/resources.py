@@ -23,6 +23,18 @@ class ResourceValidationError(ValueError):
         self.message = message
 
 
+class DependencyError(ValueError):
+    """A dependency relation could not be established.
+
+    ``code`` is the stable, client-facing error code.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 @dataclass(frozen=True, slots=True)
 class Resource:
     """A single registered resource record."""
@@ -107,12 +119,17 @@ class ResourceStore:
         self._resources: list[Resource] = []
         self._by_id: dict[str, Resource] = {}
         self._key_to_id: dict[tuple[str, str, str], str] = {}
+        # resource id -> ids it directly depends on, and the reverse view.
+        self._dependencies: dict[str, set[str]] = {}
+        self._dependents: dict[str, set[str]] = {}
 
     def reset(self) -> None:
         self._resources.clear()
         self._resources = []
         self._by_id = {}
         self._key_to_id = {}
+        self._dependencies = {}
+        self._dependents = {}
 
     def list_all(self) -> list[Resource]:
         return list(self._resources)
@@ -173,4 +190,75 @@ class ResourceStore:
         self._resources.append(resource)
         self._by_id[resource.id] = resource
         self._key_to_id[key] = resource.id
+        self._dependencies[resource.id] = set()
+        self._dependents[resource.id] = set()
         return resource, None
+
+    # --- Dependencies ------------------------------------------------------
+
+    def _reachable(self, start: str, graph: dict[str, set[str]]) -> set[str]:
+        """Transitive closure of ``start`` through ``graph`` (start excluded)."""
+
+        seen: set[str] = set()
+        stack = list(graph.get(start, ()))
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            stack.extend(graph.get(node, ()))
+        return seen
+
+    def _registration_order(self, ids: set[str]) -> list[str]:
+        return [r.id for r in self._resources if r.id in ids]
+
+    def add_dependency(self, resource_id: str, dependency_id: str) -> None:
+        """Record that ``resource_id`` depends on ``dependency_id``.
+
+        Both resources must already be registered. Raises
+        :class:`DependencyError` with code ``duplicate_dependency`` when the
+        same-direction relation already exists, or ``dependency_cycle`` for a
+        self loop or a relation that would introduce a cycle; in either case
+        the graph is left unchanged.
+        """
+
+        if resource_id == dependency_id:
+            raise DependencyError(
+                "dependency_cycle", "A resource must not depend on itself."
+            )
+
+        existing = self._dependencies.get(resource_id, ())
+        if dependency_id in existing:
+            raise DependencyError(
+                "duplicate_dependency",
+                "This dependency relation already exists.",
+            )
+
+        # Adding resource_id -> dependency_id creates a cycle whenever
+        # dependency_id can already reach resource_id.
+        if resource_id in self._reachable(dependency_id, self._dependencies):
+            raise DependencyError(
+                "dependency_cycle",
+                "This dependency would introduce a cycle.",
+            )
+
+        self._dependencies[resource_id].add(dependency_id)
+        self._dependents[dependency_id].add(resource_id)
+
+    def list_dependencies(self, resource_id: str) -> list[str]:
+        """Return every reachable dependency id in registration order."""
+
+        return self._registration_order(
+            self._reachable(resource_id, self._dependencies)
+        )
+
+    def list_impact(self, resource_id: str) -> list[str]:
+        """Return ids that directly or transitively depend on ``resource_id``.
+
+        The start resource itself is excluded; results are in registration
+        order.
+        """
+
+        return self._registration_order(
+            self._reachable(resource_id, self._dependents)
+        )

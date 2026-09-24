@@ -12,7 +12,13 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
-from .resources import CATEGORIES, Resource, ResourceStore, ResourceValidationError
+from .resources import (
+    CATEGORIES,
+    DependencyError,
+    Resource,
+    ResourceStore,
+    ResourceValidationError,
+)
 
 StartResponse = Callable[[str, list[tuple[str, str]]], Any]
 
@@ -374,6 +380,217 @@ def _handle_resource_item(
     return _resource_response(start_response, "200 OK", resource)
 
 
+def _validate_path_id(raw_id: str) -> str | None:
+    """Return a stable error message for an invalid path id, else ``None``."""
+
+    if not raw_id:
+        return "Resource id must not be empty."
+    if "/" in raw_id or "\\" in raw_id:
+        return "Resource id must not contain path separators."
+    return None
+
+
+def _query_parameter_error(environ: dict[str, Any]) -> str | None:
+    """Reject any query parameter on endpoints that declare none."""
+
+    query_string = str(environ.get("QUERY_STRING", ""))
+    if parse_qsl(query_string, keep_blank_values=True):
+        return "This endpoint does not accept query parameters."
+    return None
+
+
+def _handle_dependencies_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    if not isinstance(payload, dict):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be a JSON object.",
+        )
+    unknown_fields = set(payload) - {"dependency_id"}
+    if unknown_fields:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            f"Unknown field: {sorted(unknown_fields)[0]!r}.",
+        )
+    if "dependency_id" not in payload:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Missing required field: 'dependency_id'.",
+        )
+    dependency_id = payload["dependency_id"]
+    if not isinstance(dependency_id, str) or not dependency_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Field 'dependency_id' must be a non-empty string.",
+        )
+    if "/" in dependency_id or "\\" in dependency_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Field 'dependency_id' must not contain path separators.",
+        )
+
+    # Both endpoints must already be registered; never auto-create.
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+    if store.get(dependency_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with dependency_id.",
+        )
+
+    try:
+        store.add_dependency(raw_id, dependency_id)
+    except DependencyError as exc:
+        return _error(
+            start_response,
+            "409 Conflict",
+            exc.code,
+            exc.message,
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created",
+        {"resource_id": raw_id, "dependency_id": dependency_id},
+        trailing_newline=True,
+    )
+
+
+def _handle_dependencies_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"dependencies": store.list_dependencies(raw_id)},
+        trailing_newline=True,
+    )
+
+
+def _handle_dependencies(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_dependencies_post(environ, raw_id, start_response)
+    if method == "GET":
+        return _handle_dependencies_get(environ, raw_id, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
+def _handle_impact(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"resources": store.list_impact(raw_id)},
+        trailing_newline=True,
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -399,8 +616,20 @@ def application(
             )
 
         if path.startswith("/resources/"):
+            suffix = path[len("/resources/"):]
+            head, separator, tail = suffix.partition("/")
+            if separator and tail == "dependencies":
+                return _handle_dependencies(
+                    method, environ, head, start_response
+                )
+            if separator and tail == "impact":
+                return _handle_impact(
+                    method, environ, head, start_response
+                )
+            # Any other suffix keeps the baseline item semantics (embedded
+            # separators are rejected by the item handler).
             return _handle_resource_item(
-                method, path[len("/resources/"):], start_response
+                method, suffix, start_response
             )
 
         # Unknown paths and undeclared methods on /health stay as before.
