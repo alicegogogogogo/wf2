@@ -40,6 +40,23 @@ class _Session:
     content: bytes = b""
 
 
+@dataclass(frozen=True, slots=True)
+class SessionStatus:
+    """Read-only snapshot of one resource's chunk upload session.
+
+    ``missing_chunks`` lists absent indices in ascending numeric order;
+    ``size`` is the finalized content length, or ``None`` until assembly
+    succeeds.
+    """
+
+    total: int
+    digest: str
+    received_chunks: int
+    missing_chunks: tuple[int, ...]
+    complete: bool
+    size: int | None
+
+
 class ContentStore:
     """In-process chunk sessions keyed by resource id."""
 
@@ -176,3 +193,30 @@ class ContentStore:
                 "Content for this resource is not complete.",
             )
         return session.content
+
+    def session_status(self, resource_id: str) -> SessionStatus | None:
+        """Return a read-only snapshot of the upload session, or ``None``.
+
+        ``None`` means no chunk has ever been accepted for this resource.
+        The snapshot never mutates session state: it creates no records and
+        leaves chunks, cursors, lifecycle, dependencies and bytes untouched.
+        A failed assembly leaves ``complete`` as ``False`` and ``size`` as
+        ``None`` while retaining every received chunk.
+        """
+
+        session = self._sessions.get(resource_id)
+        if session is None:
+            return None
+        missing = tuple(
+            index
+            for index in range(session.total)
+            if index not in session.chunks
+        )
+        return SessionStatus(
+            total=session.total,
+            digest=session.digest,
+            received_chunks=len(session.chunks),
+            missing_chunks=missing,
+            complete=session.complete,
+            size=len(session.content) if session.complete else None,
+        )

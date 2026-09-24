@@ -857,6 +857,66 @@ def _handle_chunk(
     )
 
 
+def _handle_chunks_status(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Read-only: no session is created when upload has not started.
+    status = content_store.session_status(raw_id)
+    if status is None:
+        return _error(
+            start_response,
+            "409 Conflict",
+            "chunks_not_started",
+            "No chunk upload has been started for this resource.",
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {
+            "id": raw_id,
+            "digest": status.digest,
+            "total_chunks": status.total,
+            "received_chunks": status.received_chunks,
+            "missing_chunks": list(status.missing_chunks),
+            "complete": status.complete,
+            "size": status.size,
+        },
+        trailing_newline=True,
+    )
+
+
 def _handle_assemble(
     method: str,
     environ: dict[str, Any],
@@ -1209,6 +1269,10 @@ def application(
                 return _handle_lifecycle(
                     method, environ, head, start_response
                 )
+            if separator and tail == "chunks/status":
+                return _handle_chunks_status(
+                    method, environ, head, start_response
+                )
             if separator and tail.startswith("chunks/"):
                 return _handle_chunk(
                     method, environ, head, tail[len("chunks/"):],
@@ -1225,6 +1289,15 @@ def application(
                 # verify handler reject it without reading business data.
                 return _handle_verify(
                     method, environ, suffix[: -len("/verify")], start_response
+                )
+            if separator and suffix.endswith("/chunks/status"):
+                # Fallback for a separator inside the id segment so the
+                # status handler rejects it without creating any state.
+                return _handle_chunks_status(
+                    method,
+                    environ,
+                    suffix[: -len("/chunks/status")],
+                    start_response,
                 )
             if separator and "/chunks/" in suffix:
                 # Same fallback for chunk paths with a separator in the id.

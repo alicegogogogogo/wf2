@@ -684,6 +684,211 @@ class ChunkFlowTests(unittest.TestCase):
         self.assertEqual(status, "409 Conflict")
         self.assertEqual(body["error"], "content_not_complete")
 
+    # --- Session status ----------------------------------------------------
+
+    def test_status_before_start_is_409_and_creates_nothing(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        self.assertNotIn(resource_id, content_store._sessions)
+        status, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "chunks_not_started")
+        # The query is read-only: it must not open a session.
+        self.assertNotIn(resource_id, content_store._sessions)
+
+    def test_status_in_progress_lists_missing_ascending(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/2",
+            b"c",
+            headers=chunk_headers(4, DIGEST_A),
+        )
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(4, DIGEST_A),
+        )
+        status, headers, raw = call(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertIn(
+            ("Content-Type", "application/json; charset=utf-8"), headers
+        )
+        self.assertTrue(raw.endswith(b"\n"))
+        body = json.loads(raw)
+        self.assertEqual(body["id"], resource_id)
+        self.assertEqual(body["digest"], DIGEST_A)
+        self.assertEqual(body["total_chunks"], 4)
+        self.assertEqual(body["received_chunks"], 2)
+        self.assertEqual(body["missing_chunks"], [1, 3])
+        self.assertIs(body["complete"], False)
+        self.assertIsNone(body["size"])
+        # Compact JSON and the documented fixed key order.
+        text = raw.decode("utf-8").rstrip("\n")
+        self.assertNotIn(" ", text)
+        order = [
+            "id",
+            "digest",
+            "total_chunks",
+            "received_chunks",
+            "missing_chunks",
+            "complete",
+            "size",
+        ]
+        positions = [text.index(f'"{key}"') for key in order]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_status_after_idempotent_repeat_counts_distinct_indices(
+        self,
+    ) -> None:
+        resource_id = self._create(DIGEST_A)
+        for _ in range(3):
+            call(
+                "POST",
+                f"/resources/{resource_id}/chunks/0",
+                b"a",
+                headers=chunk_headers(2, DIGEST_A),
+            )
+        _s, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(body["received_chunks"], 1)
+        self.assertEqual(body["missing_chunks"], [1])
+
+    def test_status_after_digest_mismatch_is_not_complete(self) -> None:
+        registered = hashlib.sha256(b"abc").hexdigest()
+        resource_id = self._create(registered)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"abd",
+            headers=chunk_headers(1, registered),
+        )
+        status, _h, body = call_json(
+            "POST", f"/resources/{resource_id}/assemble"
+        )
+        self.assertEqual(body["error"], "digest_mismatch")
+
+        status, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["digest"], registered)
+        self.assertEqual(body["total_chunks"], 1)
+        self.assertEqual(body["received_chunks"], 1)
+        self.assertEqual(body["missing_chunks"], [])
+        self.assertIs(body["complete"], False)
+        self.assertIsNone(body["size"])
+        # Chunks survive the failed assembly and no content is produced.
+        status, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/content"
+        )
+        self.assertEqual(body["error"], "content_not_complete")
+
+    def test_status_after_successful_assembly_reports_size(self) -> None:
+        resource_id, digest = self._chunks([b"ab", b"cd", b"ef"])
+        call("POST", f"/resources/{resource_id}/assemble")
+        status, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["id"], resource_id)
+        self.assertEqual(body["digest"], digest)
+        self.assertEqual(body["total_chunks"], 3)
+        self.assertEqual(body["received_chunks"], 3)
+        self.assertEqual(body["missing_chunks"], [])
+        self.assertIs(body["complete"], True)
+        self.assertEqual(body["size"], 6)
+
+    def test_status_empty_completed_content_reports_size_zero(self) -> None:
+        empty_digest = hashlib.sha256(b"").hexdigest()
+        resource_id = self._create(empty_digest)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"",
+            headers=chunk_headers(1, empty_digest),
+        )
+        call("POST", f"/resources/{resource_id}/assemble")
+        _s, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertIs(body["complete"], True)
+        self.assertEqual(body["size"], 0)
+
+    def test_status_is_read_only(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(2, DIGEST_A),
+        )
+        before = content_store.session_status(resource_id)
+        for _ in range(2):
+            status, _h, body = call_json(
+                "GET", f"/resources/{resource_id}/chunks/status"
+            )
+            self.assertEqual(status, "200 OK")
+            self.assertEqual(body["received_chunks"], 1)
+        after = content_store.session_status(resource_id)
+        self.assertEqual(after, before)
+        # The underlying chunk bytes are untouched.
+        status, _h, _b = call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(2, DIGEST_A),
+        )
+        self.assertEqual(status, "200 OK")
+
+    def test_status_resource_not_found(self) -> None:
+        status, _h, body = call_json(
+            "GET", "/resources/missing/chunks/status"
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "resource_not_found")
+
+    def test_status_invalid_requests(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        for path in (
+            "/resources//chunks/status",
+            "/resources/a/b/chunks/status",
+            "/resources/a\\b/chunks/status",
+        ):
+            with self.subTest(path=path):
+                status, _h, body = call_json("GET", path)
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+        status, _h, body = call_json(
+            "GET",
+            f"/resources/{resource_id}/chunks/status",
+            query_string="x=1",
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_status_non_get_methods_405_with_allow_get(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(1, DIGEST_A),
+        )
+        for method in ("POST", "PUT", "DELETE", "PATCH"):
+            with self.subTest(method=method):
+                status, headers, body = call_json(
+                    method, f"/resources/{resource_id}/chunks/status"
+                )
+                self.assertEqual(status, "405 Method Not Allowed")
+                self.assertEqual(body["error"], "method_not_allowed")
+                self.assertIn(("Allow", "GET"), headers)
+
     # --- Isolation ---------------------------------------------------------
 
     def test_sessions_are_isolated_per_resource(self) -> None:
