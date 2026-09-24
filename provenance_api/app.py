@@ -23,6 +23,13 @@ from .lifecycle import (
     LifecycleRecord,
     LifecycleStore,
 )
+from .mirrors import (
+    Mirror,
+    MirrorError,
+    MirrorStore,
+    MirrorValidationError,
+    pull_layer,
+)
 from .notifications import (
     NotificationStore,
     NotificationValidationError,
@@ -94,6 +101,9 @@ notification_store = NotificationStore()
 #: Process-local image layer cache; entries and counters never persisted.
 cache_store = LayerCacheStore()
 
+#: Process-local mirror registry; cleared on restart like everything else.
+mirror_store = MirrorStore()
+
 
 def reset_state() -> None:
     """Clear every in-process store (test and tooling helper)."""
@@ -107,6 +117,7 @@ def reset_state() -> None:
     policy_store.reset()
     notification_store.reset()
     cache_store.reset()
+    mirror_store.reset()
 
 #: Listing defaults and bounds.
 DEFAULT_LIMIT = 50
@@ -2320,6 +2331,206 @@ def _handle_cache_status(
     )
 
 
+def _mirror_response(
+    start_response: StartResponse, status: str, mirror: Mirror
+) -> Iterable[bytes]:
+    return _json_response(
+        start_response, status, mirror.to_dict(), trailing_newline=True
+    )
+
+
+def _handle_mirrors(
+    method: str, environ: dict[str, Any], start_response: StartResponse
+) -> Iterable[bytes]:
+    if method == "GET":
+        query_error = _query_parameter_error(environ)
+        if query_error is not None:
+            return _error(
+                start_response, "400 Bad Request", "invalid_request", query_error
+            )
+        return _json_response(
+            start_response,
+            "200 OK",
+            {"mirrors": [m.to_dict() for m in mirror_store.list_all()]},
+            trailing_newline=True,
+        )
+
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET, POST",
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    try:
+        created, existing = mirror_store.add(payload)
+    except MirrorValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if existing is not None:
+        # Names are globally unique; a repeat never overwrites the original.
+        return _error(
+            start_response,
+            "409 Conflict",
+            "duplicate_mirror",
+            "A mirror with the same name already exists.",
+        )
+
+    assert created is not None
+    return _mirror_response(start_response, "201 Created", created)
+
+
+def _handle_mirror_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    if not raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not be empty.",
+        )
+    if "/" in raw_id or "\\" in raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not contain path separators.",
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    mirror = mirror_store.get(raw_id)
+    if mirror is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_not_found",
+            "No mirror exists with the requested id.",
+        )
+
+    return _mirror_response(start_response, "200 OK", mirror)
+
+
+def _handle_mirror_pull(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_digest: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
+        )
+
+    if not raw_id or "/" in raw_id or "\\" in raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must be a non-empty value without path separators.",
+        )
+    if _DIGEST_PATTERN.fullmatch(raw_digest) is None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Layer digest must be a 64-character hexadecimal string.",
+        )
+    digest = raw_digest.lower()
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    mirror = mirror_store.get(raw_id)
+    if mirror is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_not_found",
+            "No mirror exists with the requested id.",
+        )
+
+    try:
+        data = pull_layer(cache_store, mirror, digest)
+    except MirrorError as exc:
+        if exc.code == "cache_quota_exceeded":
+            return _error(
+                start_response, "409 Conflict", exc.code, exc.message
+            )
+        # mirror_fetch_failed and mirror_digest_mismatch are upstream-side
+        # failures: both answer 502 and neither changes the cache.
+        return _error(
+            start_response, "502 Bad Gateway", exc.code, exc.message
+        )
+
+    # A pull returns the raw layer bytes with the same headers as a cache
+    # read, but never bumps the cache hit/miss counters.
+    start_response(
+        "200 OK",
+        [
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", str(len(data))),
+        ],
+    )
+    return [data]
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -2351,6 +2562,24 @@ def application(
             return _handle_cache_layer(
                 method, environ, path[len("/cache/layers/"):], start_response
             )
+
+        if path == "/mirrors":
+            return _handle_mirrors(method, environ, start_response)
+
+        if path.startswith("/mirrors/"):
+            suffix = path[len("/mirrors/"):]
+            if "/pull/" in suffix:
+                raw_id, _, raw_digest = suffix.partition("/pull/")
+                return _handle_mirror_pull(
+                    method, environ, raw_id, raw_digest, start_response
+                )
+            if suffix.endswith("/pull"):
+                # A pull address without a digest segment is a bad request.
+                return _handle_mirror_pull(
+                    method, environ, suffix[: -len("/pull")], "", start_response
+                )
+            # A plain item; an embedded separator is rejected by the handler.
+            return _handle_mirror_item(method, environ, suffix, start_response)
 
         if path.startswith("/resources/"):
             suffix = path[len("/resources/"):]

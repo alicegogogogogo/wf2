@@ -126,6 +126,15 @@ class LayerCacheStore:
         self._hits += 1
         return data
 
+    def peek(self, digest: str) -> bytes | None:
+        """Return the cached bytes without touching hit/miss counters.
+
+        Used by mirror pulls, whose cache interaction must not change the
+        counters either way.
+        """
+
+        return self._layers.get(digest)
+
     def status(self) -> CacheStatus:
         """Return a read-only snapshot; never mutates entries or counters."""
 
