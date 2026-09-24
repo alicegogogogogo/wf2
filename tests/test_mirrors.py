@@ -451,6 +451,109 @@ class MirrorPullTests(unittest.TestCase):
         self.assertEqual(status_body["hits"], 0)
         self.assertEqual(status_body["misses"], 0)
 
+    def test_pull_after_cache_delete_refetches_and_recaches(self) -> None:
+        # Deleting a layer must not poison the pull path: the next pull goes
+        # back upstream, verifies the bytes and writes the cache again.
+        _s, created = register(upstream=UPSTREAM_SLASH)
+        put_cache_layer(LAYER_A)
+        status, _h, _raw = call("DELETE", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "200 OK")
+        # The layer now misses the cache ...
+        status, _h, miss = call_json("GET", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(miss["error"], "cache_miss")
+        # ... so a pull must contact the upstream and cache it anew.
+        with patch_fetch(LAYER_A) as fetch:
+            status, headers, raw = call(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(raw, LAYER_A)
+        fetch.assert_called_once_with(UPSTREAM_SLASH, DIGEST_A)
+        status, _h, cached = call("GET", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(cached, LAYER_A)
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["used_bytes"], len(LAYER_A))
+
+    def test_pull_after_clear_refetches_and_recaches(self) -> None:
+        _s, created = register()
+        put_cache_layer(LAYER_A)
+        status, _h, _raw = call("DELETE", "/cache")
+        self.assertEqual(status, "200 OK")
+        with patch_fetch(LAYER_A) as fetch:
+            status, _h, raw = call(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(raw, LAYER_A)
+        fetch.assert_called_once_with(UPSTREAM, DIGEST_A)
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+
+    def test_deleted_layer_pull_still_rejects_digest_mismatch(self) -> None:
+        # Deletion must not let verification be skipped: bad upstream bytes
+        # stay a 502 mirror_digest_mismatch after the layer was deleted.
+        _s, created = register()
+        put_cache_layer(LAYER_A)
+        call("DELETE", f"/cache/layers/{DIGEST_A}")
+        with patch_fetch(b"tampered bytes"):
+            status, _h, body = call_json(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "502 Bad Gateway")
+        self.assertEqual(body["error"], "mirror_digest_mismatch")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 0)
+
+    def test_deleted_layer_pull_still_enforces_quota(self) -> None:
+        # Even after deletion frees room, a fetched layer larger than the
+        # quota still answers 409: deletion never bypasses the quota check.
+        _s, created = register()
+        cache_store.configure(len(LAYER_A))
+        put_cache_layer(LAYER_A)
+        status, _h, _raw = call("DELETE", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "200 OK")
+        with patch_fetch(LAYER_B):
+            status, _h, body = call_json(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_B}"
+            )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "cache_quota_exceeded")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 0)
+        self.assertEqual(status_body["used_bytes"], 0)
+
+    def test_pull_after_delete_uses_freed_quota(self) -> None:
+        # The complementary case: a layer fitting the freed room is pulled
+        # and cached successfully after deletion.
+        _s, created = register()
+        cache_store.configure(len(LAYER_B))
+        put_cache_layer(LAYER_B)
+        # A cannot be added while B fills the quota.
+        with patch_fetch(LAYER_A):
+            status, _h, body = call_json(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "cache_quota_exceeded")
+        call("DELETE", f"/cache/layers/{DIGEST_B}")
+        with patch_fetch(LAYER_A):
+            status, _h, raw = call(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(raw, LAYER_A)
+
+    def test_cache_clear_does_not_remove_mirrors(self) -> None:
+        _s, created = register()
+        status, _h, _raw = call("DELETE", "/cache")
+        self.assertEqual(status, "200 OK")
+        status, _h, body = call_json("GET", f"/mirrors/{created['id']}")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["id"], created["id"])
+
 
 class UpstreamFetchTests(unittest.TestCase):
     def test_layer_url_strips_trailing_slash(self) -> None:

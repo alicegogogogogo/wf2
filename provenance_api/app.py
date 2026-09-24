@@ -1944,6 +1944,28 @@ def _admission_body_error(environ: dict[str, Any]) -> str | None:
     return None
 
 
+def _bodyless_request_error(environ: dict[str, Any]) -> str | None:
+    """Reject a bodyless endpoint (cache DELETE) that declares a body.
+
+    Unlike admission, this also treats an empty-string ``Content-Length``
+    as no body: a real WSGI server seeds ``CONTENT_LENGTH`` with ``''``
+    for requests that omit the header entirely (e.g. curl's bodyless
+    DELETE), so only a declared positive or malformed length is rejected.
+    An explicit ``Content-Length: 0`` is an empty body and is accepted.
+    """
+
+    raw_length = environ.get("CONTENT_LENGTH")
+    if raw_length is None or raw_length == "":
+        return None
+    if (
+        not isinstance(raw_length, str)
+        or _NON_NEGATIVE_INT_PATTERN.fullmatch(raw_length) is None
+        or int(raw_length) > 0
+    ):
+        return "This endpoint does not accept a request body."
+    return None
+
+
 def _handle_admission(
     method: str,
     environ: dict[str, Any],
@@ -2277,6 +2299,50 @@ def _handle_cache_layer_get(
     return [data]
 
 
+def _handle_cache_layer_delete(
+    environ: dict[str, Any], raw_digest: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    # Same ordering as a write: the path digest is rejected before the
+    # request body is ever considered.
+    if _DIGEST_PATTERN.fullmatch(raw_digest) is None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Layer digest must be a 64-character hexadecimal string.",
+        )
+    digest = raw_digest.lower()
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Deletion carries no body; a declared non-empty or malformed body is
+    # rejected without being read.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    try:
+        size, entries = cache_store.remove(digest)
+    except CacheError as exc:
+        # Deleting a missing or already deleted digest is a miss.
+        return _error(
+            start_response, "404 Not Found", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"digest": digest, "size": size, "entries": entries},
+        trailing_newline=True,
+    )
+
+
 def _handle_cache_layer(
     method: str,
     environ: dict[str, Any],
@@ -2287,12 +2353,49 @@ def _handle_cache_layer(
         return _handle_cache_layer_post(environ, raw_digest, start_response)
     if method == "GET":
         return _handle_cache_layer_get(environ, raw_digest, start_response)
+    if method == "DELETE":
+        return _handle_cache_layer_delete(environ, raw_digest, start_response)
     return _error(
         start_response,
         "405 Method Not Allowed",
         "method_not_allowed",
         f"Method {method} is not allowed for this path.",
-        allowed="GET, POST",
+        allowed="DELETE, GET, POST",
+    )
+
+
+def _handle_cache_root(
+    method: str, environ: dict[str, Any], start_response: StartResponse
+) -> Iterable[bytes]:
+    if method != "DELETE":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="DELETE",
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Clearing an already empty cache is an idempotent success with zero
+    # counts; the hit/miss counters are deliberately preserved.
+    removed, freed_bytes = cache_store.clear()
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"removed": removed, "freed_bytes": freed_bytes},
+        trailing_newline=True,
     )
 
 
@@ -2590,6 +2693,9 @@ def application(
                 f"Method {method} is not allowed for this path.",
                 allowed="GET, POST",
             )
+
+        if path == "/cache":
+            return _handle_cache_root(method, environ, start_response)
 
         if path == "/cache/status":
             return _handle_cache_status(method, environ, start_response)

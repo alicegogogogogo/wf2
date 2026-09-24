@@ -7,6 +7,12 @@ idempotent no-op; different bytes under an already cached digest are a
 conflict. Reads bump the hit or miss counters; the status snapshot is
 read-only and never changes any counter.
 
+A single layer can be removed by digest, or the whole cache cleared at
+once; either operation frees the entry bytes (so quota headroom returns)
+but never touches the hit/miss counters. Removing a digest that is not
+cached is a ``cache_miss``; clearing an empty cache is an idempotent
+no-op.
+
 Everything lives in the current process memory: entries and counters are
 lost on restart and nothing is ever written to a file. There is
 intentionally no eviction, no cross-layer batching and no concurrency
@@ -134,6 +140,44 @@ class LayerCacheStore:
         """
 
         return self._layers.get(digest)
+
+    def remove(self, digest: str) -> tuple[int, int]:
+        """Delete one cached layer, returning ``(size, entries)``.
+
+        ``size`` is the number of bytes freed by the removal and
+        ``entries`` is the number of cached layers remaining afterwards.
+        The used-byte total drops immediately, so a later write is judged
+        against the reduced usage. Raises :class:`CacheError` with code
+        ``cache_miss`` when no layer is cached for ``digest``; the cache
+        is left unchanged (so deleting an already deleted digest keeps
+        failing with ``cache_miss``). Hit/miss counters are never
+        touched.
+        """
+
+        existing = self._layers.pop(digest, None)
+        if existing is None:
+            raise CacheError(
+                "cache_miss",
+                "No layer is cached for the requested digest.",
+            )
+        self._used -= len(existing)
+        return len(existing), len(self._layers)
+
+    def clear(self) -> tuple[int, int]:
+        """Remove every cached layer, returning ``(removed, freed_bytes)``.
+
+        ``removed`` is the number of entries dropped and ``freed_bytes``
+        is the total number of bytes they occupied. Clearing an empty
+        cache is an idempotent no-op: both counts are ``0`` and repeated
+        calls never raise. Hit/miss counters and the configured quota
+        are preserved.
+        """
+
+        removed = len(self._layers)
+        freed = self._used
+        self._layers = {}
+        self._used = 0
+        return removed, freed
 
     def status(self) -> CacheStatus:
         """Return a read-only snapshot; never mutates entries or counters."""
