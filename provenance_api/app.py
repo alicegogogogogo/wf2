@@ -22,6 +22,13 @@ from .lifecycle import (
     LifecycleRecord,
     LifecycleStore,
 )
+from .policies import (
+    PolicyError,
+    PolicyStore,
+    PolicyValidationError,
+    build_policy_fields,
+    evaluate_policy,
+)
 from .provenance import (
     ProvenanceError,
     ProvenanceStore,
@@ -70,6 +77,10 @@ sbom_store = SbomStore()
 #: Process-local build provenance records; never persisted.
 provenance_store = ProvenanceStore()
 
+#: Process-local admission policies and their read-only decisions; never
+#: persisted and never materialized as records.
+policy_store = PolicyStore()
+
 
 def reset_state() -> None:
     """Clear every in-process store (test and tooling helper)."""
@@ -80,6 +91,7 @@ def reset_state() -> None:
     vulnerability_store.reset()
     sbom_store.reset()
     provenance_store.reset()
+    policy_store.reset()
 
 #: Listing defaults and bounds.
 DEFAULT_LIMIT = 50
@@ -1768,6 +1780,216 @@ def _handle_provenance(
     )
 
 
+def _handle_policies_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Validate the whole body before touching any store, so a bad request
+    # can never leave a partial policy.
+    try:
+        build_policy_fields(payload)
+    except PolicyValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    try:
+        record, created = policy_store.add(raw_id, payload)
+    except PolicyError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created" if created else "200 OK",
+        record.to_dict(raw_id),
+        trailing_newline=True,
+    )
+
+
+def _handle_policies_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    record = policy_store.get(raw_id)
+    if record is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "policy_not_found",
+            "No policy is registered for this resource.",
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        record.to_dict(raw_id),
+        trailing_newline=True,
+    )
+
+
+def _handle_policies(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_policies_post(environ, raw_id, start_response)
+    if method == "GET":
+        return _handle_policies_get(environ, raw_id, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
+def _admission_body_error(environ: dict[str, Any]) -> str | None:
+    """Reject an admission request that declares or carries a body."""
+
+    raw_length = environ.get("CONTENT_LENGTH")
+    if raw_length is None:
+        return None
+    if (
+        not isinstance(raw_length, str)
+        or _NON_NEGATIVE_INT_PATTERN.fullmatch(raw_length) is None
+        or int(raw_length) > 0
+    ):
+        return "This endpoint does not accept a request body."
+    return None
+
+
+def _handle_admission(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    body_error = _admission_body_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    policy = policy_store.get(raw_id)
+    if policy is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "policy_not_found",
+            "No policy is registered for this resource.",
+        )
+
+    license_record = sbom_store.get_license(raw_id)
+    allowed, reasons = evaluate_policy(
+        policy,
+        lifecycle_state=lifecycle_store.get(raw_id).state,
+        has_sbom=sbom_store.get_sbom(raw_id) is not None,
+        has_license=license_record is not None,
+        has_provenance=provenance_store.get(raw_id) is not None,
+        license_spdx_id=(
+            license_record.spdx_id if license_record is not None else None
+        ),
+        severities=[
+            alert.severity for alert in vulnerability_store.list_for(raw_id)
+        ],
+    )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"id": raw_id, "allowed": allowed, "reasons": reasons},
+        trailing_newline=True,
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -1833,6 +2055,14 @@ def application(
                 )
             if separator and tail == "provenance":
                 return _handle_provenance(
+                    method, environ, head, start_response
+                )
+            if separator and tail == "policies":
+                return _handle_policies(
+                    method, environ, head, start_response
+                )
+            if separator and tail == "admission":
+                return _handle_admission(
                     method, environ, head, start_response
                 )
             if separator and tail == "chunks/status":
@@ -1920,6 +2150,24 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/provenance")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/policies"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without recording any policy.
+                return _handle_policies(
+                    method,
+                    environ,
+                    suffix[: -len("/policies")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/admission"):
+                # Same fallback so a separator in the id is rejected
+                # without performing an evaluation.
+                return _handle_admission(
+                    method,
+                    environ,
+                    suffix[: -len("/admission")],
                     start_response,
                 )
             # Any other suffix keeps the baseline item semantics (embedded
