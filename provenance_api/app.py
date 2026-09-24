@@ -551,6 +551,109 @@ def _handle_dependencies(
     )
 
 
+class _BodyReadError(ValueError):
+    """The raw request body could not be read exactly as declared."""
+
+
+def _read_exact_body(environ: dict[str, Any]) -> bytes:
+    """Read exactly ``Content-Length`` raw bytes from the request body.
+
+    Raises :class:`_BodyReadError` when the length header is missing or
+    invalid, the stream cannot be read, or fewer bytes than declared are
+    available. An explicitly declared empty body is legal.
+    """
+
+    raw_length = environ.get("CONTENT_LENGTH")
+    if raw_length is None or str(raw_length) == "":
+        raise _BodyReadError("A Content-Length header is required.")
+    try:
+        length = int(str(raw_length))
+    except (TypeError, ValueError):
+        raise _BodyReadError(
+            "Content-Length must be a non-negative integer."
+        ) from None
+    if length < 0:
+        raise _BodyReadError("Content-Length must be a non-negative integer.")
+    try:
+        body = environ["wsgi.input"].read(length)
+    except Exception:
+        raise _BodyReadError("Failed to read the request body.") from None
+    if len(body) != length:
+        raise _BodyReadError(
+            "Request body is incomplete: fewer bytes than declared."
+        )
+    return body
+
+
+def _handle_verify_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        # Reject before touching any business data or the request body.
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    media_type = (
+        str(environ.get("CONTENT_TYPE", "")).split(";", 1)[0].strip().lower()
+    )
+    if media_type != "application/octet-stream":
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Content-Type must be application/octet-stream.",
+        )
+
+    try:
+        body = _read_exact_body(environ)
+    except _BodyReadError as exc:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", str(exc)
+        )
+
+    resource = store.get(raw_id)
+    if resource is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Lowercase SHA-256 hex digest, compared verbatim against registration.
+    digest = hashlib.sha256(body).hexdigest()
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"id": resource.id, "digest": digest, "valid": digest == resource.digest},
+        trailing_newline=True,
+    )
+
+
+def _handle_verify(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
+        )
+    return _handle_verify_post(environ, raw_id, start_response)
+
+
 def _handle_impact(
     method: str,
     environ: dict[str, Any],
@@ -625,6 +728,13 @@ def application(
             if separator and tail == "impact":
                 return _handle_impact(
                     method, environ, head, start_response
+                )
+            if suffix.endswith("/verify"):
+                # Everything before the final "/verify" is the id; embedded
+                # separators make it invalid and are rejected with 400.
+                raw_id = suffix[: -len("/verify")]
+                return _handle_verify(
+                    method, environ, raw_id, start_response
                 )
             # Any other suffix keeps the baseline item semantics (embedded
             # separators are rejected by the item handler).

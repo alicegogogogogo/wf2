@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import unittest
@@ -1029,6 +1030,217 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual(deps["dependencies"], [b])
         _s, _h, impact = call_json("GET", f"/resources/{b}/impact")
         self.assertEqual(impact["resources"], [a])
+
+
+_AUTO = object()
+
+
+def call_verify(
+    method: str,
+    path: str,
+    body: bytes = b"",
+    *,
+    content_type: str | None = "application/octet-stream",
+    content_length: int | None | object = _AUTO,
+    query_string: str | None = None,
+) -> tuple[str, list[tuple[str, str]], bytes]:
+    environ: dict[str, object] = {
+        "REQUEST_METHOD": method,
+        "PATH_INFO": path,
+        "wsgi.input": io.BytesIO(body),
+    }
+    if content_length is _AUTO:
+        environ["CONTENT_LENGTH"] = str(len(body))
+    elif content_length is not None:
+        environ["CONTENT_LENGTH"] = str(content_length)
+    if content_type is not None:
+        environ["CONTENT_TYPE"] = content_type
+    if query_string is not None:
+        environ["QUERY_STRING"] = query_string
+    captured: dict[str, object] = {}
+
+    def start_response(status: str, headers: list[tuple[str, str]]) -> None:
+        captured["status"] = status
+        captured["headers"] = headers
+
+    chunks = application(environ, start_response)
+    return str(captured["status"]), list(captured["headers"]), b"".join(chunks)
+
+
+class VerifyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        store.reset()
+
+    def _create(self, name: str, digest: str) -> str:
+        status, _headers, body = call_json(
+            "POST",
+            "/resources",
+            {"name": name, "category": "code", "digest": digest},
+        )
+        self.assertEqual(status, "201 Created")
+        return str(body["id"])
+
+    def test_verify_matching_content_is_valid(self) -> None:
+        content = b"hello supply chain"
+        resource_id = self._create("a", hashlib.sha256(content).hexdigest())
+
+        status, _headers, raw = call_verify(
+            "POST", f"/resources/{resource_id}/verify", content
+        )
+
+        self.assertEqual(status, "200 OK")
+        payload = json.loads(raw.decode("utf-8"))
+        self.assertEqual(
+            payload,
+            {
+                "id": resource_id,
+                "digest": hashlib.sha256(content).hexdigest(),
+                "valid": True,
+            },
+        )
+        # Compact JSON, stable key order, newline terminated.
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(
+            raw.decode("utf-8"),
+            '{"id":"%s","digest":"%s","valid":true}\n'
+            % (resource_id, hashlib.sha256(content).hexdigest()),
+        )
+
+    def test_verify_mismatched_content_is_invalid_but_200(self) -> None:
+        resource_id = self._create("a", DIGEST_A)
+
+        status, _headers, raw = call_verify(
+            "POST", f"/resources/{resource_id}/verify", b"other bytes"
+        )
+
+        self.assertEqual(status, "200 OK")
+        payload = json.loads(raw.decode("utf-8"))
+        self.assertEqual(payload["id"], resource_id)
+        self.assertEqual(
+            payload["digest"], hashlib.sha256(b"other bytes").hexdigest()
+        )
+        self.assertIs(payload["valid"], False)
+
+    def test_verify_empty_body_is_legal(self) -> None:
+        empty_digest = hashlib.sha256(b"").hexdigest()
+        resource_id = self._create("a", empty_digest)
+
+        status, _headers, raw = call_verify(
+            "POST", f"/resources/{resource_id}/verify", b"", content_length=0
+        )
+
+        self.assertEqual(status, "200 OK")
+        payload = json.loads(raw.decode("utf-8"))
+        self.assertEqual(payload["digest"], empty_digest)
+        self.assertIs(payload["valid"], True)
+
+    def test_verify_missing_content_length_is_bad_request(self) -> None:
+        resource_id = self._create("a", DIGEST_A)
+
+        status, _headers, raw = call_verify(
+            "POST", f"/resources/{resource_id}/verify", b"data",
+            content_length=None,
+        )
+
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(json.loads(raw.decode("utf-8"))["error"], "invalid_request")
+
+    def test_verify_incomplete_body_is_bad_request(self) -> None:
+        resource_id = self._create("a", DIGEST_A)
+
+        status, _headers, raw = call_verify(
+            "POST",
+            f"/resources/{resource_id}/verify",
+            b"short",
+            content_length=100,
+        )
+
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(json.loads(raw.decode("utf-8"))["error"], "invalid_request")
+
+    def test_verify_wrong_content_type_is_bad_request(self) -> None:
+        resource_id = self._create("a", DIGEST_A)
+
+        for content_type in ("application/json", "text/plain", None):
+            with self.subTest(content_type=content_type):
+                status, _headers, raw = call_verify(
+                    "POST",
+                    f"/resources/{resource_id}/verify",
+                    b"data",
+                    content_type=content_type,
+                    content_length=4,
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8"))["error"], "invalid_request"
+                )
+
+    def test_verify_bad_path_id_is_bad_request(self) -> None:
+        for raw_id in ("", "a/b", "a\\b"):
+            path = f"/resources/{raw_id}/verify"
+            with self.subTest(path=path):
+                status, _headers, raw = call_verify(
+                    "POST", path, b"data", content_length=4
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8"))["error"], "invalid_request"
+                )
+
+    def test_verify_unknown_resource_is_not_found(self) -> None:
+        status, _headers, raw = call_verify(
+            "POST", "/resources/missing/verify", b"data", content_length=4
+        )
+
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(
+            json.loads(raw.decode("utf-8"))["error"], "resource_not_found"
+        )
+
+    def test_verify_query_parameters_are_bad_request(self) -> None:
+        resource_id = self._create("a", DIGEST_A)
+
+        status, _headers, raw = call_verify(
+            "POST",
+            f"/resources/{resource_id}/verify",
+            b"data",
+            content_length=4,
+            query_string="bogus=1",
+        )
+
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(json.loads(raw.decode("utf-8"))["error"], "invalid_request")
+
+    def test_verify_unsupported_methods_return_405_with_allow_post(self) -> None:
+        resource_id = self._create("a", DIGEST_A)
+
+        for method in ("GET", "PUT", "DELETE"):
+            with self.subTest(method=method):
+                status, headers, raw = call_verify(
+                    method, f"/resources/{resource_id}/verify"
+                )
+                self.assertEqual(status, "405 Method Not Allowed")
+                self.assertEqual(
+                    json.loads(raw.decode("utf-8"))["error"],
+                    "method_not_allowed",
+                )
+                self.assertIn(("Allow", "POST"), headers)
+
+    def test_failed_verify_requests_leave_state_unchanged(self) -> None:
+        resource_id = self._create("a", DIGEST_A)
+        call_verify("POST", f"/resources/{resource_id}/verify", b"x")
+        call_verify(
+            "POST",
+            f"/resources/{resource_id}/verify",
+            b"x",
+            content_length=1,
+            query_string="q=1",
+        )
+        call_verify("POST", "/resources/missing/verify", b"x", content_length=1)
+
+        _s, _h, listing = call_json("GET", "/resources")
+        self.assertEqual(len(listing["resources"]), 1)
+        self.assertEqual(listing["resources"][0]["id"], resource_id)
 
 
 if __name__ == "__main__":

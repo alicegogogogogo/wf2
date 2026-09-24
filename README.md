@@ -60,6 +60,41 @@ curl -s -X POST http://127.0.0.1:8000/resources \
 
 相同类别、名称与摘要的重复登记返回 HTTP 409（错误码 `duplicate_resource`），不会覆盖或合并原记录。
 
+### 校验资源内容：`POST /resources/{id}/verify`
+
+按资源标识提交原始字节，服务用 SHA-256 计算提交内容的 64 位小写十六进制摘要，并与登记时的摘要逐字比较。校验只在内存中完成，不写入任何文件。
+
+请求要求：
+
+- 请求体为原始字节流，`Content-Type` 必须是 `application/octet-stream`。
+- 必须携带合法的 `Content-Length`，并按声明长度完整读取；空字节流（`Content-Length: 0`）也是合法内容，仍会计算摘要。
+- 不接受任何查询参数。
+
+成功时返回 HTTP 200，响应体是紧凑 UTF-8 JSON，依次给出资源标识、计算摘要和布尔 `valid`，并以换行结束：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/resources/$A/verify \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary @payload.bin
+```
+
+```json
+{"id":"<资源 id>","digest":"<计算出的摘要>","valid":true}
+```
+
+`valid` 为 `true` 只表示摘要相同；为 `false` 表示内容可读但与登记摘要不一致，此时仍是 HTTP 200，不视为服务错误。
+
+错误与边界：
+
+- 标识为空或含 `/`、`\\` 返回 HTTP 400（错误码 `invalid_request`），且不读取任何业务数据。
+- 缺少长度头、长度头非法、读取失败或声明的字节流不完整，返回 HTTP 400（错误码 `invalid_request`）。
+- `Content-Type` 不是 `application/octet-stream` 返回 HTTP 400（错误码 `invalid_request`）。
+- 带任意查询参数返回 HTTP 400（错误码 `invalid_request`），不留下部分结果。
+- 标识格式合法但资源不存在时返回 HTTP 404（错误码 `resource_not_found`）。
+- `POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: POST`）。
+- 任何非法请求都不会改变资源、依赖、分页游标及进程内存中的其他状态。
+- 除上述约定外，对其他输入形式不作兼容承诺。
+
 ### 查询单个资源：`GET /resources/{id}`
 
 按标识取得单条资源；标识为空或含路径分隔符（`/`、`\\`）时返回 HTTP 400，找不到时返回只读的 HTTP 404（错误码 `resource_not_found`），两种情况都不改变状态。
@@ -197,5 +232,5 @@ python -m unittest discover -s tests -v
 - 持久化数据和生成文件不得提交到 Git。
 - 不得把密钥、访问令牌、私有验证脚本或控制系统资料写入仓库。
 - 对已有公开接口的更改应保持向后兼容，除非任务明确要求破坏性升级。
-- 当前公开业务接口为健康检查、上述资源登记/查询接口，以及资源依赖关系登记、依赖拓扑查询与影响分析接口；资源与依赖数据仅存于进程内存，不承诺跨进程或重启后的保存。
+- 当前公开业务接口为健康检查、上述资源登记/查询/内容校验接口，以及资源依赖关系登记、依赖拓扑查询与影响分析接口；资源与依赖数据仅存于进程内存，不承诺跨进程或重启后的保存。
 
