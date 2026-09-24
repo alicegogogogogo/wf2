@@ -29,6 +29,13 @@ from .resources import (
     ResourceStore,
     ResourceValidationError,
 )
+from .vulnerabilities import (
+    SEVERITY_VALUES,
+    VulnerabilityDuplicateError,
+    VulnerabilityStore,
+    VulnerabilityValidationError,
+    build_vulnerability_fields,
+)
 
 StartResponse = Callable[[str, list[tuple[str, str]]], Any]
 
@@ -41,6 +48,9 @@ content_store = ContentStore()
 #: Process-local lifecycle states; cleared on restart like everything else.
 lifecycle_store = LifecycleStore()
 
+#: Process-local security alerts; also never persisted.
+vulnerability_store = VulnerabilityStore()
+
 
 def reset_state() -> None:
     """Clear every in-process store (test and tooling helper)."""
@@ -48,6 +58,7 @@ def reset_state() -> None:
     store.reset()
     content_store.reset()
     lifecycle_store.reset()
+    vulnerability_store.reset()
 
 #: Listing defaults and bounds.
 DEFAULT_LIMIT = 50
@@ -1218,6 +1229,164 @@ def _handle_lifecycle(
     )
 
 
+def _handle_vulnerabilities_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    try:
+        # Validate fully before touching any state, so a bad payload can
+        # never leave a partial alert even for a missing resource. The
+        # store repeats the pure validation when storing.
+        build_vulnerability_fields(payload)
+    except VulnerabilityValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    try:
+        entry = vulnerability_store.add(raw_id, payload)
+    except VulnerabilityDuplicateError as exc:
+        return _error(
+            start_response,
+            "409 Conflict",
+            exc.code,
+            exc.message,
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created",
+        entry.to_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_vulnerabilities_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+
+    # Only the optional ``severity`` filter is accepted; unknown or
+    # repeated parameters are bad requests.
+    pairs = parse_qsl(
+        str(environ.get("QUERY_STRING", "")),
+        keep_blank_values=True,
+        strict_parsing=False,
+    )
+    severity: str | None = None
+    seen: set[str] = set()
+    for key, value in pairs:
+        if key != "severity":
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                f"Unknown query parameter: {key!r}.",
+            )
+        if key in seen:
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                "Query parameter 'severity' must not be repeated.",
+            )
+        seen.add(key)
+        if value == "":
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                "Severity must not be empty.",
+            )
+        severity = value.lower()
+        if severity not in SEVERITY_VALUES:
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                "Severity must be one of: critical, high, medium, low "
+                "(case-insensitive).",
+            )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    entries = vulnerability_store.list_for(raw_id, severity)
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"vulnerabilities": [entry.to_dict() for entry in entries]},
+        trailing_newline=True,
+    )
+
+
+def _handle_vulnerabilities(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_vulnerabilities_post(environ, raw_id, start_response)
+    if method == "GET":
+        return _handle_vulnerabilities_get(environ, raw_id, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -1269,6 +1438,10 @@ def application(
                 return _handle_lifecycle(
                     method, environ, head, start_response
                 )
+            if separator and tail == "vulnerabilities":
+                return _handle_vulnerabilities(
+                    method, environ, head, start_response
+                )
             if separator and tail == "chunks/status":
                 return _handle_chunks_status(
                     method, environ, head, start_response
@@ -1318,6 +1491,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/lifecycle")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/vulnerabilities"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without creating any alert.
+                return _handle_vulnerabilities(
+                    method,
+                    environ,
+                    suffix[: -len("/vulnerabilities")],
                     start_response,
                 )
             # Any other suffix keeps the baseline item semantics (embedded
