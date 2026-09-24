@@ -1,15 +1,226 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
 import json
+import os
+import re
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qsl
 
-from .resources import Resource, ResourceStore, ResourceValidationError
+from .resources import CATEGORIES, Resource, ResourceStore, ResourceValidationError
 
 StartResponse = Callable[[str, list[tuple[str, str]]], Any]
 
 #: Process-local storage; records are not persisted across restarts.
 store = ResourceStore()
+
+#: Listing defaults and bounds.
+DEFAULT_LIMIT = 50
+MAX_LIMIT = 100
+_LIST_PARAMS = frozenset({"category", "name", "digest", "limit", "cursor"})
+_CATEGORY_VALUES = frozenset(CATEGORIES)
+_DIGEST_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
+_POSITIVE_INT_PATTERN = re.compile(r"[1-9][0-9]*")
+
+#: Random per-process key so cursors cannot be forged and never survive a
+#: restart; nothing here is persisted to disk.
+_cursor_key = os.urandom(32)
+
+
+class ListQueryError(ValueError):
+    """A list request contained invalid query parameters or cursor."""
+
+
+@dataclass(frozen=True, slots=True)
+class ListQuery:
+    category: str | None
+    name: str | None
+    digest: str | None
+    limit: int
+    offset: int
+    paged: bool
+
+
+def _cursor_signature(
+    category: str, name: str, digest: str, limit: int, offset: int
+) -> bytes:
+    mac = hmac.new(_cursor_key, b"list-cursor-v1", hashlib.sha256)
+    for part in (category, name, digest, str(limit)):
+        encoded = part.encode("utf-8")
+        mac.update(len(encoded).to_bytes(4, "big"))
+        mac.update(encoded)
+    mac.update(offset.to_bytes(8, "big"))
+    return mac.digest()
+
+
+def _b64encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64decode(token: str) -> bytes:
+    return base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+
+
+def _encode_cursor(
+    category: str, name: str, digest: str, limit: int, offset: int
+) -> str:
+    return _b64encode(str(offset).encode("ascii")) + "." + _b64encode(
+        _cursor_signature(category, name, digest, limit, offset)
+    )
+
+
+def _decode_cursor(
+    raw: str, category: str, name: str, digest: str, limit: int
+) -> int:
+    """Return the offset encoded by a cursor.
+
+    Raises :class:`ListQueryError` when the cursor is forged, corrupted or
+    was issued for different filter conditions or limit.
+    """
+
+    token_b64, dot, sig_b64 = raw.partition(".")
+    if not dot or not token_b64 or not sig_b64:
+        raise ListQueryError("Cursor is malformed.")
+    try:
+        token = _b64decode(token_b64)
+        sig = _b64decode(sig_b64)
+    except (binascii.Error, ValueError):
+        raise ListQueryError("Cursor is malformed.") from None
+
+    if not token.isdigit() or token.startswith(b"0") or int(token) <= 0:
+        raise ListQueryError("Cursor is malformed.")
+    offset = int(token)
+
+    expected = _cursor_signature(category, name, digest, limit, offset)
+    if not hmac.compare_digest(sig, expected):
+        raise ListQueryError("Cursor is not valid for this request.")
+    return offset
+
+
+def parse_list_query(query_string: str) -> ListQuery:
+    """Parse and validate the query string for ``GET /resources``."""
+
+    pairs = parse_qsl(query_string, keep_blank_values=True, strict_parsing=False)
+    seen: set[str] = set()
+    raw_values: dict[str, str] = {}
+    for key, value in pairs:
+        if key not in _LIST_PARAMS:
+            raise ListQueryError(f"Unknown query parameter: {key!r}.")
+        if key in seen:
+            raise ListQueryError(f"Query parameter {key!r} must not be repeated.")
+        seen.add(key)
+        raw_values[key] = value
+
+    category: str | None = None
+    if "category" in raw_values:
+        value = raw_values["category"]
+        if value == "":
+            raise ListQueryError("Category must not be empty.")
+        if value.lower() not in _CATEGORY_VALUES:
+            allowed = ", ".join(CATEGORIES)
+            raise ListQueryError(
+                f"Category must be one of: {allowed} (case-insensitive)."
+            )
+        category = value.lower()
+
+    name: str | None = None
+    if "name" in raw_values:
+        value = raw_values["name"]
+        # Exact, case-sensitive comparison; no trimming or folding.
+        if value == "":
+            raise ListQueryError("Name must not be empty.")
+        name = value
+
+    digest: str | None = None
+    if "digest" in raw_values:
+        value = raw_values["digest"]
+        if _DIGEST_PATTERN.fullmatch(value) is None:
+            raise ListQueryError(
+                "Digest must be a 64-character hexadecimal string."
+            )
+        digest = value.lower()
+
+    limit = DEFAULT_LIMIT
+    if "limit" in raw_values:
+        value = raw_values["limit"]
+        if _POSITIVE_INT_PATTERN.fullmatch(value) is None:
+            raise ListQueryError(
+                f"Limit must be a positive integer no greater than {MAX_LIMIT}."
+            )
+        limit = int(value)
+        if limit > MAX_LIMIT:
+            raise ListQueryError(
+                f"Limit must be a positive integer no greater than {MAX_LIMIT}."
+            )
+
+    offset = 0
+    if "cursor" in raw_values:
+        value = raw_values["cursor"]
+        if value == "":
+            raise ListQueryError("Cursor is malformed.")
+        offset = _decode_cursor(
+            value, category or "", name or "", digest or "", limit
+        )
+
+    paged = bool(seen)
+    return ListQuery(
+        category=category,
+        name=name,
+        digest=digest,
+        limit=limit,
+        offset=offset,
+        paged=paged,
+    )
+
+
+def _handle_resources_get(
+    environ: dict[str, Any], start_response: StartResponse
+) -> Iterable[bytes]:
+    try:
+        query = parse_list_query(str(environ.get("QUERY_STRING", "")))
+    except ListQueryError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            str(exc),
+        )
+
+    if not query.paged:
+        # No filtering or pagination parameters: preserve the original shape.
+        return _json_response(
+            start_response,
+            "200 OK",
+            {"resources": [r.to_dict() for r in store.list_all()]},
+            trailing_newline=True,
+        )
+
+    matched = store.query(
+        category=query.category, name=query.name, digest=query.digest
+    )
+    page = matched[query.offset : query.offset + query.limit]
+    next_offset = query.offset + len(page)
+    next_cursor: str | None = None
+    if next_offset < len(matched):
+        next_cursor = _encode_cursor(
+            query.category or "",
+            query.name or "",
+            query.digest or "",
+            query.limit,
+            next_offset,
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"resources": [r.to_dict() for r in page], "next_cursor": next_cursor},
+        trailing_newline=True,
+    )
 
 
 def _json_response(
@@ -176,12 +387,7 @@ def application(
 
         if path == "/resources":
             if method == "GET":
-                return _json_response(
-                    start_response,
-                    "200 OK",
-                    {"resources": [r.to_dict() for r in store.list_all()]},
-                    trailing_newline=True,
-                )
+                return _handle_resources_get(environ, start_response)
             if method == "POST":
                 return _handle_resources_post(environ, start_response)
             return _error(

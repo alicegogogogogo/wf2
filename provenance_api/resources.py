@@ -117,6 +117,34 @@ class ResourceStore:
     def list_all(self) -> list[Resource]:
         return list(self._resources)
 
+    def query(
+        self,
+        *,
+        category: str | None = None,
+        name: str | None = None,
+        digest: str | None = None,
+    ) -> list[Resource]:
+        """Return matching resources in creation order.
+
+        ``category`` is compared case-insensitively, ``name`` is an exact
+        string match and ``digest`` is compared against the stored lowercase
+        form. Multiple conditions are AND-ed together.
+        """
+
+        if category is None and name is None and digest is None:
+            return list(self._resources)
+
+        matches: list[Resource] = []
+        for resource in self._resources:
+            if category is not None and resource.category != category.lower():
+                continue
+            if name is not None and resource.name != name:
+                continue
+            if digest is not None and resource.digest != digest:
+                continue
+            matches.append(resource)
+        return matches
+
     def get(self, resource_id: str) -> Resource | None:
         return self._by_id.get(resource_id)
 
