@@ -29,6 +29,12 @@ from .resources import (
     ResourceStore,
     ResourceValidationError,
 )
+from .provenance import (
+    ProvenanceError,
+    ProvenanceStore,
+    ProvenanceValidationError,
+    build_provenance_fields,
+)
 from .sbom import (
     SbomError,
     SbomStore,
@@ -61,6 +67,9 @@ vulnerability_store = VulnerabilityStore()
 #: Process-local SBOM documents and license declarations; never persisted.
 sbom_store = SbomStore()
 
+#: Process-local build provenance records; never persisted.
+provenance_store = ProvenanceStore()
+
 
 def reset_state() -> None:
     """Clear every in-process store (test and tooling helper)."""
@@ -70,6 +79,7 @@ def reset_state() -> None:
     lifecycle_store.reset()
     vulnerability_store.reset()
     sbom_store.reset()
+    provenance_store.reset()
 
 #: Listing defaults and bounds.
 DEFAULT_LIMIT = 50
@@ -1634,6 +1644,131 @@ def _handle_license(
     )
 
 
+def _handle_provenance_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Validate the whole body before touching any store, so a bad request
+    # can never leave a partial record and always answers 400 (even for a
+    # resource that does not exist).
+    try:
+        build_provenance_fields(payload)
+    except ProvenanceValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    try:
+        record, created = provenance_store.add(raw_id, payload)
+    except ProvenanceError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created" if created else "200 OK",
+        record.to_dict(raw_id),
+        trailing_newline=True,
+    )
+
+
+def _handle_provenance_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    record = provenance_store.get(raw_id)
+    if record is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "provenance_not_found",
+            "No provenance is recorded for this resource.",
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        record.to_dict(raw_id),
+        trailing_newline=True,
+    )
+
+
+def _handle_provenance(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_provenance_post(environ, raw_id, start_response)
+    if method == "GET":
+        return _handle_provenance_get(environ, raw_id, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -1695,6 +1830,10 @@ def application(
                 )
             if separator and tail == "license":
                 return _handle_license(
+                    method, environ, head, start_response
+                )
+            if separator and tail == "provenance":
+                return _handle_provenance(
                     method, environ, head, start_response
                 )
             if separator and tail == "chunks/status":
@@ -1773,6 +1912,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/license")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/provenance"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without recording any provenance.
+                return _handle_provenance(
+                    method,
+                    environ,
+                    suffix[: -len("/provenance")],
                     start_response,
                 )
             # Any other suffix keeps the baseline item semantics (embedded
