@@ -742,5 +742,230 @@ class ChunkFlowTests(unittest.TestCase):
         self.assertEqual(content_store._sessions, {})
 
 
+class ChunkStatusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_state()
+
+    def _create(self, digest: str) -> str:
+        body = json.dumps(
+            {"name": "r", "category": "code", "digest": digest}
+        ).encode("utf-8")
+        _s, _h, raw = call(
+            "POST", "/resources", body,
+            headers={"CONTENT_TYPE": "application/json"},
+        )
+        return str(json.loads(raw)["id"])
+
+    def _upload(self, resource_id: str, index: int, total: int,
+                digest: str, data: bytes) -> tuple[str, list, dict]:
+        return call_json(
+            "POST",
+            f"/resources/{resource_id}/chunks/{index}",
+            data,
+            headers=chunk_headers(total, digest),
+        )
+
+    def _status(self, resource_id: str, **kwargs: object):
+        return call_json(
+            "GET", f"/resources/{resource_id}/chunks/status", **kwargs
+        )
+
+    # --- Not started -------------------------------------------------------
+
+    def test_not_started_is_conflict_and_creates_no_session(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, _h, body = self._status(resource_id)
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "chunks_not_started")
+        # The read-only query must not open a session.
+        self.assertNotIn(resource_id, content_store._sessions)
+        status, _h, body = self._status(resource_id)
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "chunks_not_started")
+
+    def test_digest_conflicting_first_chunk_leaves_not_started(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, _h, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"x",
+            headers=chunk_headers(1, DIGEST_B),
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "digest_conflict")
+        status, _h, body = self._status(resource_id)
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "chunks_not_started")
+
+    # --- In progress -------------------------------------------------------
+
+    def test_in_progress_reports_missing_in_ascending_order(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        # Arrive out of order with index 1 missing for a while.
+        self._upload(resource_id, 2, 4, DIGEST_A, b"c")
+        self._upload(resource_id, 0, 4, DIGEST_A, b"a")
+        status, headers, body = self._status(resource_id)
+        self.assertEqual(status, "200 OK")
+        self.assertIn(
+            ("Content-Type", "application/json; charset=utf-8"), headers
+        )
+        self.assertEqual(body["id"], resource_id)
+        self.assertEqual(body["digest"], DIGEST_A)
+        self.assertEqual(body["total_chunks"], 4)
+        self.assertEqual(body["received_chunks"], 2)
+        self.assertEqual(body["missing_chunks"], [1, 3])
+        self.assertIs(body["complete"], False)
+        self.assertIsNone(body["size"])
+
+        # Filling one gap shrinks the missing list, still ascending.
+        self._upload(resource_id, 3, 4, DIGEST_A, b"d")
+        _s, _h, body = self._status(resource_id)
+        self.assertEqual(body["received_chunks"], 3)
+        self.assertEqual(body["missing_chunks"], [1])
+        self.assertIs(body["complete"], False)
+        self.assertIsNone(body["size"])
+
+    def test_response_is_compact_ordered_and_newline_terminated(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        self._upload(resource_id, 0, 2, DIGEST_A, b"a")
+        status, _h, raw = call(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertTrue(raw.endswith(b"\n"))
+        text = raw.decode("utf-8").rstrip("\n")
+        self.assertNotIn(" ", text)
+        keys = [
+            "id", "digest", "total_chunks", "received_chunks",
+            "missing_chunks", "complete", "size",
+        ]
+        positions = [text.index(f'"{key}"') for key in keys]
+        self.assertEqual(positions, sorted(positions))
+
+    # --- Failed assembly ---------------------------------------------------
+
+    def test_failed_assembly_keeps_chunks_and_reports_not_complete(self) -> None:
+        # Registered digest is that of b"abc"; the single chunk is b"abd".
+        registered = hashlib.sha256(b"abc").hexdigest()
+        resource_id = self._create(registered)
+        self._upload(resource_id, 0, 1, registered, b"abd")
+        status, _h, body = call_json(
+            "POST", f"/resources/{resource_id}/assemble"
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "digest_mismatch")
+
+        status, _h, body = self._status(resource_id)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["digest"], registered)
+        self.assertEqual(body["total_chunks"], 1)
+        self.assertEqual(body["received_chunks"], 1)
+        # All chunks present, so missing is empty even though digest failed.
+        self.assertEqual(body["missing_chunks"], [])
+        self.assertIs(body["complete"], False)
+        self.assertIsNone(body["size"])
+        # No finalized content was produced.
+        status, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/content"
+        )
+        self.assertEqual(body["error"], "content_not_complete")
+
+    # --- Completed ---------------------------------------------------------
+
+    def test_completed_reports_true_and_actual_size(self) -> None:
+        content = bytes(range(256)) + b"tail"
+        digest = hashlib.sha256(content).hexdigest()
+        resource_id = self._create(digest)
+        self._upload(resource_id, 0, 2, digest, content[:100])
+        self._upload(resource_id, 1, 2, digest, content[100:])
+        call("POST", f"/resources/{resource_id}/assemble")
+
+        status, _h, body = self._status(resource_id)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["digest"], digest)
+        self.assertEqual(body["total_chunks"], 2)
+        self.assertEqual(body["received_chunks"], 2)
+        self.assertEqual(body["missing_chunks"], [])
+        self.assertIs(body["complete"], True)
+        self.assertEqual(body["size"], len(content))
+
+    def test_completed_empty_content_reports_size_zero(self) -> None:
+        empty_digest = hashlib.sha256(b"").hexdigest()
+        resource_id = self._create(empty_digest)
+        self._upload(resource_id, 0, 1, empty_digest, b"")
+        call("POST", f"/resources/{resource_id}/assemble")
+        _s, _h, body = self._status(resource_id)
+        self.assertIs(body["complete"], True)
+        self.assertEqual(body["size"], 0)
+        self.assertEqual(body["missing_chunks"], [])
+
+    # --- Read-only ---------------------------------------------------------
+
+    def test_status_query_is_read_only(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        # A query before any upload creates nothing.
+        self._status(resource_id)
+        self.assertNotIn(resource_id, content_store._sessions)
+
+        self._upload(resource_id, 0, 3, DIGEST_A, b"a")
+        before = content_store._sessions[resource_id]
+        chunks_before = dict(before.chunks)
+        # Repeated queries never change the snapshot or stored bytes.
+        for _ in range(3):
+            status, _h, body = self._status(resource_id)
+            self.assertEqual(status, "200 OK")
+            self.assertEqual(body["missing_chunks"], [1, 2])
+        self.assertIs(content_store._sessions[resource_id], before)
+        self.assertEqual(before.chunks, chunks_before)
+
+        # Resource record, other endpoints and restart isolation are intact:
+        # status must not finalize content or mark completion.
+        status, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/content"
+        )
+        self.assertEqual(body["error"], "content_not_complete")
+        _s, _h, record = call_json("GET", f"/resources/{resource_id}")
+        self.assertEqual(record["digest"], DIGEST_A)
+
+    # --- Errors ------------------------------------------------------------
+
+    def test_unknown_resource_is_not_found(self) -> None:
+        status, _h, body = self._status("missing")
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "resource_not_found")
+
+    def test_empty_or_separator_id_is_bad_request(self) -> None:
+        for path in (
+            "/resources//chunks/status",
+            "/resources/a/b/chunks/status",
+            "/resources/a\\b/chunks/status",
+        ):
+            with self.subTest(path=path):
+                status, _h, body = call_json("GET", path)
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+    def test_query_parameters_rejected(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, _h, body = call_json(
+            "GET",
+            f"/resources/{resource_id}/chunks/status",
+            query_string="x=1",
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_non_get_methods_return_405_with_allow_get(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        for method in ("POST", "PUT", "DELETE", "PATCH"):
+            with self.subTest(method=method):
+                status, headers, body = call_json(
+                    method, f"/resources/{resource_id}/chunks/status"
+                )
+                self.assertEqual(status, "405 Method Not Allowed")
+                self.assertEqual(body["error"], "method_not_allowed")
+                self.assertIn(("Allow", "GET"), headers)
+
+
 if __name__ == "__main__":
     unittest.main()

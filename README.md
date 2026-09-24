@@ -1,6 +1,6 @@
 # 数字资源供应链与溯源平台
 
-这是一个面向代码、AI 模型、数据集和构建产物的后端服务基线。当前版本提供可运行的 HTTP 服务、健康检查、进程内的资源登记与查询、资源之间的依赖关系登记、拓扑查询与影响分析接口、按资源标识提交原始字节的内容校验接口、内容寻址的分块存储、组装与成品读取接口，以及资源生命周期状态（晋级、撤回与隔离）接口。
+这是一个面向代码、AI 模型、数据集和构建产物的后端服务基线。当前版本提供可运行的 HTTP 服务、健康检查、进程内的资源登记与查询、资源之间的依赖关系登记、拓扑查询与影响分析接口、按资源标识提交原始字节的内容校验接口、内容寻址的分块存储、组装、成品读取与上传会话状态查询接口，以及资源生命周期状态（晋级、撤回与隔离）接口。
 
 ## 环境
 
@@ -297,6 +297,44 @@ curl -s -X POST "http://127.0.0.1:8000/resources/$ID/assemble"
 curl -s "http://127.0.0.1:8000/resources/$ID/content" --output artifact.bin
 ```
 
+### 查询上传会话状态：`GET /resources/{id}/chunks/status`
+
+只读返回该资源当前分块上传会话的进度。查询不创建会话、不写入任何分块或成品字节，也不改变游标、生命周期、依赖关系或其他状态。
+
+成功时返回 HTTP 200，响应体为紧凑 UTF-8 JSON，键序固定（`id`、`digest`、`total_chunks`、`received_chunks`、`missing_chunks`、`complete`、`size`）并以换行结束：
+
+```bash
+curl -s "http://127.0.0.1:8000/resources/$ID/chunks/status"
+```
+
+```json
+{"id":"<资源 id>","digest":"<目标摘要>","total_chunks":3,"received_chunks":2,"missing_chunks":[1],"complete":false,"size":null}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 资源标识 |
+| `digest` | 首个分块确定的整份内容目标摘要（小写） |
+| `total_chunks` | 首个分块确定的总块数 |
+| `received_chunks` | 当前已收齐的不同序号数量 |
+| `missing_chunks` | 尚未收到的序号，按数值升序排列；全部收齐（含组装失败后）为空数组 |
+| `complete` | 组装成功并已生成成品为 `true`；尚未组装、缺块或组装失败均为 `false` |
+| `size` | 成品字节数；`complete` 为 `true` 时是实际成品长度（空成品为 `0`），否则为 `null` |
+
+会话各阶段的语义：
+
+- 已开始上传但尚未组装（无论是否收齐）返回 HTTP 200，`complete` 为 `false`、`size` 为 `null`；缺失序号按数值升序给出。
+- 组装失败（`digest_mismatch`）后已收分块继续保留：仍返回 HTTP 200，`missing_chunks` 为空、`complete` 为 `false`、`size` 为 `null`，不会误报完成，也没有成品可读。
+- 组装成功后返回 HTTP 200，`missing_chunks` 为空、`complete` 为 `true`、`size` 为实际成品字节数。
+
+错误与边界：
+
+- 标识为空或含 `/`、`\\`，或携带任意查询参数，返回 HTTP 400（错误码 `invalid_request`），不执行任何查询、不改变状态。
+- 标识格式合法但资源不存在，返回 HTTP 404（错误码 `resource_not_found`），不改变资源或会话状态。
+- 资源存在但从未开始上传时返回 HTTP 409（错误码 `chunks_not_started`），该响应不创建会话；重复查询仍是同样的 409。
+- `GET` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET`）。
+- 状态查询严格只读：不增加记录，不改变游标、生命周期、依赖关系或内容字节；会话与成品仍只存在于当前进程内存，重启即清空，不承诺跨进程恢复。
+
 ### 分块接口的通用错误
 
 - 路径标识为空或含 `/`、`\\`，或分块序号缺失、不是非负十进制整数、不小于总块数，返回 HTTP 400（错误码 `invalid_request`）。
@@ -304,8 +342,8 @@ curl -s "http://127.0.0.1:8000/resources/$ID/content" --output artifact.bin
 - 缺少或非法的 `X-Total-Chunks`、`X-Content-Digest`（含摘要不是 64 位十六进制），返回 HTTP 400（错误码 `invalid_request`）。
 - `Content-Type` 不是 `application/octet-stream`，返回 HTTP 400（错误码 `invalid_request`）。
 - 缺少 `Content-Length`、其值不是非负十进制整数，或实际字节数不足声明长度，返回 HTTP 400（错误码 `invalid_request`）；失败请求不会留下分块片段。
-- 资源不存在返回 HTTP 404（错误码 `resource_not_found`）。
-- 方法限制：`/resources/{id}/chunks/{index}` 与 `/resources/{id}/assemble` 仅允许 `POST`（`Allow: POST`）；`/resources/{id}/content` 仅允许 `GET`（`Allow: GET`）；其他方法返回 HTTP 405（错误码 `method_not_allowed`）。
+- 资源不存在返回 HTTP 404（错误码 `resource_not_found`），不改变资源或会话状态。
+- 方法限制：`/resources/{id}/chunks/{index}` 与 `/resources/{id}/assemble` 仅允许 `POST`（`Allow: POST`）；`/resources/{id}/content` 与 `/resources/{id}/chunks/status` 仅允许 `GET`（`Allow: GET`）；其他方法返回 HTTP 405（错误码 `method_not_allowed`）。
 - 除 JSON 错误响应外，成品读取成功时只返回原始字节。
 
 ## 资源生命周期
@@ -384,6 +422,6 @@ python -m unittest discover -s tests -v
 - 持久化数据和生成文件不得提交到 Git。
 - 不得把密钥、访问令牌、私有验证脚本或控制系统资料写入仓库。
 - 对已有公开接口的更改应保持向后兼容，除非任务明确要求破坏性升级。
-- 当前公开业务接口为健康检查、上述资源登记/查询接口、资源依赖关系登记、依赖拓扑查询与影响分析接口、资源内容校验接口、分块上传、组装与成品读取接口，以及资源生命周期状态读取与提交接口；资源、依赖、分块会话、成品内容与生命周期状态均仅存于进程内存，不承诺跨进程或重启后的保存。
+- 当前公开业务接口为健康检查、上述资源登记/查询接口、资源依赖关系登记、依赖拓扑查询与影响分析接口、资源内容校验接口、分块上传、组装、成品读取与上传会话状态查询接口，以及资源生命周期状态读取与提交接口；资源、依赖、分块会话、成品内容与生命周期状态均仅存于进程内存，不承诺跨进程或重启后的保存。
 - 分块能力明确不承诺以下行为：重启后的断点续传（重启清空全部会话与成品）、并发上传的加锁与顺序保证、以及跨资源的批量上传或批量组装。每个分块请求独立校验，冲突时以 409 拒绝且不覆盖既有字节。
 

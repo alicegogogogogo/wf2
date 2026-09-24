@@ -53,6 +53,36 @@ class ContentStore:
         session = self._sessions.get(resource_id)
         return session is not None and session.complete
 
+    def session_status(self, resource_id: str) -> dict[str, object] | None:
+        """Return a read-only snapshot of the resource's upload session.
+
+        The snapshot never creates a session: ``None`` means no chunk upload
+        has ever started (a failed digest-conflicting first chunk included),
+        and callers surface that as ``chunks_not_started``. After assembly the
+        missing list is empty, ``complete`` is true and ``size`` is the final
+        artifact length; after a failed assembly the chunks are retained, so
+        ``complete`` stays false and ``size`` is ``None``. Missing indices are
+        always returned in ascending numeric order.
+        """
+
+        session = self._sessions.get(resource_id)
+        if session is None:
+            return None
+        missing = [
+            index
+            for index in range(session.total)
+            if index not in session.chunks
+        ]
+        size: int | None = len(session.content) if session.complete else None
+        return {
+            "digest": session.digest,
+            "total_chunks": session.total,
+            "received_chunks": len(session.chunks),
+            "missing_chunks": missing,
+            "complete": session.complete,
+            "size": size,
+        }
+
     def add_chunk(
         self,
         resource_id: str,
