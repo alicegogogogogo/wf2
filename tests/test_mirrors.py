@@ -451,6 +451,102 @@ class MirrorPullTests(unittest.TestCase):
         self.assertEqual(status_body["hits"], 0)
         self.assertEqual(status_body["misses"], 0)
 
+    def test_pull_after_delete_refetches_and_recaches(self) -> None:
+        _s, created = register(upstream=UPSTREAM_SLASH)
+        with patch_fetch(LAYER_A):
+            status, _h, _raw = call(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "200 OK")
+        status, _h, _raw = call("DELETE", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "200 OK")
+        # The next pull must go back upstream instead of serving a stale hit.
+        with patch_fetch(LAYER_A) as fetch:
+            status, headers, raw = call(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(raw, LAYER_A)
+        self.assertIn(("Content-Length", str(len(LAYER_A))), headers)
+        fetch.assert_called_once_with(UPSTREAM_SLASH, DIGEST_A)
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["used_bytes"], len(LAYER_A))
+        self.assertEqual(status_body["hits"], 0)
+        self.assertEqual(status_body["misses"], 0)
+
+    def test_pull_after_clear_refetches_and_recaches(self) -> None:
+        _s, created = register()
+        with patch_fetch(LAYER_A):
+            status, _h, _raw = call(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "200 OK")
+        status, _h, _raw = call("DELETE", "/cache")
+        self.assertEqual(status, "200 OK")
+        with patch_fetch(LAYER_A) as fetch:
+            status, _h, raw = call(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(raw, LAYER_A)
+        fetch.assert_called_once()
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["used_bytes"], len(LAYER_A))
+
+    def test_pull_after_delete_still_verifies_upstream_bytes(self) -> None:
+        # A prior cache entry must not cause verification to be skipped:
+        # tampered upstream bytes after a delete still answer 502 and are
+        # not re-cached.
+        _s, created = register()
+        with patch_fetch(LAYER_A):
+            status, _h, _raw = call(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "200 OK")
+        status, _h, _raw = call("DELETE", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "200 OK")
+        with patch_fetch(b"tampered bytes"):
+            status, _h, body = call_json(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "502 Bad Gateway")
+        self.assertEqual(body["error"], "mirror_digest_mismatch")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 0)
+        self.assertEqual(status_body["used_bytes"], 0)
+
+    def test_pull_after_delete_enforces_quota_against_freed_usage(self) -> None:
+        _s, created = register()
+        # Quota fits exactly one of the larger layer, but not both layers.
+        cache_store.configure(len(LAYER_B))
+        with patch_fetch(LAYER_A):
+            status, _h, _raw = call(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "200 OK")
+        # Larger layer does not fit while the first layer still occupies quota.
+        with patch_fetch(LAYER_B):
+            status, _h, body = call_json(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_B}"
+            )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "cache_quota_exceeded")
+        status, _h, _raw = call("DELETE", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "200 OK")
+        # Freed headroom lets the larger layer populate the cache.
+        with patch_fetch(LAYER_B):
+            status, _h, raw = call(
+                "POST", f"/mirrors/{created['id']}/pull/{DIGEST_B}"
+            )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(raw, LAYER_B)
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["used_bytes"], len(LAYER_B))
+        self.assertEqual(status_body["quota"], len(LAYER_B))
+
 
 class UpstreamFetchTests(unittest.TestCase):
     def test_layer_url_strips_trailing_slash(self) -> None:

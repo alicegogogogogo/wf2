@@ -336,16 +336,330 @@ class CacheStatusTests(unittest.TestCase):
         self.assertEqual(json.loads(raw)["error"], "invalid_request")
 
 
+class LayerDeleteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_state()
+
+    def test_delete_returns_200_compact_echo_in_key_order(self) -> None:
+        put_layer(LAYER_A)
+        put_layer(LAYER_B)
+        status, headers, raw = call("DELETE", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "200 OK")
+        self.assertIn(
+            ("Content-Type", "application/json; charset=utf-8"), headers
+        )
+        self.assertEqual(
+            raw,
+            json.dumps(
+                {"digest": DIGEST_A, "size": len(LAYER_A), "entries": 1},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n",
+        )
+
+    def test_delete_drops_entry_and_bytes(self) -> None:
+        put_layer(LAYER_A)
+        put_layer(LAYER_B)
+        _s, _h, raw = call("DELETE", f"/cache/layers/{DIGEST_A}")
+        body = json.loads(raw)
+        self.assertEqual(body["entries"], 1)
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["used_bytes"], len(LAYER_B))
+        # The deleted layer now reads as a miss.
+        status, _h, read_raw = call("GET", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(json.loads(read_raw)["error"], "cache_miss")
+        # The other layer is untouched.
+        status, _h, data = call("GET", f"/cache/layers/{DIGEST_B}")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(data, LAYER_B)
+
+    def test_delete_keeps_counters_and_quota(self) -> None:
+        cache_store.configure(4096)
+        put_layer(LAYER_A)
+        put_layer(LAYER_B)
+        call("GET", f"/cache/layers/{DIGEST_A}")
+        call("GET", f"/cache/layers/{DIGEST_C}")
+        status, _h, _raw = call("DELETE", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "200 OK")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["hits"], 1)
+        self.assertEqual(status_body["misses"], 1)
+        self.assertEqual(status_body["quota"], 4096)
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["used_bytes"], len(LAYER_B))
+
+    def test_delete_missing_digest_returns_404_cache_miss(self) -> None:
+        status, _h, raw = call("DELETE", f"/cache/layers/{DIGEST_C}")
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(json.loads(raw)["error"], "cache_miss")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 0)
+        self.assertEqual(status_body["used_bytes"], 0)
+        self.assertEqual(status_body["hits"], 0)
+        self.assertEqual(status_body["misses"], 0)
+
+    def test_deleting_twice_first_200_then_404(self) -> None:
+        put_layer(LAYER_A)
+        status, _h, _raw = call("DELETE", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "200 OK")
+        status, _h, raw = call("DELETE", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(json.loads(raw)["error"], "cache_miss")
+
+    def test_uppercase_digest_deletes_lowercase_entry(self) -> None:
+        put_layer(LAYER_A)
+        status, _h, raw = call("DELETE", f"/cache/layers/{DIGEST_A.upper()}")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(json.loads(raw)["digest"], DIGEST_A)
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 0)
+
+    def test_invalid_digest_returns_400_without_reading_body(self) -> None:
+        put_layer(LAYER_A)
+        for digest in (
+            "abc",
+            "g" * 64,
+            "a" * 63,
+            "a" * 65,
+            "",
+            "a" * 32 + "/" + "a" * 32,
+        ):
+            status, _h, raw = call(
+                "DELETE",
+                f"/cache/layers/{digest}",
+                LAYER_A,
+                stream=ExplodingStream(),
+            )
+            self.assertEqual(status, "400 Bad Request", digest)
+            self.assertEqual(json.loads(raw)["error"], "invalid_request")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+
+    def test_query_parameters_return_400_and_change_nothing(self) -> None:
+        put_layer(LAYER_A)
+        status, _h, raw = call(
+            "DELETE", f"/cache/layers/{DIGEST_A}", query_string="x=1"
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(json.loads(raw)["error"], "invalid_request")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["used_bytes"], len(LAYER_A))
+
+    def test_request_body_is_rejected_with_400(self) -> None:
+        put_layer(LAYER_A)
+        status, _h, raw = call("DELETE", f"/cache/layers/{DIGEST_A}", b"x")
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(json.loads(raw)["error"], "invalid_request")
+        # A malformed Content-Length is rejected the same way.
+        status, _h, raw = call(
+            "DELETE",
+            f"/cache/layers/{DIGEST_A}",
+            content_length="abc",
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(json.loads(raw)["error"], "invalid_request")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["used_bytes"], len(LAYER_A))
+
+    def test_zero_or_missing_content_length_is_accepted(self) -> None:
+        put_layer(LAYER_A)
+        status, _h, _raw = call(
+            "DELETE", f"/cache/layers/{DIGEST_A}", b"", omit_content_length=True
+        )
+        self.assertEqual(status, "200 OK")
+        put_layer(LAYER_A)
+        status, _h, _raw = call(
+            "DELETE",
+            f"/cache/layers/{DIGEST_A}",
+            b"",
+            stream=io.BytesIO(b"unread trailing bytes"),
+        )
+        self.assertEqual(status, "200 OK")
+
+    def test_delete_frees_quota_for_a_new_layer(self) -> None:
+        # Quota fits either layer alone but never both (B is the larger one).
+        cache_store.configure(len(LAYER_B))
+        put_layer(LAYER_A)
+        status, _h, raw = put_layer(LAYER_B)
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(json.loads(raw)["error"], "cache_quota_exceeded")
+        status, _h, _raw = call("DELETE", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "200 OK")
+        status, _h, _raw = put_layer(LAYER_B)
+        self.assertEqual(status, "201 Created")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["used_bytes"], len(LAYER_B))
+
+    def test_delete_is_unknown_to_status_path(self) -> None:
+        status, headers, raw = call("DELETE", "/cache/status")
+        self.assertEqual(status, "405 Method Not Allowed")
+        self.assertIn(("Allow", "GET"), headers)
+        self.assertEqual(json.loads(raw)["error"], "method_not_allowed")
+
+
+class CacheClearTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_state()
+
+    def test_clear_empty_cache_returns_zero_counts(self) -> None:
+        status, headers, raw = call("DELETE", "/cache")
+        self.assertEqual(status, "200 OK")
+        self.assertIn(
+            ("Content-Type", "application/json; charset=utf-8"), headers
+        )
+        self.assertEqual(raw, b'{"removed":0,"freed_bytes":0}\n')
+
+    def test_clear_removes_every_layer_and_reports_totals(self) -> None:
+        put_layer(LAYER_A)
+        put_layer(LAYER_B)
+        status, _h, raw = call("DELETE", "/cache")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(
+            json.loads(raw),
+            {"removed": 2, "freed_bytes": len(LAYER_A) + len(LAYER_B)},
+        )
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 0)
+        self.assertEqual(status_body["used_bytes"], 0)
+
+    def test_repeated_clear_is_idempotent(self) -> None:
+        put_layer(LAYER_A)
+        _s, _h, _raw = call("DELETE", "/cache")
+        status, _h, raw = call("DELETE", "/cache")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(
+            json.loads(raw), {"removed": 0, "freed_bytes": 0}
+        )
+
+    def test_clear_preserves_counters_and_quota(self) -> None:
+        cache_store.configure(4096)
+        put_layer(LAYER_A)
+        call("GET", f"/cache/layers/{DIGEST_A}")
+        call("GET", f"/cache/layers/{DIGEST_C}")
+        status, _h, _raw = call("DELETE", "/cache")
+        self.assertEqual(status, "200 OK")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(
+            status_body,
+            {
+                "entries": 0,
+                "used_bytes": 0,
+                "quota": 4096,
+                "hits": 1,
+                "misses": 1,
+            },
+        )
+
+    def test_clear_does_not_touch_other_state(self) -> None:
+        _s, _h, created = call_json(
+            "POST",
+            "/mirrors",
+            json.dumps(
+                {"name": "primary", "upstream": "https://registry.example.invalid"}
+            ).encode("utf-8"),
+            headers={"CONTENT_TYPE": "application/json"},
+        )
+        put_layer(LAYER_A)
+        status, _h, _raw = call("DELETE", "/cache")
+        self.assertEqual(status, "200 OK")
+        _s, _h, mirrors = call_json("GET", "/mirrors")
+        self.assertEqual(mirrors["mirrors"], [created])
+
+    def test_query_parameters_return_400_and_change_nothing(self) -> None:
+        put_layer(LAYER_A)
+        status, _h, raw = call("DELETE", "/cache", query_string="x=1")
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(json.loads(raw)["error"], "invalid_request")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["used_bytes"], len(LAYER_A))
+
+    def test_request_body_is_rejected_with_400(self) -> None:
+        put_layer(LAYER_A)
+        status, _h, raw = call("DELETE", "/cache", b"x")
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(json.loads(raw)["error"], "invalid_request")
+        status, _h, raw = call("DELETE", "/cache", content_length="abc")
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(json.loads(raw)["error"], "invalid_request")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+
+    def test_root_only_allows_delete(self) -> None:
+        for method in ("GET", "POST", "PUT", "PATCH"):
+            status, headers, raw = call(method, "/cache")
+            self.assertEqual(status, "405 Method Not Allowed", method)
+            self.assertIn(("Allow", "DELETE"), headers)
+            self.assertEqual(json.loads(raw)["error"], "method_not_allowed")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 0)
+
+
+class LayerCacheStoreInvalidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_state()
+
+    def test_remove_returns_size_and_remaining(self) -> None:
+        cache_store.put(DIGEST_A, LAYER_A)
+        cache_store.put(DIGEST_B, LAYER_B)
+        result = cache_store.remove(DIGEST_A)
+        self.assertEqual(result, (len(LAYER_A), 1))
+        self.assertIsNone(cache_store.peek(DIGEST_A))
+        self.assertEqual(cache_store.status().used_bytes, len(LAYER_B))
+
+    def test_remove_missing_returns_none_and_changes_nothing(self) -> None:
+        cache_store.put(DIGEST_A, LAYER_A)
+        self.assertIsNone(cache_store.remove(DIGEST_C))
+        status = cache_store.status()
+        self.assertEqual(status.entries, 1)
+        self.assertEqual(status.used_bytes, len(LAYER_A))
+
+    def test_remove_never_touches_counters(self) -> None:
+        cache_store.put(DIGEST_A, LAYER_A)
+        cache_store.get(DIGEST_A)
+        cache_store.get(DIGEST_C)
+        cache_store.remove(DIGEST_A)
+        status = cache_store.status()
+        self.assertEqual(status.hits, 1)
+        self.assertEqual(status.misses, 1)
+
+    def test_clear_returns_counts_and_is_idempotent(self) -> None:
+        cache_store.put(DIGEST_A, LAYER_A)
+        cache_store.put(DIGEST_B, LAYER_B)
+        self.assertEqual(
+            cache_store.clear(), (2, len(LAYER_A) + len(LAYER_B))
+        )
+        self.assertEqual(cache_store.clear(), (0, 0))
+        status = cache_store.status()
+        self.assertEqual(status.entries, 0)
+        self.assertEqual(status.used_bytes, 0)
+
+    def test_clear_keeps_counters_and_quota(self) -> None:
+        cache_store.configure(4096)
+        cache_store.put(DIGEST_A, LAYER_A)
+        cache_store.get(DIGEST_A)
+        cache_store.clear()
+        status = cache_store.status()
+        self.assertEqual(status.quota, 4096)
+        self.assertEqual(status.hits, 1)
+        self.assertEqual(status.misses, 0)
+
+
 class CacheMethodTests(unittest.TestCase):
     def setUp(self) -> None:
         reset_state()
 
     def test_layer_path_rejects_other_methods_with_allow(self) -> None:
         put_layer(LAYER_A)
-        for method in ("PUT", "DELETE", "PATCH"):
+        for method in ("PUT", "PATCH"):
             status, headers, raw = call(method, f"/cache/layers/{DIGEST_A}")
             self.assertEqual(status, "405 Method Not Allowed", method)
-            self.assertIn(("Allow", "GET, POST"), headers)
+            self.assertIn(("Allow", "GET, POST, DELETE"), headers)
             self.assertEqual(json.loads(raw)["error"], "method_not_allowed")
         _s, _h, body = call_json("GET", "/cache/status")
         self.assertEqual(body["entries"], 1)

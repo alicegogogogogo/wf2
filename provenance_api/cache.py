@@ -5,7 +5,9 @@ the received bytes hash to the digest in the path and the configured quota
 still has room. Re-submitting the same bytes for a cached digest is an
 idempotent no-op; different bytes under an already cached digest are a
 conflict. Reads bump the hit or miss counters; the status snapshot is
-read-only and never changes any counter.
+read-only and never changes any counter. A single layer can be invalidated
+or the whole cache cleared; either drops the entries and the bytes they
+occupied while leaving the hit/miss counters and quota untouched.
 
 Everything lives in the current process memory: entries and counters are
 lost on restart and nothing is ever written to a file. There is
@@ -145,3 +147,37 @@ class LayerCacheStore:
             hits=self._hits,
             misses=self._misses,
         )
+
+    def remove(self, digest: str) -> tuple[int, int] | None:
+        """Invalidate one layer, releasing its bytes.
+
+        ``digest`` is the 64-character lowercase hex digest of the layer to
+        remove. Returns ``(size, entries)`` where ``size`` is the number of
+        bytes the removed layer occupied and ``entries`` is the number of
+        cached layers left after the call, or ``None`` when no layer is
+        cached for ``digest`` (nothing is changed). Hit/miss counters and
+        the quota are never touched; freed quota headroom is available to
+        later writes immediately.
+        """
+
+        data = self._layers.pop(digest, None)
+        if data is None:
+            return None
+        self._used -= len(data)
+        return len(data), len(self._layers)
+
+    def clear(self) -> tuple[int, int]:
+        """Invalidate every layer.
+
+        Returns ``(removed, freed_bytes)`` where ``removed`` is the number
+        of entries dropped and ``freed_bytes`` is the total byte usage they
+        accounted for. An empty cache yields ``(0, 0)`` and clearing it
+        again stays an idempotent no-op. Hit/miss counters and the quota
+        are preserved.
+        """
+
+        removed = len(self._layers)
+        freed = self._used
+        self._layers = {}
+        self._used = 0
+        return removed, freed
