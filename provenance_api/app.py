@@ -13,6 +13,15 @@ from typing import Any
 from urllib.parse import parse_qsl
 
 from .content import ContentError, ContentStore
+from .lifecycle import (
+    BLOCKING_STATES,
+    MAX_REASON_LENGTH,
+    REASON_REQUIRED_STATES,
+    STATE_VALUES,
+    LifecycleError,
+    LifecycleRecord,
+    LifecycleStore,
+)
 from .resources import (
     CATEGORIES,
     DependencyError,
@@ -29,12 +38,16 @@ store = ResourceStore()
 #: Process-local chunk sessions and finalized content; also never persisted.
 content_store = ContentStore()
 
+#: Process-local lifecycle states; cleared on restart like everything else.
+lifecycle_store = LifecycleStore()
+
 
 def reset_state() -> None:
     """Clear every in-process store (test and tooling helper)."""
 
     store.reset()
     content_store.reset()
+    lifecycle_store.reset()
 
 #: Listing defaults and bounds.
 DEFAULT_LIMIT = 50
@@ -946,6 +959,205 @@ def _handle_content(
     return [body]
 
 
+def _lifecycle_response(
+    start_response: StartResponse,
+    status: str,
+    resource_id: str,
+    record: LifecycleRecord,
+) -> Iterable[bytes]:
+    return _json_response(
+        start_response,
+        status,
+        {"id": resource_id, "state": record.state, "reason": record.reason},
+        trailing_newline=True,
+    )
+
+
+def _handle_lifecycle_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+    return _lifecycle_response(
+        start_response, "200 OK", raw_id, lifecycle_store.get(raw_id)
+    )
+
+
+def _handle_lifecycle_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    if not isinstance(payload, dict):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be a JSON object.",
+        )
+    unknown_fields = set(payload) - {"state", "reason"}
+    if unknown_fields:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            f"Unknown field: {sorted(unknown_fields)[0]!r}.",
+        )
+    if "state" not in payload:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Missing required field: 'state'.",
+        )
+    target = payload["state"]
+    if not isinstance(target, str) or target not in STATE_VALUES:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Field 'state' must be one of: staged, released, withdrawn, "
+            "quarantined (case-sensitive).",
+        )
+
+    reason: str | None = None
+    if "reason" in payload:
+        value = payload["reason"]
+        if not isinstance(value, str):
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                "Field 'reason' must be a string.",
+            )
+        if value == "":
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                "Field 'reason' must not be empty.",
+            )
+        if len(value) > MAX_REASON_LENGTH:
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                f"Field 'reason' must not exceed {MAX_REASON_LENGTH} "
+                "Unicode code points.",
+            )
+        reason = value
+    if target in REASON_REQUIRED_STATES and reason is None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            f"Field 'reason' is required when the target state is "
+            f"{target!r}.",
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    current = lifecycle_store.get(raw_id)
+    if (current.state, target) == ("staged", "released"):
+        # Promotion requires assembled content and healthy dependencies.
+        if not content_store.is_complete(raw_id):
+            return _error(
+                start_response,
+                "409 Conflict",
+                "content_not_complete",
+                "Content for this resource is not complete.",
+            )
+        for dependency_id in store.list_dependencies(raw_id):
+            if lifecycle_store.get(dependency_id).state in BLOCKING_STATES:
+                return _error(
+                    start_response,
+                    "409 Conflict",
+                    "dependency_blocked",
+                    "A dependency of this resource is withdrawn or "
+                    "quarantined.",
+                )
+
+    try:
+        record = lifecycle_store.apply(current, target, reason)
+    except LifecycleError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    # ``apply`` returns the very same record for an idempotent repeat; only a
+    # real transition is stored, so a repeat never adds a record.
+    if record is not current:
+        lifecycle_store.set(raw_id, record)
+    return _lifecycle_response(start_response, "200 OK", raw_id, record)
+
+
+def _handle_lifecycle(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "GET":
+        return _handle_lifecycle_get(environ, raw_id, start_response)
+    if method == "POST":
+        return _handle_lifecycle_post(environ, raw_id, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -993,6 +1205,10 @@ def application(
                 return _handle_content(
                     method, environ, head, start_response
                 )
+            if separator and tail == "lifecycle":
+                return _handle_lifecycle(
+                    method, environ, head, start_response
+                )
             if separator and tail.startswith("chunks/"):
                 return _handle_chunk(
                     method, environ, head, tail[len("chunks/"):],
@@ -1023,6 +1239,13 @@ def application(
             if separator and suffix.endswith("/content"):
                 return _handle_content(
                     method, environ, suffix[: -len("/content")], start_response
+                )
+            if separator and suffix.endswith("/lifecycle"):
+                return _handle_lifecycle(
+                    method,
+                    environ,
+                    suffix[: -len("/lifecycle")],
+                    start_response,
                 )
             # Any other suffix keeps the baseline item semantics (embedded
             # separators are rejected by the item handler).

@@ -1,6 +1,6 @@
 # 数字资源供应链与溯源平台
 
-这是一个面向代码、AI 模型、数据集和构建产物的后端服务基线。当前版本提供可运行的 HTTP 服务、健康检查、进程内的资源登记与查询、资源之间的依赖关系登记、拓扑查询与影响分析接口、按资源标识提交原始字节的内容校验接口，以及内容寻址的分块存储、组装与成品读取接口。
+这是一个面向代码、AI 模型、数据集和构建产物的后端服务基线。当前版本提供可运行的 HTTP 服务、健康检查、进程内的资源登记与查询、资源之间的依赖关系登记、拓扑查询与影响分析接口、按资源标识提交原始字节的内容校验接口、内容寻址的分块存储、组装与成品读取接口，以及资源生命周期状态（晋级、撤回与隔离）接口。
 
 ## 环境
 
@@ -308,6 +308,70 @@ curl -s "http://127.0.0.1:8000/resources/$ID/content" --output artifact.bin
 - 方法限制：`/resources/{id}/chunks/{index}` 与 `/resources/{id}/assemble` 仅允许 `POST`（`Allow: POST`）；`/resources/{id}/content` 仅允许 `GET`（`Allow: GET`）；其他方法返回 HTTP 405（错误码 `method_not_allowed`）。
 - 除 JSON 错误响应外，成品读取成功时只返回原始字节。
 
+## 资源生命周期
+
+新登记的资源默认处于 `staged`（暂存）状态；生命周期状态只保存在当前进程内存中，服务停止或重启后全部回到默认的 `staged`，不会写入任何文件。生命周期操作只修改状态与原因，不改变资源记录、依赖关系、分块会话、成品内容或分页游标。
+
+### 读取状态：`GET /resources/{id}/lifecycle`
+
+成功返回 HTTP 200，响应体为紧凑 UTF-8 JSON，键序固定（`id`、`state`、`reason`）并以换行结束。首次读取时状态为 `staged`、原因为 `null`：
+
+```json
+{"id":"<资源 id>","state":"staged","reason":null}
+```
+
+状态集合固定为 `staged`、`released`、`withdrawn`、`quarantined`，**状态名称区分大小写**。
+
+### 提交目标状态：`POST /resources/{id}/lifecycle`
+
+请求体必须是 JSON 对象，只允许以下两个字段：
+
+| 字段 | 类型 | 是否必填 | 说明 |
+| --- | --- | --- | --- |
+| `state` | string | 是 | `staged`、`released`、`withdrawn`、`quarantined` 之一，区分大小写 |
+| `reason` | string | 否 | 非空业务原因，最长 1024 个 Unicode 码点 |
+
+隔离或撤回（目标状态为 `quarantined` 或 `withdrawn`）必须提供非空 `reason`；其他请求可省略 `reason`（响应中原因为 `null`）。成功（含幂等重试）返回 HTTP 200：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/resources/$ID/lifecycle \
+  -H 'Content-Type: application/json' \
+  -d '{"state":"released"}'
+```
+
+```json
+{"id":"<资源 id>","state":"released","reason":null}
+```
+
+### 状态跳转规则
+
+- `staged → released`（晋级）：只有在**成品已组装完成**且**全部可达依赖状态正常**（没有被隔离或撤回）时才允许。
+  - 成品尚未组装完成时返回 HTTP 409（错误码 `content_not_complete`）。
+  - 任一可达依赖处于 `withdrawn` 或 `quarantined` 时返回 HTTP 409（错误码 `dependency_blocked`）。
+- `staged → quarantined`（隔离）：允许，须给非空原因。
+- `released → withdrawn`（撤回）、`released → quarantined`（隔离）：允许，须给非空原因。
+- `withdrawn → staged`、`quarantined → staged`：允许，无需原因；之后若要 released 仍须重新通过晋级检查（即“先回 staged 再检查”）。`quarantined` 不得直达 `released`。
+- 其余跳转均为非法跳转，返回 HTTP 409（错误码 `invalid_state_transition`），状态保持不变。
+
+### 幂等与原因
+
+- 以**相同状态和相同原因**再次提交返回 HTTP 200，响应不变，且**不新增任何记录**。
+- 已处于目标状态但原因不同（包括给默认无原因的状态补填原因）视为非法跳转，返回 HTTP 409（错误码 `invalid_state_transition`），状态与原因都不变。
+- 原因一经记录不可修改；要变更状态请走允许的跳转。
+
+### 生命周期接口的错误
+
+下列情况都返回 HTTP 400（错误码 `invalid_request`），且不改变任何状态：
+
+- 请求体缺失、不是合法 UTF-8 JSON、顶层不是 JSON 对象，或出现未知字段；
+- 路径标识为空或含 `/`、`\\`，或携带任意查询参数；
+- `state` 缺失、不是字符串、为空或不在四个合法状态之内（注意区分大小写，如 `"Staged"` 非法）；
+- `reason` 类型错误、为空或超过 1024 个 Unicode 码点；隔离或撤回缺少原因。
+
+标识格式合法但资源不存在，返回 HTTP 404（错误码 `resource_not_found`）。`GET`、`POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET, POST`）。
+
+任何失败都不会新增或修改资源、依赖关系、分块、成品内容或游标；资源响应结构、启动方式和内存边界保持不变。
+
 ## 运行测试
 
 ```bash
@@ -320,6 +384,6 @@ python -m unittest discover -s tests -v
 - 持久化数据和生成文件不得提交到 Git。
 - 不得把密钥、访问令牌、私有验证脚本或控制系统资料写入仓库。
 - 对已有公开接口的更改应保持向后兼容，除非任务明确要求破坏性升级。
-- 当前公开业务接口为健康检查、上述资源登记/查询接口、资源依赖关系登记、依赖拓扑查询与影响分析接口、资源内容校验接口，以及分块上传、组装与成品读取接口；资源、依赖、分块会话与成品内容均仅存于进程内存，不承诺跨进程或重启后的保存。
+- 当前公开业务接口为健康检查、上述资源登记/查询接口、资源依赖关系登记、依赖拓扑查询与影响分析接口、资源内容校验接口、分块上传、组装与成品读取接口，以及资源生命周期状态读取与提交接口；资源、依赖、分块会话、成品内容与生命周期状态均仅存于进程内存，不承诺跨进程或重启后的保存。
 - 分块能力明确不承诺以下行为：重启后的断点续传（重启清空全部会话与成品）、并发上传的加锁与顺序保证、以及跨资源的批量上传或批量组装。每个分块请求独立校验，冲突时以 409 拒绝且不覆盖既有字节。
 
