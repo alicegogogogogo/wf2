@@ -1,4 +1,4 @@
-"""In-process resource registry and registration validation."""
+"""In-process resource registry, registration validation and dependency graph."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ _CATEGORY_VALUES = frozenset(CATEGORIES)
 _DIGEST_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 _ALLOWED_FIELDS = frozenset({"name", "category", "digest", "source"})
 _REQUIRED_FIELDS = ("name", "category", "digest")
+_DEPENDENCY_FIELDS = frozenset({"dependency_id"})
 
 
 class ResourceValidationError(ValueError):
@@ -21,6 +22,22 @@ class ResourceValidationError(ValueError):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+
+
+class DependencyValidationError(ValueError):
+    """A dependency payload failed field-level validation."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+class DuplicateDependencyError(Exception):
+    """The same directed dependency edge was already registered."""
+
+
+class DependencyCycleError(Exception):
+    """The proposed edge is a self-loop or would close a cycle."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +58,17 @@ class Resource:
             "digest": self.digest,
             "source": self.source,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class Dependency:
+    """A directed edge: a resource depends on another resource."""
+
+    resource_id: str
+    dependency_id: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {"resource_id": self.resource_id, "dependency_id": self.dependency_id}
 
 
 def _require_non_empty_string(value: object, label: str) -> str:
@@ -100,6 +128,34 @@ def build_resource_fields(
     return name, category, digest, source
 
 
+def build_dependency_fields(payload: object) -> str:
+    """Validate a decoded dependency payload and return the dependency id."""
+
+    if not isinstance(payload, dict):
+        raise DependencyValidationError("Request body must be a JSON object.")
+
+    unknown_fields = set(payload) - _DEPENDENCY_FIELDS
+    if unknown_fields:
+        raise DependencyValidationError(
+            f"Unknown field: {sorted(unknown_fields)[0]!r}."
+        )
+    if "dependency_id" not in payload:
+        raise DependencyValidationError(
+            "Missing required field: 'dependency_id'."
+        )
+
+    dependency_id = payload["dependency_id"]
+    if not isinstance(dependency_id, str):
+        raise DependencyValidationError("dependency_id must be a string.")
+    if not dependency_id:
+        raise DependencyValidationError("dependency_id must not be empty.")
+    if "/" in dependency_id or "\\" in dependency_id:
+        raise DependencyValidationError(
+            "dependency_id must not contain path separators."
+        )
+    return dependency_id
+
+
 class ResourceStore:
     """Process-local, insertion-ordered resource storage."""
 
@@ -107,12 +163,21 @@ class ResourceStore:
         self._resources: list[Resource] = []
         self._by_id: dict[str, Resource] = {}
         self._key_to_id: dict[tuple[str, str, str], str] = {}
+        #: Outgoing edges keyed by the depending resource, in edge insertion
+        #: order; the values are sets for O(1) duplicate checks.
+        self._dependencies: dict[str, set[str]] = {}
+        #: Reverse edges keyed by the depended-on resource.
+        self._dependents: dict[str, set[str]] = {}
+        self._edge_keys: set[tuple[str, str]] = set()
 
     def reset(self) -> None:
         self._resources.clear()
         self._resources = []
         self._by_id = {}
         self._key_to_id = {}
+        self._dependencies = {}
+        self._dependents = {}
+        self._edge_keys = set()
 
     def list_all(self) -> list[Resource]:
         return list(self._resources)
@@ -174,3 +239,84 @@ class ResourceStore:
         self._by_id[resource.id] = resource
         self._key_to_id[key] = resource.id
         return resource, None
+
+    # -- Dependency graph ---------------------------------------------------
+
+    def add_dependency(
+        self, resource_id: str, dependency_id: str
+    ) -> Dependency:
+        """Add a directed edge ``resource_id -> dependency_id``.
+
+        Both endpoints must already be registered; callers are responsible
+        for verifying existence. Raises
+        :class:`DuplicateDependencyError` for an existing edge in the same
+        direction and :class:`DependencyCycleError` for a self-loop or any
+        edge that would close a cycle. Failed calls never mutate the graph.
+        """
+
+        if resource_id == dependency_id:
+            raise DependencyCycleError("A resource cannot depend on itself.")
+
+        key = (resource_id, dependency_id)
+        if key in self._edge_keys:
+            raise DuplicateDependencyError(
+                "This dependency relationship already exists."
+            )
+
+        if self._reaches(dependency_id, resource_id):
+            raise DependencyCycleError(
+                "This dependency would create a cycle."
+            )
+
+        dependency = Dependency(resource_id, dependency_id)
+        self._edge_keys.add(key)
+        self._dependencies.setdefault(resource_id, set()).add(dependency_id)
+        self._dependents.setdefault(dependency_id, set()).add(resource_id)
+        return dependency
+
+    def _reaches(self, source_id: str, target_id: str) -> bool:
+        """Return whether ``target_id`` is reachable from ``source_id``."""
+
+        stack = [source_id]
+        seen: set[str] = {source_id}
+        while stack:
+            current = stack.pop()
+            if current == target_id:
+                return True
+            for neighbour in self._dependencies.get(current, ()):
+                if neighbour not in seen:
+                    seen.add(neighbour)
+                    stack.append(neighbour)
+        return False
+
+    def list_dependencies(self, resource_id: str) -> list[Resource]:
+        """Return all transitive dependencies in registration order.
+
+        Every reachable resource is reported at most once and the origin
+        itself is never included.
+        """
+
+        return self._reachable(resource_id, self._dependencies)
+
+    def list_impact(self, resource_id: str) -> list[Resource]:
+        """Return resources directly or indirectly depending on the origin.
+
+        Traversal follows reverse edges; results are ordered by resource
+        registration order and the origin itself is never included.
+        """
+
+        return self._reachable(resource_id, self._dependents)
+
+    def _reachable(
+        self, origin_id: str, adjacency: dict[str, set[str]]
+    ) -> list[Resource]:
+        reachable: set[str] = set()
+        stack: list[str] = [origin_id]
+        while stack:
+            current = stack.pop()
+            for neighbour in adjacency.get(current, ()):
+                if neighbour not in reachable:
+                    reachable.add(neighbour)
+                    stack.append(neighbour)
+        # Stable output regardless of graph insertion or set iteration.
+        return [r for r in self._resources if r.id in reachable]

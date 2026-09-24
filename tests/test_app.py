@@ -657,5 +657,376 @@ class ApplicationTests(unittest.TestCase):
         self.assertEqual(len(body["resources"]), 1)
 
 
+class DependencyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        store.reset()
+
+    def _create(self, name: str = "x", digest_char: str = "a") -> str:
+        _s, _h, body = call_json(
+            "POST",
+            "/resources",
+            {
+                "name": name,
+                "category": "code",
+                "digest": digest_char * 64,
+            },
+        )
+        return str(body["id"])
+
+    def _add_edge(self, resource_id: str, dependency_id: str) -> tuple[str, dict[str, object]]:
+        status, headers, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/dependencies",
+            {"dependency_id": dependency_id},
+        )
+        return status, body
+
+    # --- Creating edges ----------------------------------------------------
+
+    def test_add_dependency_returns_201_relationship(self) -> None:
+        a = self._create("a", "a")
+        b = self._create("b", "b")
+        status, headers, raw = call(
+            "POST",
+            f"/resources/{a}/dependencies",
+            {"dependency_id": b},
+        )
+        self.assertEqual(status, "201 Created")
+        self.assertIn(
+            ("Content-Type", "application/json; charset=utf-8"), headers
+        )
+        self.assertEqual(
+            raw,
+            f'{{"resource_id":"{a}","dependency_id":"{b}"}}\n'.encode(),
+        )
+
+    def test_dependency_edge_does_not_change_resources(self) -> None:
+        a = self._create("a", "a")
+        b = self._create("b", "b")
+        self._add_edge(a, b)
+        _s, _h, listing = call_json("GET", "/resources")
+        self.assertEqual([r["id"] for r in listing["resources"]], [a, b])
+
+    def test_duplicate_same_direction_is_conflict(self) -> None:
+        a = self._create("a", "a")
+        b = self._create("b", "b")
+        self.assertEqual(self._add_edge(a, b)[0], "201 Created")
+        status, body = self._add_edge(a, b)
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "duplicate_dependency")
+
+        # The edge set is unchanged: still a single edge, not duplicated.
+        _s, _h, dependencies = call_json(
+            "GET", f"/resources/{a}/dependencies"
+        )
+        self.assertEqual(
+            [r["id"] for r in dependencies["dependencies"]], [b]
+        )
+
+    def test_reverse_direction_closes_a_two_node_cycle(self) -> None:
+        a = self._create("a", "a")
+        b = self._create("b", "b")
+        self._add_edge(a, b)
+        # The reverse edge is not a duplicate of the directed edge, but it
+        # closes a cycle a -> b -> a and must be reported as such.
+        status, body = self._add_edge(b, a)
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "dependency_cycle")
+
+    def test_self_loop_is_cycle(self) -> None:
+        a = self._create("a", "a")
+        status, body = self._add_edge(a, a)
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "dependency_cycle")
+        _s, _h, dependencies = call_json(
+            "GET", f"/resources/{a}/dependencies"
+        )
+        self.assertEqual(dependencies["dependencies"], [])
+
+    def test_indirect_cycle_is_rejected(self) -> None:
+        a = self._create("a", "a")
+        b = self._create("b", "b")
+        c = self._create("c", "c")
+        self.assertEqual(self._add_edge(a, b)[0], "201 Created")
+        self.assertEqual(self._add_edge(b, c)[0], "201 Created")
+        status, body = self._add_edge(c, a)
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "dependency_cycle")
+
+        # State unchanged: c still only reaches nothing; a reaches b and c.
+        _s, _h, deps_c = call_json(
+            "GET", f"/resources/{c}/dependencies"
+        )
+        self.assertEqual(deps_c["dependencies"], [])
+        _s, _h, impact_a = call_json("GET", f"/resources/{a}/impact")
+        self.assertEqual(impact_a["resources"], [])
+
+    def test_failed_edge_does_not_affect_unrelated_state(self) -> None:
+        a = self._create("a", "a")
+        b = self._create("b", "b")
+        c = self._create("c", "c")
+        self._add_edge(a, b)
+        self._add_edge(c, a)  # 201: c -> a -> b
+        # Closing c -> b is fine (already reachable transitively but not
+        # directly); closing b -> c is a cycle and must be rejected.
+        status, _body = self._add_edge(b, c)
+        self.assertEqual(status, "409 Conflict")
+        _s, _h, deps_b = call_json(
+            "GET", f"/resources/{b}/dependencies"
+        )
+        self.assertEqual(deps_b["dependencies"], [])
+        _s, _h, deps_c = call_json(
+            "GET", f"/resources/{c}/dependencies"
+        )
+        self.assertEqual(
+            [r["id"] for r in deps_c["dependencies"]], [a, b]
+        )
+
+    # --- Transitive dependency listing ------------------------------------
+
+    def test_list_empty_dependencies(self) -> None:
+        a = self._create("a", "a")
+        status, _headers, raw = call(
+            "GET", f"/resources/{a}/dependencies"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(raw, b'{"dependencies":[]}\n')
+
+    def test_list_transitive_dependencies_in_registration_order(self) -> None:
+        # Registration order: top, l, r, leaf. Edges form a diamond so
+        # "leaf" is reachable two ways and must appear exactly once.
+        top = self._create("top", "1")
+        l = self._create("l", "2")
+        r = self._create("r", "3")
+        leaf = self._create("leaf", "4")
+        self._add_edge(top, l)
+        self._add_edge(top, r)
+        self._add_edge(l, leaf)
+        self._add_edge(r, leaf)
+
+        _s, _h, body = call_json(
+            "GET", f"/resources/{top}/dependencies"
+        )
+        self.assertEqual(
+            [r["id"] for r in body["dependencies"]], [l, r, leaf]
+        )
+        # Entries are full resource objects in the documented key order.
+        first = body["dependencies"][0]
+        self.assertEqual(
+            list(first.keys()),
+            ["id", "name", "category", "digest", "source"],
+        )
+
+    def test_dependency_listing_excludes_origin(self) -> None:
+        a = self._create("a", "a")
+        b = self._create("b", "b")
+        self._add_edge(a, b)
+        _s, _h, deps_a = call_json("GET", f"/resources/{a}/dependencies")
+        self.assertNotIn(a, [r["id"] for r in deps_a["dependencies"]])
+
+    # --- Impact ------------------------------------------------------------
+
+    def test_empty_impact(self) -> None:
+        a = self._create("a", "a")
+        status, _headers, raw = call("GET", f"/resources/{a}/impact")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(raw, b'{"resources":[]}\n')
+
+    def test_impact_lists_direct_and_indirect_dependents(self) -> None:
+        top = self._create("top", "1")
+        l = self._create("l", "2")
+        r = self._create("r", "3")
+        leaf = self._create("leaf", "4")
+        self._add_edge(top, l)
+        self._add_edge(top, r)
+        self._add_edge(l, leaf)
+        self._add_edge(r, leaf)
+
+        _s, _h, body = call_json("GET", f"/resources/{leaf}/impact")
+        self.assertEqual(
+            [r["id"] for r in body["resources"]], [top, l, r]
+        )
+
+    def test_impact_excludes_origin(self) -> None:
+        a = self._create("a", "a")
+        b = self._create("b", "b")
+        self._add_edge(a, b)
+        _s, _h, body = call_json("GET", f"/resources/{b}/impact")
+        self.assertEqual([r["id"] for r in body["resources"]], [a])
+        self.assertNotIn(b, [r["id"] for r in body["resources"]])
+
+    # --- Missing resources -------------------------------------------------
+
+    def test_get_dependencies_unknown_origin_is_404(self) -> None:
+        status, _h, body = call_json(
+            "GET", "/resources/missing/dependencies"
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "resource_not_found")
+
+    def test_get_impact_unknown_origin_is_404(self) -> None:
+        status, _h, body = call_json(
+            "GET", "/resources/missing/impact"
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "resource_not_found")
+
+    def test_post_dependency_unknown_origin_is_404(self) -> None:
+        b = self._create("b", "b")
+        status, _h, body = call_json(
+            "POST",
+            "/resources/missing/dependencies",
+            {"dependency_id": b},
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "resource_not_found")
+
+    def test_post_dependency_unknown_target_is_404(self) -> None:
+        a = self._create("a", "a")
+        status, _h, body = call_json(
+            "POST",
+            f"/resources/{a}/dependencies",
+            {"dependency_id": "missing"},
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "resource_not_found")
+        _s, _h, deps = call_json(
+            "GET", f"/resources/{a}/dependencies"
+        )
+        self.assertEqual(deps["dependencies"], [])
+
+    # --- Bad requests ------------------------------------------------------
+
+    def test_path_id_with_separator_is_bad_request(self) -> None:
+        a = self._create("a", "a")
+        b = self._create("b", "b")
+        for suffix, method, body in [
+            ("dependencies", "GET", None),
+            ("impact", "GET", None),
+            ("dependencies", "POST", {"dependency_id": b}),
+        ]:
+            with self.subTest(suffix=suffix, method=method):
+                status, _h, resp = call_json(
+                    method,
+                    f"/resources/{a}/x/{suffix}",
+                    body,
+                )
+                self.assertEqual(status[:3], "400")
+                self.assertEqual(resp["error"], "invalid_request")
+
+    def test_missing_body_is_bad_request(self) -> None:
+        a = self._create("a", "a")
+        status, _h, body = call_json(
+            "POST", f"/resources/{a}/dependencies", None
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_malformed_or_non_utf8_body_is_bad_request(self) -> None:
+        a = self._create("a", "a")
+        for raw in (b"{not json", b"\xff\xfe"):
+            with self.subTest(raw=raw):
+                status, _h, body = call_json(
+                    "POST", f"/resources/{a}/dependencies", raw
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+    def test_non_object_top_level_is_bad_request(self) -> None:
+        a = self._create("a", "a")
+        for raw in (b"[]", b'"x"', b"42", b"null"):
+            with self.subTest(raw=raw):
+                status, _h, body = call_json(
+                    "POST", f"/resources/{a}/dependencies", raw
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+    def test_missing_dependency_id_is_bad_request(self) -> None:
+        a = self._create("a", "a")
+        status, _h, body = call_json(
+            "POST", f"/resources/{a}/dependencies", {}
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_bad_dependency_id_values(self) -> None:
+        a = self._create("a", "a")
+        for value in (12, True, None, ["x"], "", "a/b", "a\\b"):
+            with self.subTest(value=value):
+                status, _h, body = call_json(
+                    "POST",
+                    f"/resources/{a}/dependencies",
+                    {"dependency_id": value},
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+    def test_unknown_field_is_bad_request(self) -> None:
+        a = self._create("a", "a")
+        b = self._create("b", "b")
+        status, _h, body = call_json(
+            "POST",
+            f"/resources/{a}/dependencies",
+            {"dependency_id": b, "extra": 1},
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_query_parameters_rejected(self) -> None:
+        a = self._create("a", "a")
+        b = self._create("b", "b")
+        for method, path, body in [
+            ("GET", f"/resources/{a}/dependencies", None),
+            ("GET", f"/resources/{a}/impact", None),
+            (
+                "POST",
+                f"/resources/{a}/dependencies",
+                {"dependency_id": b},
+            ),
+        ]:
+            with self.subTest(method=method, path=path):
+                status, _h, resp = call_json(
+                    method, path, body, query_string="unused=1"
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(resp["error"], "invalid_request")
+
+    # --- Methods -----------------------------------------------------------
+
+    def test_unsupported_methods(self) -> None:
+        a = self._create("a", "a")
+        status, headers, body = call_json(
+            "DELETE", f"/resources/{a}/dependencies"
+        )
+        self.assertEqual(status, "405 Method Not Allowed")
+        self.assertEqual(body["error"], "method_not_allowed")
+        self.assertIn(("Allow", "GET, POST"), headers)
+
+        status, headers, body = call_json(
+            "POST", f"/resources/{a}/impact", {}
+        )
+        self.assertEqual(status, "405 Method Not Allowed")
+        self.assertEqual(body["error"], "method_not_allowed")
+        self.assertIn(("Allow", "GET"), headers)
+
+    # --- Baseline compatibility --------------------------------------------
+
+    def test_existing_item_route_still_supported(self) -> None:
+        a = self._create("a", "a")
+        status, _h, body = call_json("GET", f"/resources/{a}")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["id"], a)
+
+    def test_dependency_named_resource_is_not_matched_as_graph_route(self) -> None:
+        # An id literally ending in "/dependencies" carries a separator and
+        # must never resolve as a resource or bypass validation.
+        status, _h, body = call_json(
+            "GET", "/resources/abc/dependencies/impact"
+        )
+        self.assertIn(status[:3], {"400", "404"})
+        self.assertIn("error", body)
+
+
 if __name__ == "__main__":
     unittest.main()

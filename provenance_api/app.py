@@ -12,7 +12,16 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
-from .resources import CATEGORIES, Resource, ResourceStore, ResourceValidationError
+from .resources import (
+    CATEGORIES,
+    DependencyCycleError,
+    DependencyValidationError,
+    DuplicateDependencyError,
+    Resource,
+    ResourceStore,
+    ResourceValidationError,
+    build_dependency_fields,
+)
 
 StartResponse = Callable[[str, list[tuple[str, str]]], Any]
 
@@ -374,6 +383,179 @@ def _handle_resource_item(
     return _resource_response(start_response, "200 OK", resource)
 
 
+def _bad_path_id(
+    raw_id: str, start_response: StartResponse
+) -> Iterable[bytes] | None:
+    if not raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Resource id must not be empty.",
+        )
+    if "/" in raw_id or "\\" in raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Resource id must not contain path separators.",
+        )
+    return None
+
+
+def _reject_query_params(
+    environ: dict[str, Any], start_response: StartResponse
+) -> Iterable[bytes] | None:
+    query_string = str(environ.get("QUERY_STRING", ""))
+    if parse_qsl(query_string, keep_blank_values=True):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "This endpoint does not accept query parameters.",
+        )
+    return None
+
+
+def _handle_dependencies(
+    method: str,
+    raw_id: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method not in ("GET", "POST"):
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET, POST",
+        )
+
+    bad_id = _bad_path_id(raw_id, start_response)
+    if bad_id is not None:
+        return bad_id
+    bad_query = _reject_query_params(environ, start_response)
+    if bad_query is not None:
+        return bad_query
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    if method == "GET":
+        dependencies = store.list_dependencies(raw_id)
+        return _json_response(
+            start_response,
+            "200 OK",
+            {"dependencies": [r.to_dict() for r in dependencies]},
+            trailing_newline=True,
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    try:
+        dependency_id = build_dependency_fields(payload)
+    except DependencyValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if store.get(dependency_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested dependency_id.",
+        )
+
+    try:
+        edge = store.add_dependency(raw_id, dependency_id)
+    except DuplicateDependencyError:
+        return _error(
+            start_response,
+            "409 Conflict",
+            "duplicate_dependency",
+            "This dependency relationship already exists.",
+        )
+    except DependencyCycleError:
+        return _error(
+            start_response,
+            "409 Conflict",
+            "dependency_cycle",
+            "This dependency would create a cycle.",
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created",
+        edge.to_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_impact(
+    method: str,
+    raw_id: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    bad_id = _bad_path_id(raw_id, start_response)
+    if bad_id is not None:
+        return bad_id
+    bad_query = _reject_query_params(environ, start_response)
+    if bad_query is not None:
+        return bad_query
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    impacted = store.list_impact(raw_id)
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"resources": [r.to_dict() for r in impacted]},
+        trailing_newline=True,
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -399,9 +581,26 @@ def application(
             )
 
         if path.startswith("/resources/"):
-            return _handle_resource_item(
-                method, path[len("/resources/"):], start_response
-            )
+            remainder = path[len("/resources/") :]
+            # The suffix match also covers the bare "/dependencies" shape
+            # (/resources//dependencies), whose empty id segment is reported
+            # as invalid_request by the handler. A literal id without a slash
+            # (e.g. /resources/dependencies) still hits the item route.
+            if remainder.endswith("/dependencies"):
+                return _handle_dependencies(
+                    method,
+                    remainder[: -len("/dependencies")],
+                    environ,
+                    start_response,
+                )
+            if remainder.endswith("/impact"):
+                return _handle_impact(
+                    method,
+                    remainder[: -len("/impact")],
+                    environ,
+                    start_response,
+                )
+            return _handle_resource_item(method, remainder, start_response)
 
         # Unknown paths and undeclared methods on /health stay as before.
         return _json_response(
