@@ -22,12 +22,24 @@ from .lifecycle import (
     LifecycleRecord,
     LifecycleStore,
 )
+from .licenses import (
+    LicenseError,
+    LicenseStore,
+    LicenseValidationError,
+    build_license_fields,
+)
 from .resources import (
     CATEGORIES,
     DependencyError,
     Resource,
     ResourceStore,
     ResourceValidationError,
+)
+from .sbom import (
+    SbomError,
+    SbomStore,
+    SbomValidationError,
+    build_sbom_fields,
 )
 from .vulnerabilities import (
     SEVERITY_VALUES,
@@ -51,6 +63,12 @@ lifecycle_store = LifecycleStore()
 #: Process-local vulnerability alerts; cleared on restart like the rest.
 vulnerability_store = VulnerabilityStore()
 
+#: Process-local SBOM documents; one per resource, cleared on restart.
+sbom_store = SbomStore()
+
+#: Process-local license declarations; one per resource, cleared on restart.
+license_store = LicenseStore()
+
 
 def reset_state() -> None:
     """Clear every in-process store (test and tooling helper)."""
@@ -59,6 +77,8 @@ def reset_state() -> None:
     content_store.reset()
     lifecycle_store.reset()
     vulnerability_store.reset()
+    sbom_store.reset()
+    license_store.reset()
 
 #: Listing defaults and bounds.
 DEFAULT_LIMIT = 50
@@ -1375,6 +1395,264 @@ def _handle_vulnerabilities(
     )
 
 
+def _read_json_object(
+    environ: dict[str, Any], start_response: StartResponse
+) -> tuple[object | None, Iterable[bytes] | None]:
+    """Read and decode a JSON-object request body.
+
+    Returns ``(payload, None)`` on success or ``(None, error_response)`` when
+    the body is missing, not valid UTF-8 JSON, or the top-level value is not
+    a JSON object.
+    """
+
+    raw = _read_body(environ)
+    if not raw:
+        return None, _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+    if not isinstance(payload, dict):
+        return None, _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be a JSON object.",
+        )
+    return payload, None
+
+
+def _handle_sbom_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    payload, error_response = _read_json_object(environ, start_response)
+    if error_response is not None:
+        return error_response
+    assert payload is not None
+
+    try:
+        # Validate the entire body before touching the store or checking the
+        # resource, so an invalid request always answers 400 and leaves no
+        # partial document behind.
+        format_value, components = build_sbom_fields(payload)
+    except SbomValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    try:
+        document, created = sbom_store.submit(raw_id, format_value, components)
+    except SbomError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created" if created else "200 OK",
+        document.to_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_sbom_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    document = sbom_store.get(raw_id)
+    if document is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "sbom_not_found",
+            "No SBOM document is recorded for this resource.",
+        )
+    return _json_response(
+        start_response,
+        "200 OK",
+        document.to_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_sbom(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_sbom_post(environ, raw_id, start_response)
+    if method == "GET":
+        return _handle_sbom_get(environ, raw_id, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
+def _handle_license_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    payload, error_response = _read_json_object(environ, start_response)
+    if error_response is not None:
+        return error_response
+    assert payload is not None
+
+    try:
+        # Validate before touching the store or resolving the resource so a
+        # bad declaration can never be partially recorded.
+        spdx_id, source = build_license_fields(payload)
+    except LicenseValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    try:
+        record, created = license_store.submit(raw_id, spdx_id, source)
+    except LicenseError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created" if created else "200 OK",
+        record.to_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_license_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    record = license_store.get(raw_id)
+    if record is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "license_not_found",
+            "No license is declared for this resource.",
+        )
+    return _json_response(
+        start_response,
+        "200 OK",
+        record.to_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_license(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_license_post(environ, raw_id, start_response)
+    if method == "GET":
+        return _handle_license_get(environ, raw_id, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -1428,6 +1706,14 @@ def application(
                 )
             if separator and tail == "vulnerabilities":
                 return _handle_vulnerabilities(
+                    method, environ, head, start_response
+                )
+            if separator and tail == "sbom":
+                return _handle_sbom(
+                    method, environ, head, start_response
+                )
+            if separator and tail == "license":
+                return _handle_license(
                     method, environ, head, start_response
                 )
             if separator and tail == "chunks/status":
@@ -1488,6 +1774,24 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/vulnerabilities")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/sbom"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without recording a document.
+                return _handle_sbom(
+                    method,
+                    environ,
+                    suffix[: -len("/sbom")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/license"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without recording a declaration.
+                return _handle_license(
+                    method,
+                    environ,
+                    suffix[: -len("/license")],
                     start_response,
                 )
             # Any other suffix keeps the baseline item semantics (embedded
