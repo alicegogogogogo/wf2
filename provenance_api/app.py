@@ -23,6 +23,12 @@ from .lifecycle import (
     LifecycleRecord,
     LifecycleStore,
 )
+from .mirrors import (
+    MirrorFetchError,
+    MirrorStore,
+    MirrorValidationError,
+    fetch_upstream_layer,
+)
 from .notifications import (
     NotificationStore,
     NotificationValidationError,
@@ -94,6 +100,9 @@ notification_store = NotificationStore()
 #: Process-local image layer cache; entries and counters never persisted.
 cache_store = LayerCacheStore()
 
+#: Process-local image mirror registry; cleared on restart like everything.
+mirror_store = MirrorStore()
+
 
 def reset_state() -> None:
     """Clear every in-process store (test and tooling helper)."""
@@ -107,6 +116,7 @@ def reset_state() -> None:
     policy_store.reset()
     notification_store.reset()
     cache_store.reset()
+    mirror_store.reset()
 
 #: Listing defaults and bounds.
 DEFAULT_LIMIT = 50
@@ -2320,6 +2330,243 @@ def _handle_cache_status(
     )
 
 
+def _handle_mirrors_get(
+    environ: dict[str, Any], start_response: StartResponse
+) -> Iterable[bytes]:
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Mirrors are returned in registration order; an empty registry is a
+    # valid empty array.
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"mirrors": [mirror.to_dict() for mirror in mirror_store.list_all()]},
+        trailing_newline=True,
+    )
+
+
+def _handle_mirrors_post(
+    environ: dict[str, Any], start_response: StartResponse
+) -> Iterable[bytes]:
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Validate the whole body before touching the store, so a bad request
+    # can never leave a partial mirror.
+    try:
+        created, existing = mirror_store.add(payload)
+    except MirrorValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if existing is not None:
+        # Names are globally unique; the original mirror is never overwritten.
+        return _error(
+            start_response,
+            "409 Conflict",
+            "duplicate_mirror",
+            "A mirror with the same name already exists.",
+        )
+
+    assert created is not None
+    return _json_response(
+        start_response, "201 Created", created.to_dict(), trailing_newline=True
+    )
+
+
+def _handle_mirror_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    if not raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not be empty.",
+        )
+    if "/" in raw_id or "\\" in raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not contain path separators.",
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    mirror = mirror_store.get(raw_id)
+    if mirror is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_not_found",
+            "No mirror exists with the requested id.",
+        )
+
+    return _json_response(
+        start_response, "200 OK", mirror.to_dict(), trailing_newline=True
+    )
+
+
+def _raw_layer_response(
+    start_response: StartResponse, data: bytes
+) -> Iterable[bytes]:
+    # Raw layer bytes only: same headers as an artifact/cache read, no JSON
+    # wrapper and no trailing newline.
+    start_response(
+        "200 OK",
+        [
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", str(len(data))),
+        ],
+    )
+    return [data]
+
+
+def _handle_mirror_pull(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_digest: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
+        )
+
+    if not raw_id or "/" in raw_id or "\\" in raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not be empty or contain path separators.",
+        )
+    if _DIGEST_PATTERN.fullmatch(raw_digest) is None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Layer digest must be a 64-character hexadecimal string.",
+        )
+    digest = raw_digest.lower()
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    mirror = mirror_store.get(raw_id)
+    if mirror is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_not_found",
+            "No mirror exists with the requested id.",
+        )
+
+    # A cache hit is served straight from storage; pulling must not change
+    # the cache counters, so the counter-free accessor is used.
+    cached = cache_store.peek(digest)
+    if cached is not None:
+        return _raw_layer_response(start_response, cached)
+
+    try:
+        data = fetch_upstream_layer(mirror.upstream, digest)
+    except MirrorFetchError as exc:
+        return _error(
+            start_response, "502 Bad Gateway", exc.code, exc.message
+        )
+
+    # Only bytes that hash to the requested digest may enter the cache.
+    if hashlib.sha256(data).hexdigest() != digest:
+        return _error(
+            start_response,
+            "502 Bad Gateway",
+            "mirror_digest_mismatch",
+            "Upstream layer bytes do not match the requested digest.",
+        )
+
+    try:
+        # The digest was just verified, so ``put`` can only fail on quota;
+        # either way the cache is left unchanged.
+        cache_store.put(digest, data)
+    except CacheError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _raw_layer_response(start_response, data)
+
+
+def _handle_mirrors(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "GET":
+        return _handle_mirrors_get(environ, start_response)
+    if method == "POST":
+        return _handle_mirrors_post(environ, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -2350,6 +2597,44 @@ def application(
         if path.startswith("/cache/layers/"):
             return _handle_cache_layer(
                 method, environ, path[len("/cache/layers/"):], start_response
+            )
+
+        if path == "/mirrors":
+            return _handle_mirrors(method, environ, start_response)
+
+        if path.startswith("/mirrors/"):
+            suffix = path[len("/mirrors/"):]
+            marker = "/pull/"
+            marker_index = suffix.find(marker)
+            if marker_index >= 0:
+                # Split on the pull marker even when the id segment embeds a
+                # separator, so the pull handler can reject the id as a bad
+                # request instead of treating the path as an unknown item.
+                return _handle_mirror_pull(
+                    method,
+                    environ,
+                    suffix[:marker_index],
+                    suffix[marker_index + len(marker):],
+                    start_response,
+                )
+            if suffix.endswith("/pull"):
+                # A pull always names a digest; an empty segment is invalid.
+                return _handle_mirror_pull(
+                    method,
+                    environ,
+                    suffix[: -len("/pull")],
+                    "",
+                    start_response,
+                )
+            head, separator, _tail = suffix.partition("/")
+            if not separator:
+                return _handle_mirror_item(
+                    method, environ, head, start_response
+                )
+            # Any other suffix embeds a separator in the id segment; the
+            # item handler rejects it without touching any state.
+            return _handle_mirror_item(
+                method, environ, suffix, start_response
             )
 
         if path.startswith("/resources/"):
