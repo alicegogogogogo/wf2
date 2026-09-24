@@ -194,6 +194,60 @@ class ResourceStore:
         self._dependents[resource.id] = set()
         return resource, None
 
+    def add_remote(
+        self,
+        *,
+        name: str,
+        category: str,
+        digest: str,
+        source: str | None,
+        resource_id: str | None = None,
+    ) -> Resource:
+        """Store a resource resolved from a remote repository.
+
+        The caller has already validated the fields and matched the digest
+        against the registry, so the record is constructed directly; the
+        same uniqueness key is enforced defensively. When ``resource_id``
+        is given it is reused (the caller already minted it during
+        planning); otherwise a fresh id is generated.
+        """
+
+        key = (category, name, digest)
+        existing_id = self._key_to_id.get(key)
+        if existing_id is not None:
+            return self._by_id[existing_id]
+
+        resource = Resource(
+            id=resource_id if resource_id is not None else uuid.uuid4().hex,
+            name=name,
+            category=category,
+            digest=digest,
+            source=source,
+        )
+        self._resources.append(resource)
+        self._by_id[resource.id] = resource
+        self._key_to_id[key] = resource.id
+        self._dependencies[resource.id] = set()
+        self._dependents[resource.id] = set()
+        return resource
+
+    def discard(self, resource_id: str) -> None:
+        """Remove a resource that has no edges yet.
+
+        Used to roll back a resource created during an aborted operation.
+        Only safe for resources with no dependencies or dependents.
+        """
+
+        resource = self._by_id.pop(resource_id, None)
+        if resource is None:
+            return
+        self._resources = [r for r in self._resources if r.id != resource_id]
+        self._key_to_id.pop(
+            (resource.category, resource.name, resource.digest), None
+        )
+        self._dependencies.pop(resource_id, None)
+        self._dependents.pop(resource_id, None)
+
     # --- Dependencies ------------------------------------------------------
 
     def _reachable(self, start: str, graph: dict[str, set[str]]) -> set[str]:
@@ -212,14 +266,13 @@ class ResourceStore:
     def _registration_order(self, ids: set[str]) -> list[str]:
         return [r.id for r in self._resources if r.id in ids]
 
-    def add_dependency(self, resource_id: str, dependency_id: str) -> None:
-        """Record that ``resource_id`` depends on ``dependency_id``.
+    def check_dependency(self, resource_id: str, dependency_id: str) -> None:
+        """Validate an edge without mutating the graph.
 
-        Both resources must already be registered. Raises
-        :class:`DependencyError` with code ``duplicate_dependency`` when the
-        same-direction relation already exists, or ``dependency_cycle`` for a
-        self loop or a relation that would introduce a cycle; in either case
-        the graph is left unchanged.
+        Raises :class:`DependencyError` with code ``duplicate_dependency``
+        when the same-direction relation already exists, or
+        ``dependency_cycle`` for a self loop or a relation that would
+        introduce a cycle.
         """
 
         if resource_id == dependency_id:
@@ -242,6 +295,17 @@ class ResourceStore:
                 "This dependency would introduce a cycle.",
             )
 
+    def add_dependency(self, resource_id: str, dependency_id: str) -> None:
+        """Record that ``resource_id`` depends on ``dependency_id``.
+
+        Both resources must already be registered. Raises
+        :class:`DependencyError` with code ``duplicate_dependency`` when the
+        same-direction relation already exists, or ``dependency_cycle`` for a
+        self loop or a relation that would introduce a cycle; in either case
+        the graph is left unchanged.
+        """
+
+        self.check_dependency(resource_id, dependency_id)
         self._dependencies[resource_id].add(dependency_id)
         self._dependents[dependency_id].add(resource_id)
 

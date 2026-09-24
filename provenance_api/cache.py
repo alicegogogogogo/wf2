@@ -102,6 +102,18 @@ class LayerCacheStore:
                 "digest_mismatch",
                 "Layer bytes do not match the digest in the path.",
             )
+        return self.put_verified(digest, data)
+
+    def put_verified(self, digest: str, data: bytes) -> tuple[bool, int]:
+        """Store bytes whose digest the caller has already verified.
+
+        Unlike :meth:`put`, no SHA-256 comparison is performed here: the
+        caller guarantees ``data`` belongs to ``digest``. The conflict,
+        idempotence and quota semantics are otherwise identical: equal
+        bytes under an existing digest are an idempotent no-op, different
+        bytes raise ``cache_conflict`` and an over-quota write raises
+        ``cache_quota_exceeded`` with the cache unchanged.
+        """
 
         existing = self._layers.get(digest)
         if existing is not None:

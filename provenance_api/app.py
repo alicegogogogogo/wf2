@@ -14,6 +14,13 @@ from urllib.parse import parse_qsl
 
 from .cache import CacheError, LayerCacheStore
 from .content import ContentError, ContentStore
+from .cross_references import (
+    CrossReferenceError,
+    CrossReferenceStore,
+    CrossReferenceValidationError,
+    build_cross_reference_fields,
+    resolve_remote,
+)
 from .lifecycle import (
     BLOCKING_STATES,
     MAX_REASON_LENGTH,
@@ -103,6 +110,10 @@ cache_store = LayerCacheStore()
 #: Process-local image mirror registry; cleared on restart like everything.
 mirror_store = MirrorStore()
 
+#: Process-local cross-repository references; cleared on restart like the
+#: rest.
+cross_reference_store = CrossReferenceStore()
+
 
 def reset_state() -> None:
     """Clear every in-process store (test and tooling helper)."""
@@ -117,6 +128,7 @@ def reset_state() -> None:
     notification_store.reset()
     cache_store.reset()
     mirror_store.reset()
+    cross_reference_store.reset()
 
 #: Listing defaults and bounds.
 DEFAULT_LIMIT = 50
@@ -2670,6 +2682,181 @@ def _handle_mirrors(
     )
 
 
+def _handle_cross_references_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Validate the whole body before touching any store or contacting the
+    # upstream, so a bad request can never leave a partial reference.
+    try:
+        repository, upstream, remote_id, digest = (
+            build_cross_reference_fields(payload)
+        )
+    except CrossReferenceValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    try:
+        # Local, pre-flight conflicts are rejected before the upstream is
+        # ever contacted.
+        cross_reference_store.check_prerequisites(
+            repository, upstream, remote_id
+        )
+    except CrossReferenceError as exc:
+        return _error(
+            start_response,
+            f"{exc.http_status} Conflict",
+            exc.code,
+            exc.message,
+        )
+
+    try:
+        # Fetch /resources/<remote_id> from the upstream and validate the
+        # reported metadata and digest.
+        resolution = resolve_remote(upstream, remote_id, digest)
+    except CrossReferenceError as exc:
+        return _error(
+            start_response,
+            f"{exc.http_status} Bad Gateway",
+            exc.code,
+            exc.message,
+        )
+
+    try:
+        # Resolve the local identity and pre-validate the dependency edge
+        # (self loop, duplicate edge, cycle) without mutating anything.
+        plan = cross_reference_store.plan(
+            store,
+            resource_id=raw_id,
+            repository=repository,
+            upstream=upstream,
+            remote_id=remote_id,
+            digest=digest,
+            resolution=resolution,
+        )
+    except CrossReferenceError as exc:
+        return _error(
+            start_response,
+            f"{exc.http_status} Conflict",
+            exc.code,
+            exc.message,
+        )
+
+    try:
+        # The metadata bytes are content-addressed by the verified digest;
+        # identical bytes are idempotent, differing bytes under the same
+        # digest are a conflict and abort the resolution.
+        cache_store.put_verified(digest, resolution.raw)
+    except CacheError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    # Only now do references, resources and edges come into existence.
+    try:
+        record, _dependency = cross_reference_store.commit(store, plan)
+    except DependencyError as exc:
+        # The edge was pre-validated by ``plan``; this only guards against
+        # an unexpected graph change between planning and committing.
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+    return _json_response(
+        start_response,
+        "201 Created",
+        record.to_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_cross_references_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+    records = cross_reference_store.list_for(raw_id)
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"cross_references": [record.to_dict() for record in records]},
+        trailing_newline=True,
+    )
+
+
+def _handle_cross_references(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_cross_references_post(environ, raw_id, start_response)
+    if method == "GET":
+        return _handle_cross_references_get(environ, raw_id, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -2802,6 +2989,10 @@ def application(
                 return _handle_notifications(
                     method, environ, head, start_response
                 )
+            if separator and tail == "cross-references":
+                return _handle_cross_references(
+                    method, environ, head, start_response
+                )
             if separator and tail == "chunks/status":
                 return _handle_chunks_status(
                     method, environ, head, start_response
@@ -2923,6 +3114,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/notifications")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/cross-references"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without resolving anything.
+                return _handle_cross_references(
+                    method,
+                    environ,
+                    suffix[: -len("/cross-references")],
                     start_response,
                 )
             # Any other suffix keeps the baseline item semantics (embedded
