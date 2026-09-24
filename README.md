@@ -308,6 +308,52 @@ curl -s "http://127.0.0.1:8000/resources/$ID/content" --output artifact.bin
 - 方法限制：`/resources/{id}/chunks/{index}` 与 `/resources/{id}/assemble` 仅允许 `POST`（`Allow: POST`）；`/resources/{id}/content` 仅允许 `GET`（`Allow: GET`）；其他方法返回 HTTP 405（错误码 `method_not_allowed`）。
 - 除 JSON 错误响应外，成品读取成功时只返回原始字节。
 
+## 生命周期状态
+
+每个资源都有生命周期状态，状态集合固定为 `staged`、`released`、`withdrawn`、`quarantined`（区分大小写）。新登记的资源默认处于 `staged`。状态与原因只保存在当前进程内存中，重启后全部清空，不写入任何文件。
+
+### 读取状态：`GET /resources/{id}/lifecycle`
+
+首次读取返回默认状态与空原因：
+
+```json
+{"id":"<资源 id>","state":"staged","reason":null}
+```
+
+### 提交目标状态：`POST /resources/{id}/lifecycle`
+
+请求体必须是 JSON 对象，只允许两个字段：
+
+| 字段 | 类型 | 是否必填 | 说明 |
+| --- | --- | --- | --- |
+| `state` | string | 是 | 目标状态，必须是四个声明状态之一，区分大小写 |
+| `reason` | string | 视目标而定 | 业务原因；隔离或撤回时必填且非空，其他请求可省略；提供时不超过 1024 个 Unicode 码点 |
+
+状态发生变化时返回 HTTP 201；以相同状态和相同原因再次提交是幂等操作，返回 HTTP 200 且不新增任何记录。响应体形如：
+
+```json
+{"id":"<资源 id>","state":"released","reason":null}
+```
+
+允许的跳转：
+
+- `staged` → `released`：仅当成品组装完成且全部（直接与间接）依赖均未撤回、未隔离；未组装完成返回 HTTP 409（`content_not_complete`），依赖被撤回或隔离返回 HTTP 409（`dependency_blocked`）。
+- `staged` → `quarantined`：须给非空原因。
+- `released` → `withdrawn` 或 `quarantined`：均须给非空原因并记录。
+- `withdrawn` → `staged`、`quarantined` → `staged`：回到暂存后可重新按规则晋级；`quarantined` 不得直达 `released`。
+
+其他跳转，或以当前状态提交不同原因，均返回 HTTP 409（`invalid_state_transition`），状态保持不变。
+
+错误：
+
+- 缺失请求体、坏 UTF-8、顶层非 JSON 对象或含未知字段，返回 HTTP 400（`invalid_request`）。
+- `state` 缺失、非字符串、为空或不在声明集合内，返回 HTTP 400（`invalid_request`）。
+- `reason` 类型错误、为空或超长，或隔离/撤回未给原因，返回 HTTP 400（`invalid_request`）。
+- 路径标识为空或含 `/`、`\\`，或携带任意查询参数，返回 HTTP 400（`invalid_request`）。
+- 资源不存在返回 HTTP 404（`resource_not_found`）。
+- `GET`、`POST` 之外的方法返回 HTTP 405（`method_not_allowed`，`Allow: GET, POST`）。
+- 任何失败请求都不改变资源、依赖、分块、成品、游标或生命周期状态。
+
 ## 运行测试
 
 ```bash
@@ -320,6 +366,6 @@ python -m unittest discover -s tests -v
 - 持久化数据和生成文件不得提交到 Git。
 - 不得把密钥、访问令牌、私有验证脚本或控制系统资料写入仓库。
 - 对已有公开接口的更改应保持向后兼容，除非任务明确要求破坏性升级。
-- 当前公开业务接口为健康检查、上述资源登记/查询接口、资源依赖关系登记、依赖拓扑查询与影响分析接口、资源内容校验接口，以及分块上传、组装与成品读取接口；资源、依赖、分块会话与成品内容均仅存于进程内存，不承诺跨进程或重启后的保存。
+- 当前公开业务接口为健康检查、上述资源登记/查询接口、资源依赖关系登记、依赖拓扑查询与影响分析接口、资源内容校验接口、分块上传、组装与成品读取接口，以及生命周期状态读取与提交接口；资源、依赖、分块会话、成品内容与生命周期状态均仅存于进程内存，不承诺跨进程或重启后的保存。
 - 分块能力明确不承诺以下行为：重启后的断点续传（重启清空全部会话与成品）、并发上传的加锁与顺序保证、以及跨资源的批量上传或批量组装。每个分块请求独立校验，冲突时以 409 拒绝且不覆盖既有字节。
 
