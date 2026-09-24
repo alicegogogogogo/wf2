@@ -22,6 +22,11 @@ from .lifecycle import (
     LifecycleRecord,
     LifecycleStore,
 )
+from .notifications import (
+    NotificationStore,
+    NotificationValidationError,
+    build_notification_fields,
+)
 from .policies import (
     PolicyError,
     PolicyStore,
@@ -42,6 +47,7 @@ from .resources import (
     ResourceStore,
     ResourceValidationError,
 )
+from .risk import compute_risk_score, risk_level
 from .sbom import (
     SbomError,
     SbomStore,
@@ -81,6 +87,9 @@ provenance_store = ProvenanceStore()
 #: persisted and never materialized as records.
 policy_store = PolicyStore()
 
+#: Process-local notification records; cleared on restart like the rest.
+notification_store = NotificationStore()
+
 
 def reset_state() -> None:
     """Clear every in-process store (test and tooling helper)."""
@@ -92,6 +101,7 @@ def reset_state() -> None:
     sbom_store.reset()
     provenance_store.reset()
     policy_store.reset()
+    notification_store.reset()
 
 #: Listing defaults and bounds.
 DEFAULT_LIMIT = 50
@@ -1990,6 +2000,178 @@ def _handle_admission(
     )
 
 
+def _handle_risk(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Read-only, computed on the fly: the score is never recorded anywhere.
+    license_record = sbom_store.get_license(raw_id)
+    policy = policy_store.get(raw_id)
+    score = compute_risk_score(
+        severities=[
+            alert.severity for alert in vulnerability_store.list_for(raw_id)
+        ],
+        has_sbom=sbom_store.get_sbom(raw_id) is not None,
+        has_license=license_record is not None,
+        has_provenance=provenance_store.get(raw_id) is not None,
+        lifecycle_state=lifecycle_store.get(raw_id).state,
+        license_allowlist=(
+            policy.license_allowlist if policy is not None else ()
+        ),
+        license_spdx_id=(
+            license_record.spdx_id if license_record is not None else None
+        ),
+    )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"id": raw_id, "score": score, "level": risk_level(score)},
+        trailing_newline=True,
+    )
+
+
+def _handle_notifications_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Validate the whole body before touching any store, so a bad request
+    # can never leave a partial record and always answers 400 (even for a
+    # resource that does not exist).
+    try:
+        build_notification_fields(payload)
+    except NotificationValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    record = notification_store.add(raw_id, payload)
+    return _json_response(
+        start_response,
+        "201 Created",
+        record.to_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_notifications_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    records = notification_store.list_for(raw_id)
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"notifications": [record.to_dict() for record in records]},
+        trailing_newline=True,
+    )
+
+
+def _handle_notifications(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_notifications_post(environ, raw_id, start_response)
+    if method == "GET":
+        return _handle_notifications_get(environ, raw_id, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -2063,6 +2245,14 @@ def application(
                 )
             if separator and tail == "admission":
                 return _handle_admission(
+                    method, environ, head, start_response
+                )
+            if separator and tail == "risk":
+                return _handle_risk(
+                    method, environ, head, start_response
+                )
+            if separator and tail == "notifications":
+                return _handle_notifications(
                     method, environ, head, start_response
                 )
             if separator and tail == "chunks/status":
@@ -2168,6 +2358,24 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/admission")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/risk"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without computing any score.
+                return _handle_risk(
+                    method,
+                    environ,
+                    suffix[: -len("/risk")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/notifications"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without recording any notification.
+                return _handle_notifications(
+                    method,
+                    environ,
+                    suffix[: -len("/notifications")],
                     start_response,
                 )
             # Any other suffix keeps the baseline item semantics (embedded
