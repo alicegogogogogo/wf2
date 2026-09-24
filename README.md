@@ -1,6 +1,6 @@
 # 数字资源供应链与溯源平台
 
-这是一个面向代码、AI 模型、数据集和构建产物的后端服务基线。当前版本提供可运行的 HTTP 服务、健康检查、进程内的资源登记与查询、资源之间的依赖关系登记、拓扑查询与影响分析接口，以及按资源标识提交原始字节的内容校验接口。
+这是一个面向代码、AI 模型、数据集和构建产物的后端服务基线。当前版本提供可运行的 HTTP 服务、健康检查、进程内的资源登记与查询、资源之间的依赖关系登记、拓扑查询与影响分析接口、按资源标识提交原始字节的内容校验接口，以及内容寻址的分块存储、组装与成品读取接口。
 
 ## 环境
 
@@ -223,6 +223,91 @@ curl -s -X POST http://127.0.0.1:8000/resources/$ID/verify \
 - `POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: POST`）。
 - 除上述请求体、响应字段与状态码外，不对其他输入形式（如传输编码、表单字段、内容参数）作兼容承诺。
 
+## 分块存储、组装与成品读取
+
+在内容校验之外，可以把一份资源内容拆成若干有序分块上传，由服务按序拼接、计算 SHA-256 并与登记摘要核对，成功后保存为该资源的**成品内容**供读取。分块会话、分块字节与成品内容都只保存在当前进程内存中，服务停止或重启后随资源一起清空，不写入任何文件。
+
+### 上传分块：`POST /resources/{id}/chunks/{index}`
+
+`{index}` 是该分块的序号，必须是十进制非负整数（即 `0`，或以 `1`–`9` 开头的数字串；不接受负号、小数点、空白或多余前导零），且严格小于本次上传声明的总块数。
+
+请求要求：
+
+- 请求体是按 `Content-Length` 声明长度读取的原始字节流，`Content-Type` 必须为 `application/octet-stream`（大小写无关，不接受参数）；空字节流（`Content-Length: 0`）是合法分块。
+- 头部 `X-Total-Chunks` 给出总块数，必须是十进制正整数。
+- 头部 `X-Content-Digest` 给出整份内容的目标摘要，必须是 64 位十六进制字符串（接受大小写混合，按小写比较）。
+- 不接受查询参数；路径标识与序号均不得含 `/`、`\\`。
+
+首个被接受的分块确定本次上传的总块数和目标摘要；之后每个分块都必须重复相同的两个头部值。分块可以乱序到达，序号也可以跳过，只要组装前全部收齐即可。
+
+新分块成功返回 HTTP 201，响应体为紧凑 UTF-8 JSON，键序固定并以换行结束：
+
+```bash
+curl -s -X POST "http://127.0.0.1:8000/resources/$ID/chunks/0" \
+  -H 'Content-Type: application/octet-stream' \
+  -H 'X-Total-Chunks: 3' \
+  -H "X-Content-Digest: $DIGEST" \
+  --data-binary chunk-0.bin
+```
+
+```json
+{"id":"<资源 id>","index":0,"total_chunks":3,"received_chunks":1,"digest":"<目标摘要>"}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 资源标识 |
+| `index` | 本次提交的分块序号 |
+| `total_chunks` | 首个分块确定的总块数 |
+| `received_chunks` | 当前已收齐的不同序号数量 |
+| `digest` | 本次上传的目标摘要（小写） |
+
+幂等与冲突：
+
+- 相同序号用**完全相同的字节**重复提交返回 HTTP 200，响应形状与 201 相同，状态保持不变（幂等重试）。
+- 相同序号已存在但字节不同，返回 HTTP 409（错误码 `chunk_conflict`），已有分块不被覆盖。
+- 首个分块之后提交的 `X-Total-Chunks` 或 `X-Content-Digest` 与首个分块不一致，返回 HTTP 409（错误码 `chunk_conflict`），不写入本分块。
+- 首个分块声明的目标摘要与资源登记摘要不一致，返回 HTTP 409（错误码 `digest_conflict`），不创建会话、不留下任何片段。
+
+### 组装：`POST /resources/{id}/assemble`
+
+请求不带请求体要求（不接受查询参数）。服务把所有分块按序号从小到大拼接，对整份内容计算 SHA-256：
+
+- 尚未收齐 `0..total-1` 的全部序号时返回 HTTP 409（错误码 `chunks_incomplete`），已收分块原样保留，可以继续补传。
+- 拼接结果的 SHA-256 与登记（首个分块确定）的目标摘要不一致时返回 HTTP 409（错误码 `digest_mismatch`），不生成成品，已收分块保留。
+- 成功返回 HTTP 201，并把该资源的内容标记为完成：
+
+```bash
+curl -s -X POST "http://127.0.0.1:8000/resources/$ID/assemble"
+```
+
+```json
+{"id":"<资源 id>","digest":"<成品内容的 SHA-256 摘要>","size":1234}
+```
+
+内容完成后再次上传分块或再次组装，均返回 HTTP 409（错误码 `content_already_complete`），既有字节不被覆盖。
+
+### 读取成品：`GET /resources/{id}/content`
+
+- 成功时返回 HTTP 200，响应体**只包含成品的原始字节**（无 JSON 包装、无末尾换行），`Content-Type: application/octet-stream`，`Content-Length` 为准确字节数；空成品对应 `Content-Length: 0` 与空响应体。
+- 标识合法但资源不存在，返回 HTTP 404（错误码 `resource_not_found`）。
+- 资源存在但尚未组装完成（从未上传、分块未齐或组装失败），返回 HTTP 409（错误码 `content_not_complete`）。
+
+```bash
+curl -s "http://127.0.0.1:8000/resources/$ID/content" --output artifact.bin
+```
+
+### 分块接口的通用错误
+
+- 路径标识为空或含 `/`、`\\`，或分块序号缺失、不是非负十进制整数、不小于总块数，返回 HTTP 400（错误码 `invalid_request`）。
+- 携带任意查询参数，返回 HTTP 400（错误码 `invalid_request`）。
+- 缺少或非法的 `X-Total-Chunks`、`X-Content-Digest`（含摘要不是 64 位十六进制），返回 HTTP 400（错误码 `invalid_request`）。
+- `Content-Type` 不是 `application/octet-stream`，返回 HTTP 400（错误码 `invalid_request`）。
+- 缺少 `Content-Length`、其值不是非负十进制整数，或实际字节数不足声明长度，返回 HTTP 400（错误码 `invalid_request`）；失败请求不会留下分块片段。
+- 资源不存在返回 HTTP 404（错误码 `resource_not_found`）。
+- 方法限制：`/resources/{id}/chunks/{index}` 与 `/resources/{id}/assemble` 仅允许 `POST`（`Allow: POST`）；`/resources/{id}/content` 仅允许 `GET`（`Allow: GET`）；其他方法返回 HTTP 405（错误码 `method_not_allowed`）。
+- 除 JSON 错误响应外，成品读取成功时只返回原始字节。
+
 ## 运行测试
 
 ```bash
@@ -235,5 +320,6 @@ python -m unittest discover -s tests -v
 - 持久化数据和生成文件不得提交到 Git。
 - 不得把密钥、访问令牌、私有验证脚本或控制系统资料写入仓库。
 - 对已有公开接口的更改应保持向后兼容，除非任务明确要求破坏性升级。
-- 当前公开业务接口为健康检查、上述资源登记/查询接口、资源依赖关系登记、依赖拓扑查询与影响分析接口，以及资源内容校验接口；资源与依赖数据仅存于进程内存，不承诺跨进程或重启后的保存。
+- 当前公开业务接口为健康检查、上述资源登记/查询接口、资源依赖关系登记、依赖拓扑查询与影响分析接口、资源内容校验接口，以及分块上传、组装与成品读取接口；资源、依赖、分块会话与成品内容均仅存于进程内存，不承诺跨进程或重启后的保存。
+- 分块能力明确不承诺以下行为：重启后的断点续传（重启清空全部会话与成品）、并发上传的加锁与顺序保证、以及跨资源的批量上传或批量组装。每个分块请求独立校验，冲突时以 409 拒绝且不覆盖既有字节。
 
