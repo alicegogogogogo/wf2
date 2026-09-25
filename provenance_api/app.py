@@ -85,6 +85,12 @@ from .vulnerabilities import (
     build_vulnerability_fields,
     max_severity,
 )
+from .vulnerability_exceptions import (
+    VulnerabilityExceptionError,
+    VulnerabilityExceptionStore,
+    VulnerabilityExceptionValidationError,
+    build_exception_fields,
+)
 
 StartResponse = Callable[[str, list[tuple[str, str]]], Any]
 
@@ -99,6 +105,10 @@ lifecycle_store = LifecycleStore()
 
 #: Process-local vulnerability alerts; cleared on restart like the rest.
 vulnerability_store = VulnerabilityStore()
+
+#: Process-local vulnerability alert exemptions; cleared on restart like
+#: the rest, and never persisted.
+vulnerability_exception_store = VulnerabilityExceptionStore()
 
 #: Process-local SBOM documents and license declarations; never persisted.
 sbom_store = SbomStore()
@@ -135,6 +145,7 @@ def reset_state() -> None:
     content_store.reset()
     lifecycle_store.reset()
     vulnerability_store.reset()
+    vulnerability_exception_store.reset()
     sbom_store.reset()
     provenance_store.reset()
     policy_store.reset()
@@ -1517,6 +1528,198 @@ def _handle_vulnerabilities(
     )
 
 
+def _handle_vulnerability_exceptions_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Validate the whole body before touching any store, so a bad request
+    # can never leave a partial exemption.
+    try:
+        build_exception_fields(payload)
+    except VulnerabilityExceptionValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # The exemption must verbatim match one of the resource's alerts; the
+    # store rejects duplicates and missing alerts without recording anything.
+    try:
+        record = vulnerability_exception_store.add(
+            raw_id, payload, vulnerability_store.list_for(raw_id)
+        )
+    except VulnerabilityExceptionError as exc:
+        http_status = (
+            "404 Not Found"
+            if exc.code == "vulnerability_not_found"
+            else "409 Conflict"
+        )
+        return _error(
+            start_response, http_status, exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created",
+        record.to_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_vulnerability_exceptions_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    records = vulnerability_exception_store.list_for(raw_id)
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"exceptions": [record.to_dict() for record in records]},
+        trailing_newline=True,
+    )
+
+
+def _handle_vulnerability_exception_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_exception_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "DELETE":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="DELETE",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    if not raw_exception_id or "/" in raw_exception_id or "\\" in raw_exception_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Exception id must not be empty or contain path separators.",
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    try:
+        record = vulnerability_exception_store.remove(raw_id, raw_exception_id)
+    except VulnerabilityExceptionError as exc:
+        return _error(
+            start_response, "404 Not Found", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        record.to_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_vulnerability_exceptions(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_vulnerability_exceptions_post(
+            environ, raw_id, start_response
+        )
+    if method == "GET":
+        return _handle_vulnerability_exceptions_get(
+            environ, raw_id, start_response
+        )
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
 def _handle_sbom_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -2118,6 +2321,89 @@ def _handle_admission(
         start_response,
         "200 OK",
         {"id": raw_id, "allowed": allowed, "reasons": reasons},
+        trailing_newline=True,
+    )
+
+
+def _handle_admission_preview(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    policy = policy_store.get(raw_id)
+    if policy is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "policy_not_found",
+            "No policy is registered for this resource.",
+        )
+
+    # The decision is identical to the admission evaluation except that
+    # alerts verbatim matching a registered exemption do not count toward
+    # the severity ceiling. Matching follows the exemption rule exactly:
+    # advisory and component compared byte-for-byte, case-sensitive.
+    exempted_keys = vulnerability_exception_store.exempted_keys(raw_id)
+    active_severities: list[str] = []
+    exempted_count = 0
+    for alert in vulnerability_store.list_for(raw_id):
+        if (alert.advisory, alert.component) in exempted_keys:
+            exempted_count += 1
+        else:
+            active_severities.append(alert.severity)
+
+    license_record = sbom_store.get_license(raw_id)
+    allowed, reasons = evaluate_policy(
+        policy,
+        lifecycle_state=lifecycle_store.get(raw_id).state,
+        has_sbom=sbom_store.get_sbom(raw_id) is not None,
+        has_license=license_record is not None,
+        has_provenance=provenance_store.get(raw_id) is not None,
+        has_signature=signature_store.get(raw_id) is not None,
+        license_spdx_id=(
+            license_record.spdx_id if license_record is not None else None
+        ),
+        severities=active_severities,
+    )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {
+            "id": raw_id,
+            "allowed": allowed,
+            "reasons": reasons,
+            "exempted_count": exempted_count,
+        },
         trailing_newline=True,
     )
 
@@ -3377,6 +3663,18 @@ def application(
                 return _handle_vulnerabilities(
                     method, environ, head, start_response
                 )
+            if separator and tail == "vulnerability-exceptions":
+                return _handle_vulnerability_exceptions(
+                    method, environ, head, start_response
+                )
+            if separator and tail.startswith("vulnerability-exceptions/"):
+                return _handle_vulnerability_exception_item(
+                    method,
+                    environ,
+                    head,
+                    tail[len("vulnerability-exceptions/"):],
+                    start_response,
+                )
             if separator and tail == "sbom":
                 return _handle_sbom(
                     method, environ, head, start_response
@@ -3395,6 +3693,10 @@ def application(
                 )
             if separator and tail == "admission":
                 return _handle_admission(
+                    method, environ, head, start_response
+                )
+            if separator and tail == "admission-preview":
+                return _handle_admission_preview(
                     method, environ, head, start_response
                 )
             if separator and tail == "risk":
@@ -3485,6 +3787,29 @@ def application(
                     suffix[: -len("/vulnerabilities")],
                     start_response,
                 )
+            if separator and "/vulnerability-exceptions/" in suffix:
+                # Fallback for a separator inside the id segment of an
+                # exception item path so the handler rejects it without
+                # removing any exemption.
+                malformed_id, _, raw_exception_id = suffix.rpartition(
+                    "/vulnerability-exceptions/"
+                )
+                return _handle_vulnerability_exception_item(
+                    method,
+                    environ,
+                    malformed_id,
+                    raw_exception_id,
+                    start_response,
+                )
+            if separator and suffix.endswith("/vulnerability-exceptions"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without recording any exemption.
+                return _handle_vulnerability_exceptions(
+                    method,
+                    environ,
+                    suffix[: -len("/vulnerability-exceptions")],
+                    start_response,
+                )
             if separator and suffix.endswith("/sbom"):
                 # Fallback for a separator inside the id segment so the
                 # handler rejects it without recording any document.
@@ -3528,6 +3853,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/admission")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/admission-preview"):
+                # Same fallback so a separator in the id is rejected
+                # without computing a preview.
+                return _handle_admission_preview(
+                    method,
+                    environ,
+                    suffix[: -len("/admission-preview")],
                     start_response,
                 )
             if separator and suffix.endswith("/risk"):
