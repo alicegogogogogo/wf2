@@ -4,8 +4,8 @@ A vulnerability record pairs an advisory identifier with the affected
 component, a severity level, a summary and an optional fixed version.
 Records are kept per resource in submission order and are never persisted:
 stopping or restarting the service clears every alert, and no files are
-written. Batching, updates, deletion and concurrency are intentionally out
-of scope.
+written. Alerts can be registered one at a time or as an atomic batch;
+updates, deletion and concurrency are intentionally out of scope.
 """
 
 from __future__ import annotations
@@ -28,6 +28,9 @@ MAX_ADVISORY_LENGTH = 256
 MAX_COMPONENT_LENGTH = 256
 MAX_SUMMARY_LENGTH = 2048
 MAX_FIXED_VERSION_LENGTH = 256
+
+#: A single batch registration accepts at most this many alerts.
+MAX_BATCH_SIZE = 100
 
 #: Fields accepted by the registration request; anything else is rejected.
 _ALLOWED_FIELDS = frozenset(
@@ -232,6 +235,50 @@ class VulnerabilityStore:
         resource_keys.add(key)
         self._sequence.append((resource_id, record))
         return record
+
+    def add_batch(
+        self, resource_id: str, payloads: Iterable[object]
+    ) -> list[Vulnerability]:
+        """Validate and append a batch of alerts for ``resource_id``.
+
+        The batch is atomic: every payload is validated and every
+        ``(advisory, component)`` pair is checked against the existing
+        alerts and against the rest of the batch before anything is
+        recorded. Raises :class:`VulnerabilityValidationError` for an
+        invalid element or :class:`VulnerabilityError` with code
+        ``duplicate_vulnerability`` for a repeated pair; on any failure no
+        alert is recorded at all. On success the alerts are appended in
+        array order and returned in that same order.
+        """
+
+        parsed = [build_vulnerability_fields(payload) for payload in payloads]
+        resource_keys = self._keys.setdefault(resource_id, set())
+        batch_keys: set[tuple[str, str]] = set()
+        for advisory, component, _severity, _summary, _fixed in parsed:
+            key = (advisory, component)
+            if key in resource_keys or key in batch_keys:
+                raise VulnerabilityError(
+                    "duplicate_vulnerability",
+                    "An alert with the same advisory and component already "
+                    "exists for this resource.",
+                )
+            batch_keys.add(key)
+
+        records = [
+            Vulnerability(
+                id=uuid.uuid4().hex,
+                advisory=advisory,
+                component=component,
+                severity=severity,
+                summary=summary,
+                fixed_version=fixed_version,
+            )
+            for advisory, component, severity, summary, fixed_version in parsed
+        ]
+        self._records.setdefault(resource_id, []).extend(records)
+        resource_keys.update(batch_keys)
+        self._sequence.extend((resource_id, record) for record in records)
+        return records
 
     def list_all(self) -> list[tuple[str, Vulnerability]]:
         """Return every alert across resources in global submission order.

@@ -89,6 +89,7 @@ from .signatures import (
     compute_signature,
 )
 from .vulnerabilities import (
+    MAX_BATCH_SIZE,
     SEVERITY_VALUES,
     VulnerabilityError,
     VulnerabilityStore,
@@ -1616,6 +1617,127 @@ def _handle_vulnerabilities(
         "method_not_allowed",
         f"Method {method} is not allowed for this path.",
         allowed="GET, POST",
+    )
+
+
+def _handle_vulnerabilities_batch(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Validate the whole body before touching any store, so a bad request
+    # can never leave a partial record and always answers 400 (even for a
+    # resource that does not exist).
+    if not isinstance(payload, dict):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be a JSON object.",
+        )
+    unknown_fields = set(payload) - {"vulnerabilities"}
+    if unknown_fields:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            f"Unknown field: {sorted(unknown_fields)[0]!r}.",
+        )
+    if "vulnerabilities" not in payload:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Missing required field: 'vulnerabilities'.",
+        )
+    items = payload["vulnerabilities"]
+    if not isinstance(items, list) or not items:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Field 'vulnerabilities' must be a non-empty array.",
+        )
+    if len(items) > MAX_BATCH_SIZE:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            f"Field 'vulnerabilities' must not exceed {MAX_BATCH_SIZE} "
+            "entries.",
+        )
+    try:
+        for item in items:
+            build_vulnerability_fields(item)
+    except VulnerabilityValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Atomic: either every alert in the batch is recorded, in array order,
+    # or none of them is.
+    try:
+        records = vulnerability_store.add_batch(raw_id, items)
+    except VulnerabilityError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created",
+        {"vulnerabilities": [record.to_dict() for record in records]},
+        trailing_newline=True,
     )
 
 
@@ -4516,6 +4638,10 @@ def application(
                 return _handle_release_blockers(
                     method, environ, head, start_response
                 )
+            if separator and tail == "vulnerabilities/batch":
+                return _handle_vulnerabilities_batch(
+                    method, environ, head, start_response
+                )
             if separator and tail == "vulnerabilities":
                 return _handle_vulnerabilities(
                     method, environ, head, start_response
@@ -4642,6 +4768,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/release-blockers")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/vulnerabilities/batch"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without recording any alert.
+                return _handle_vulnerabilities_batch(
+                    method,
+                    environ,
+                    suffix[: -len("/vulnerabilities/batch")],
                     start_response,
                 )
             if separator and suffix.endswith("/vulnerabilities"):
