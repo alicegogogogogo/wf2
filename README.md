@@ -1139,6 +1139,29 @@ curl -s -X POST "http://127.0.0.1:8000/mirrors/$MIRROR_ID/pull/$DIGEST" --output
 - 上游返回的字节经 SHA-256 校验与请求摘要不符，返回 HTTP 502（错误码 `mirror_digest_mismatch`），不写入缓存。
 - 校验通过但写入会使已用字节超过配额，返回 HTTP 409（错误码 `cache_quota_exceeded`），缓存保持原样，响应体不是层字节。
 
+### 登记镜像源签名策略：`POST /mirrors/{id}/signature-policy`
+
+每个镜像源最多登记一份签名策略；登记后该镜像源的拉取必须携带合法签名。请求体必须是一个完整的 JSON 对象，且只允许以下三个字段：
+
+| 字段 | 类型 | 是否必填 | 说明 |
+| --- | --- | --- | --- |
+| `algorithm` | string | 是 | 签名算法，只允许 `hmac-sha256`、`hmac-sha512`，区分大小写 |
+| `keys` | array | 是 | 受信密钥标识数组，非空，元素为非空字符串且不得重复 |
+| `cover_digest` | boolean | 是 | 为真时要求被签摘要覆盖被拉取层的摘要 |
+
+首次登记返回 HTTP 201，响应体回显镜像源 `id` 与上述三项内容；内容完全相同的重复登记返回 HTTP 200，内容不同返回 HTTP 409（错误码 `mirror_policy_conflict`），已登记策略不被覆盖。`GET /mirrors/{id}/signature-policy` 查询已登记策略（HTTP 200），未登记返回 HTTP 404（错误码 `mirror_policy_not_found`）。镜像源不存在时登记与查询都返回 HTTP 404（错误码 `mirror_not_found`）。策略只存于进程内存，重启即清空。
+
+### 拉取时的签名校验
+
+镜像源登记签名策略后，`POST /mirrors/{id}/pull/{digest}` 必须携带三个请求头：`X-Key-Id`（密钥标识）、`X-Signature`（十六进制签名值）与 `X-Signed-Digest`（被签摘要）。验签口径与内容签名一致：以密钥标识的 UTF-8 字节为密钥，对小写被签摘要文本做策略算法的 HMAC。校验在层内容就绪（缓存命中或回源并校验摘要）之后进行，不通过时不返回字节、不写缓存、不改计数。判定按以下顺序进行，命中即止，只报一个错误码：
+
+1. 缺任意签名头，返回 HTTP 403（错误码 `signature_missing`）。
+2. 密钥标识不在策略 `keys` 内，返回 HTTP 403（错误码 `key_not_trusted`）。
+3. 策略 `cover_digest` 为真且被签摘要与被拉取层摘要不符，返回 HTTP 403（错误码 `digest_uncovered`）。
+4. 按策略算法重算的签名与 `X-Signature` 不一致（比对忽略大小写），返回 HTTP 403（错误码 `signature_invalid`）。
+
+签名头取值非法（`X-Key-Id` 为空、`X-Signed-Digest` 不是 64 位十六进制、`X-Signature` 不是与策略算法匹配的十六进制长度）返回 HTTP 400（错误码 `invalid_request`）。未登记策略的镜像源拉取行为与既有完全一致，携带签名请求头也不改变结果；校验通过仍返回原始字节。
+
 ### 镜像源接口的错误
 
 下列情况都返回 HTTP 400（错误码 `invalid_request`），且不写入任何镜像源、不改变缓存或其他状态：
@@ -1147,9 +1170,10 @@ curl -s -X POST "http://127.0.0.1:8000/mirrors/$MIRROR_ID/pull/$DIGEST" --output
 - 登记请求体缺失、不是合法 UTF-8 JSON，或顶层不是 JSON 对象；
 - 缺少 `name`、`upstream`，出现未知字段，任一字段不是字符串或为空；
 - `upstream` 不是 `http` 或 `https` 的绝对地址；
+- 签名策略缺少 `algorithm`、`keys`、`cover_digest`，出现未知字段，字段类型错误，`algorithm` 不是两个允许值之一（区分大小写），`keys` 为空数组、元素不是非空字符串或出现重复；
 - 任意镜像源接口携带查询参数。
 
-路径标识格式合法但镜像源不存在时，单条查询与拉取都返回 HTTP 404（错误码 `mirror_not_found`），且不改变状态。方法不符返回 HTTP 405（错误码 `method_not_allowed`，响应带 `Allow` 头）：`/mirrors` 为 `Allow: GET, POST`，`/mirrors/{id}` 为 `Allow: GET`，`/mirrors/{id}/pull/{digest}` 为 `Allow: POST`。
+路径标识格式合法但镜像源不存在时，单条查询与拉取都返回 HTTP 404（错误码 `mirror_not_found`），且不改变状态。方法不符返回 HTTP 405（错误码 `method_not_allowed`，响应带 `Allow` 头）：`/mirrors` 为 `Allow: GET, POST`，`/mirrors/{id}` 为 `Allow: GET`，`/mirrors/{id}/pull/{digest}` 为 `Allow: POST`，`/mirrors/{id}/signature-policy` 为 `Allow: GET, POST`。
 
 镜像源数据与由拉取写入的缓存条目均仅存于当前进程内存，停止或重启即清空，不生成任何文件；缓存条目的删除与清空通过上文 `/cache` 的两个删除入口完成，镜像源的删除及并发处理不在当前范围内。
 
