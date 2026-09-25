@@ -4,8 +4,9 @@ A vulnerability record pairs an advisory identifier with the affected
 component, a severity level, a summary and an optional fixed version.
 Records are kept per resource in submission order and are never persisted:
 stopping or restarting the service clears every alert, and no files are
-written. Alerts can be registered one at a time or as an atomic batch;
-updates, deletion and concurrency are intentionally out of scope.
+written. Alerts can be registered one at a time or as an atomic batch, and
+a single alert can later be deleted; updates and concurrency are
+intentionally out of scope.
 """
 
 from __future__ import annotations
@@ -331,6 +332,52 @@ class VulnerabilityStore:
             resource_keys.add((record.advisory, record.component))
             self._sequence.append((resource_id, record))
         return records
+
+    def remove(
+        self, resource_id: str, vulnerability_id: str
+    ) -> Vulnerability:
+        """Remove and return a single alert identified by ``vulnerability_id``.
+
+        Lookup is scoped to ``resource_id``: an id that is unknown, belongs
+        to another resource, or was already removed raises
+        :class:`VulnerabilityError` with code ``vulnerability_not_found``
+        and leaves every stored alert untouched. On success the alert is
+        dropped from the resource's records (preserving the submission order
+        of the rest) and from the global sequence, and its
+        ``(advisory, component)`` pair is released so the same pair can be
+        registered again afterwards.
+        """
+
+        records = self._records.get(resource_id)
+        if records is None:
+            raise VulnerabilityError(
+                "vulnerability_not_found",
+                "No vulnerability alert exists with the requested id.",
+            )
+        index = next(
+            (
+                position
+                for position, record in enumerate(records)
+                if record.id == vulnerability_id
+            ),
+            None,
+        )
+        if index is None:
+            raise VulnerabilityError(
+                "vulnerability_not_found",
+                "No vulnerability alert exists with the requested id.",
+            )
+
+        record = records.pop(index)
+        resource_keys = self._keys.get(resource_id)
+        if resource_keys is not None:
+            resource_keys.discard((record.advisory, record.component))
+        self._sequence = [
+            (owner_id, alert)
+            for owner_id, alert in self._sequence
+            if alert is not record
+        ]
+        return record
 
     def list_all(self) -> list[tuple[str, Vulnerability]]:
         """Return every alert across resources in global submission order.
