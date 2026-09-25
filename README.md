@@ -599,7 +599,7 @@ curl -s -X POST http://127.0.0.1:8000/resources/$ID/provenance \
 
 ## 准入策略与准入评估
 
-可以为已登记的资源登记一份准入策略，并据此对该资源执行一次只读的准入评估。策略与评估结果都只保存在当前进程内存中（评估结果不落任何记录），服务停止或重启后随资源一起清空，不会写入任何文件；当前版本不校验签名，也不改变任何晋级条件。每个资源至多保留一份策略。
+可以为已登记的资源登记一份准入策略，并据此对该资源执行一次只读的准入评估。策略与评估结果都只保存在当前进程内存中（评估结果不落任何记录），服务停止或重启后随资源一起清空，不会写入任何文件；签名只作为证据是否登记参与判定，当前版本不执行验签，也不改变任何晋级条件。每个资源至多保留一份策略。
 
 ### 登记策略：`POST /resources/{id}/policies`
 
@@ -608,7 +608,7 @@ curl -s -X POST http://127.0.0.1:8000/resources/$ID/provenance \
 | 字段 | 类型 | 是否必填 | 说明 |
 | --- | --- | --- | --- |
 | `name` | string | 是 | 非空策略名称，最多 256 个 Unicode 码点，原样回显 |
-| `evidence_requirements` | array | 是 | 证据要求，元素只允许 `sbom`、`license`、`provenance`，区分大小写；可以为空数组，且不得重复 |
+| `evidence_requirements` | array | 是 | 证据要求，元素只允许 `sbom`、`license`、`provenance`、`signature`，区分大小写；可以为空数组，且不得重复 |
 | `license_allowlist` | array | 是 | 允许的 SPDX 许可证标识字符串数组，元素为非空字符串且不得重复；可以为空数组，空表示不做许可证限制；原样回显 |
 | `max_severity` | string | 是 | 级别上限，`critical`、`high`、`medium`、`low` 之一，比较时忽略大小写，按小写保存与输出 |
 
@@ -617,11 +617,11 @@ curl -s -X POST http://127.0.0.1:8000/resources/$ID/provenance \
 ```bash
 curl -s -X POST http://127.0.0.1:8000/resources/$ID/policies \
   -H 'Content-Type: application/json' \
-  -d '{"name":"release-gate","evidence_requirements":["sbom","license","provenance"],"license_allowlist":["Apache-2.0","MIT"],"max_severity":"HIGH"}'
+  -d '{"name":"release-gate","evidence_requirements":["sbom","license","provenance","signature"],"license_allowlist":["Apache-2.0","MIT"],"max_severity":"HIGH"}'
 ```
 
 ```json
-{"id":"…","name":"release-gate","evidence_requirements":["sbom","license","provenance"],"license_allowlist":["Apache-2.0","MIT"],"max_severity":"high"}
+{"id":"…","name":"release-gate","evidence_requirements":["sbom","license","provenance","signature"],"license_allowlist":["Apache-2.0","MIT"],"max_severity":"high"}
 ```
 
 幂等与冲突：
@@ -635,7 +635,7 @@ curl -s -X POST http://127.0.0.1:8000/resources/$ID/policies \
 
 ### 准入评估：`POST /resources/{id}/admission`
 
-对资源执行一次只读判定，**不接受请求体**（声明非空 `Content-Length` 即返回 400），也不接受查询参数。服务按该资源的策略读取其生命周期状态、SBOM、许可证声明、构建证明与全部安全告警，但不写入或修改任何状态。
+对资源执行一次只读判定，**不接受请求体**（声明非空 `Content-Length` 即返回 400），也不接受查询参数。服务按该资源的策略读取其生命周期状态、SBOM、许可证声明、构建证明、签名记录与全部安全告警，但不写入或修改任何状态。
 
 成功返回 HTTP 200，响应体为紧凑 UTF-8 JSON，键序固定（`id`、`allowed`、`reasons`）并以换行结束：
 
@@ -656,14 +656,14 @@ curl -s -X POST http://127.0.0.1:8000/resources/$ID/admission
 判定规则与原因代码，按固定优先级（状态 → 证据 → 许可证 → 严重度）排列：
 
 1. **状态**：资源当前生命周期状态为 `withdrawn` 或 `quarantined` 时直接拒绝，原因代码为 `state_blocked`，且**不再检查**任何其他条件（此时 `reasons` 只含这一项）。
-2. **证据**：策略要求但资源尚未登记的证据逐项拒绝，原因代码分别为 `no_sbom`、`no_license`、`no_provenance`，按此顺序输出；未要求的证据不检查。
+2. **证据**：策略要求但资源尚未登记的证据逐项拒绝，原因代码分别为 `no_sbom`、`no_license`、`no_provenance`、`no_signature`，按此顺序输出；未要求的证据不检查。只要签名记录已登记即算 `signature` 证据齐备，验签结果不参与判定。
 3. **许可证**：`license_allowlist` 非空，而资源登记的许可证 SPDX 标识不在清单中（或资源未登记许可证）时拒绝，原因代码为 `license_denied`；清单为空时不检查许可证。
 4. **严重度**：资源存在严重度**高于**上限（等于上限不算超限）的安全告警时拒绝，原因代码为 `severity_exceeded`，比较忽略大小写。
 
 未命中状态阻断时，证据、许可证、严重度三组条件都会被评估；命中多条时组内与组间均按上面的顺序输出，例如：
 
 ```json
-{"id":"…","allowed":false,"reasons":["no_sbom","no_license","no_provenance","license_denied","severity_exceeded"]}
+{"id":"…","allowed":false,"reasons":["no_sbom","no_license","no_provenance","no_signature","license_denied","severity_exceeded"]}
 ```
 
 ### 策略与评估接口的错误
@@ -673,18 +673,18 @@ curl -s -X POST http://127.0.0.1:8000/resources/$ID/admission
 - 请求体缺失、不是合法 UTF-8、无法解码为 JSON，或顶层不是 JSON 对象；
 - 缺少四个字段中任一项、字段为空值（空名称、空证据项或许可证项）、出现未知字段；
 - `name` 不是字符串或超过 256 个 Unicode 码点；
-- `evidence_requirements` 或 `license_allowlist` 不是数组、元素类型错误、证据项不是 `sbom`/`license`/`provenance`，或数组内出现重复值；
+- `evidence_requirements` 或 `license_allowlist` 不是数组、元素类型错误、证据项不是 `sbom`/`license`/`provenance`/`signature`，或数组内出现重复值；
 - `max_severity` 不是四个合法级别之一；
 - 路径标识为空或含 `/`、`\\`；策略登记、查询请求携带任意查询参数；
 - 准入评估请求携带请求体或任意查询参数。
 
 路径标识格式合法但资源不存在时，三个接口都返回 HTTP 404（错误码 `resource_not_found`）；资源存在但尚未登记策略时，策略查询与准入评估返回 HTTP 404（错误码 `policy_not_found`）。对 `/resources/{id}/policies` 使用 `GET`、`POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET, POST`）；对 `/resources/{id}/admission` 使用 `POST` 之外的方法返回 HTTP 405（`Allow: POST`）。
 
-任何失败都不会写入策略或评估结果，也不会修改资源、依赖、内容、游标、生命周期状态、安全告警、SBOM 文档、许可证声明或构建来源证明；策略仅存于当前进程内存，停止或重启即清空，本次不校验签名也不改变晋级条件。
+任何失败都不会写入策略或评估结果，也不会修改资源、依赖、内容、游标、生命周期状态、安全告警、SBOM 文档、许可证声明、构建来源证明或签名记录；策略仅存于当前进程内存，停止或重启即清空，本次不执行验签也不改变晋级条件。
 
 ## 风险评分
 
-可以对已登记的资源即时计算一次风险评分。评分只读取该资源当前的安全告警、SBOM、许可证声明、构建来源证明、生命周期状态与准入策略，**不写入或修改任何状态**，也不留下任何评分记录；重启后随全部输入一起清空，不写入任何文件。
+可以对已登记的资源即时计算一次风险评分。评分只读取该资源当前的安全告警、SBOM、许可证声明、构建来源证明、签名记录、生命周期状态与准入策略，**不写入或修改任何状态**，也不留下任何评分记录；重启后随全部输入一起清空，不写入任何文件。
 
 ### 查询风险评分：`GET /resources/{id}/risk`
 
@@ -707,7 +707,7 @@ curl -s "http://127.0.0.1:8000/resources/$ID/risk"
 计分规则：
 
 - 每条安全告警按严重度加分：`critical` 加 40 分、`high` 加 25 分、`medium` 加 10 分、`low` 加 5 分，比较时忽略大小写；
-- SBOM 文档、许可证声明、构建来源证明每缺一份加 5 分；
+- SBOM 文档、许可证声明、构建来源证明、签名记录每缺一份加 5 分；签名已登记但验签不通过时不加不减；
 - 资源处于 `withdrawn` 或 `quarantined` 状态时再加 20 分；
 - 资源策略的 `license_allowlist` 非空，而资源未登记许可证或登记的 SPDX 标识不在清单内时加 10 分；清单为空或未登记策略时不加；
 - 总分封顶到 100。

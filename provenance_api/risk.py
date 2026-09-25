@@ -1,8 +1,9 @@
 """On-the-fly risk scoring for registered resources.
 
 The risk score is computed at request time from the resource's recorded
-vulnerability alerts, its SBOM / license / provenance evidence, its
-lifecycle state and its admission policy's license allowlist. Nothing is
+vulnerability alerts, its SBOM / license / provenance / signature
+evidence, its lifecycle state and its admission policy's license
+allowlist. Nothing is
 persisted: the score is never materialized as a record, and a restart
 clears every input just like the rest of the in-process state.
 """
@@ -18,7 +19,9 @@ SEVERITY_POINTS: dict[str, int] = {
     "low": 5,
 }
 
-#: Points added for each missing evidence item (SBOM, license, provenance).
+#: Points added for each missing evidence item (SBOM, license,
+#: provenance, signature). A registered signature record counts as
+#: present whether or not it would verify.
 MISSING_EVIDENCE_POINTS = 5
 
 #: Points added when the resource is withdrawn or quarantined.
@@ -57,6 +60,7 @@ def compute_risk_score(
     has_sbom: bool,
     has_license: bool,
     has_provenance: bool,
+    has_signature: bool,
     lifecycle_state: str,
     license_allowlist: tuple[str, ...] | list[str],
     license_spdx_id: str | None,
@@ -73,7 +77,7 @@ def compute_risk_score(
     for severity in severities:
         score += SEVERITY_POINTS[severity.lower()]
 
-    for present in (has_sbom, has_license, has_provenance):
+    for present in (has_sbom, has_license, has_provenance, has_signature):
         if not present:
             score += MISSING_EVIDENCE_POINTS
 

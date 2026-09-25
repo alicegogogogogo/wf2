@@ -287,6 +287,7 @@ class PolicyTests(unittest.TestCase):
         for bad in (
             "sbom",
             ["SIGNATURE"],
+            ["Signature"],
             ["sbom", 1],
             ["sbom", "sbom"],
             [""],
@@ -298,6 +299,15 @@ class PolicyTests(unittest.TestCase):
                     f"/resources/{self.resource_id}/policies",
                     policy_payload(evidence_requirements=bad),
                 )
+
+    def test_signature_is_a_valid_evidence_requirement(self) -> None:
+        status, _h, body = self._register(
+            evidence_requirements=["sbom", "signature"]
+        )
+        self.assertEqual(status, "201 Created")
+        self.assertEqual(
+            body["evidence_requirements"], ["sbom", "signature"]
+        )
 
     def test_allowlist_validation(self) -> None:
         for bad in (
@@ -429,6 +439,19 @@ class AdmissionTests(unittest.TestCase):
                 "build_number": "1",
                 "source_digest": DIGEST_B,
                 "materials": [],
+            },
+        )
+
+    def _add_signature(self, resource_id: str | None = None) -> None:
+        call_json(
+            "POST",
+            f"/resources/{resource_id or self.resource_id}/signatures",
+            {
+                "signer": "alice",
+                "algorithm": "hmac-sha256",
+                "key_id": "key-1",
+                "signature": "c" * 64,
+                "digest": DIGEST_A,
             },
         )
 
@@ -589,6 +612,37 @@ class AdmissionTests(unittest.TestCase):
         self._add_sbom()
         _s, _h, body = self._admission()
         self.assertEqual(body["reasons"], [])
+
+    def test_missing_signature_alone_reports_no_signature(self) -> None:
+        self._register(
+            evidence_requirements=["signature"], license_allowlist=[]
+        )
+        _s, _h, body = self._admission()
+        self.assertIs(body["allowed"], False)
+        self.assertEqual(body["reasons"], ["no_signature"])
+
+    def test_registered_signature_satisfies_evidence(self) -> None:
+        # Registration alone counts; verification plays no part here.
+        self._register(
+            evidence_requirements=["signature"], license_allowlist=[]
+        )
+        self._add_signature()
+        _s, _h, body = self._admission()
+        self.assertEqual(body["reasons"], [])
+        self.assertIs(body["allowed"], True)
+
+    def test_signature_orders_after_provenance_in_evidence_group(self) -> None:
+        self._register(
+            evidence_requirements=[
+                "sbom", "license", "provenance", "signature"
+            ],
+            license_allowlist=[],
+        )
+        _s, _h, body = self._admission()
+        self.assertEqual(
+            body["reasons"],
+            ["no_sbom", "no_license", "no_provenance", "no_signature"],
+        )
 
     def test_license_denied_when_not_in_allowlist(self) -> None:
         self._register(
