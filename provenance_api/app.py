@@ -2193,6 +2193,116 @@ def _handle_component_risks(
     )
 
 
+def _fix_version_key(candidate: str) -> tuple[int, ...] | None:
+    """Parse a dotted-decimal fix version into comparable integer segments.
+
+    Returns ``None`` when any segment is not a plain ASCII decimal number;
+    such candidates never take part in the maximum comparison.
+    """
+
+    segments = candidate.split(".")
+    if any(not segment.isascii() or not segment.isdigit() for segment in segments):
+        return None
+    return tuple(int(segment) for segment in segments)
+
+
+def _max_fix_version(candidates: Iterable[str]) -> str | None:
+    """Return the largest dotted-decimal version among ``candidates``.
+
+    Comparison is numeric segment by segment; shorter versions are padded
+    with zero segments before the segments are aligned. Candidates with a
+    non-numeric segment are ignored entirely. Returns ``None`` when no
+    usable candidate remains.
+    """
+
+    best: str | None = None
+    best_key: tuple[int, ...] = ()
+    for candidate in candidates:
+        key = _fix_version_key(candidate)
+        if key is None:
+            continue
+        if best is None:
+            best, best_key = candidate, key
+            continue
+        length = max(len(key), len(best_key))
+        if key + (0,) * (length - len(key)) > best_key + (0,) * (
+            length - len(best_key)
+        ):
+            best, best_key = candidate, key
+    return best
+
+
+def _handle_component_fixes(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    document = sbom_store.get_sbom(raw_id)
+    if document is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "sbom_not_found",
+            "No SBOM document is recorded for this resource.",
+        )
+
+    # Read-only, computed on the fly: an alert hits a component only when
+    # the names are byte-for-byte identical (case-sensitive, no trimming);
+    # versions and summaries are never matched. Nothing is recorded.
+    alerts = vulnerability_store.list_for(raw_id)
+    fixes = []
+    for component in document.components:
+        matched = [alert for alert in alerts if alert.component == component.name]
+        fixes.append(
+            {
+                "name": component.name,
+                "version": component.version,
+                "recommended_version": _max_fix_version(
+                    alert.fixed_version
+                    for alert in matched
+                    if alert.fixed_version
+                ),
+                "advisory_count": len(matched),
+            }
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"fixes": fixes},
+        trailing_newline=True,
+    )
+
+
 def _handle_notifications_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -3265,6 +3375,10 @@ def application(
                 return _handle_component_risks(
                     method, environ, head, start_response
                 )
+            if separator and tail == "component-fixes":
+                return _handle_component_fixes(
+                    method, environ, head, start_response
+                )
             if separator and tail == "notifications":
                 return _handle_notifications(
                     method, environ, head, start_response
@@ -3402,6 +3516,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/component-risks")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/component-fixes"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without computing any fix advice.
+                return _handle_component_fixes(
+                    method,
+                    environ,
+                    suffix[: -len("/component-fixes")],
                     start_response,
                 )
             if separator and suffix.endswith("/notifications"):
