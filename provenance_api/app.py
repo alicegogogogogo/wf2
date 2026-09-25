@@ -1703,22 +1703,12 @@ def _handle_vulnerabilities(
     )
 
 
-def _handle_vulnerability_item(
-    method: str,
+def _handle_vulnerability_item_delete(
     environ: dict[str, Any],
     raw_id: str,
     raw_vulnerability_id: str,
     start_response: StartResponse,
 ) -> Iterable[bytes]:
-    if method != "DELETE":
-        return _error(
-            start_response,
-            "405 Method Not Allowed",
-            "method_not_allowed",
-            f"Method {method} is not allowed for this path.",
-            allowed="DELETE",
-        )
-
     id_error = _validate_path_id(raw_id)
     if id_error is not None:
         return _error(
@@ -1767,6 +1757,123 @@ def _handle_vulnerability_item(
         "200 OK",
         record.to_dict(),
         trailing_newline=True,
+    )
+
+
+def _handle_vulnerability_item_put(
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_vulnerability_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    if (
+        not raw_vulnerability_id
+        or "/" in raw_vulnerability_id
+        or "\\" in raw_vulnerability_id
+    ):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Vulnerability id must not be empty or contain path separators.",
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    try:
+        # Validate the whole body before touching any store, so a bad request
+        # can never leave a partial update and always answers 400 (even for a
+        # resource or alert that does not exist).
+        build_vulnerability_fields(payload)
+    except VulnerabilityValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    try:
+        record = vulnerability_store.update(
+            raw_id, raw_vulnerability_id, payload
+        )
+    except VulnerabilityValidationError as exc:
+        # The advisory/component identity does not match the stored alert.
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+    except VulnerabilityError as exc:
+        return _error(
+            start_response, "404 Not Found", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        record.to_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_vulnerability_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_vulnerability_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "DELETE":
+        return _handle_vulnerability_item_delete(
+            environ, raw_id, raw_vulnerability_id, start_response
+        )
+    if method == "PUT":
+        return _handle_vulnerability_item_put(
+            environ, raw_id, raw_vulnerability_id, start_response
+        )
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="DELETE, PUT",
     )
 
 

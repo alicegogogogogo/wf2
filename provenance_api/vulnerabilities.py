@@ -4,8 +4,10 @@ A vulnerability record pairs an advisory identifier with the affected
 component, a severity level, a summary and an optional fixed version.
 Records are kept per resource in submission order and are never persisted:
 stopping or restarting the service clears every alert, and no files are
-written. Alerts can be registered one at a time or as an atomic batch, and
-a single alert can later be deleted; updates and concurrency are
+written. Alerts can be registered one at a time or as an atomic batch, a
+single alert can be updated in place (only the severity, summary and fixed
+version are mutable; the advisory identifier and component are the alert's
+identity), and a single alert can later be deleted; concurrency is
 intentionally out of scope.
 """
 
@@ -332,6 +334,69 @@ class VulnerabilityStore:
             resource_keys.add((record.advisory, record.component))
             self._sequence.append((resource_id, record))
         return records
+
+    def update(
+        self, resource_id: str, vulnerability_id: str, payload: object
+    ) -> Vulnerability:
+        """Validate and replace the mutable fields of a single alert in place.
+
+        Lookup is scoped to ``resource_id``: an id that is unknown, belongs
+        to another resource, or was already removed raises
+        :class:`VulnerabilityError` with code ``vulnerability_not_found``
+        and leaves every stored alert untouched. ``advisory`` and
+        ``component`` are the alert's identity: the payload must repeat
+        them verbatim, otherwise :class:`VulnerabilityValidationError` is
+        raised and nothing changes. On success only ``severity``,
+        ``summary`` and ``fixed_version`` are replaced; the alert keeps its
+        id, its position in the resource's submission order and its slot in
+        the global sequence, and the ``(advisory, component)`` key set is
+        untouched.
+        """
+
+        advisory, component, severity, summary, fixed_version = (
+            build_vulnerability_fields(payload)
+        )
+        records = self._records.get(resource_id)
+        if records is None:
+            raise VulnerabilityError(
+                "vulnerability_not_found",
+                "No vulnerability alert exists with the requested id.",
+            )
+        index = next(
+            (
+                position
+                for position, record in enumerate(records)
+                if record.id == vulnerability_id
+            ),
+            None,
+        )
+        if index is None:
+            raise VulnerabilityError(
+                "vulnerability_not_found",
+                "No vulnerability alert exists with the requested id.",
+            )
+
+        record = records[index]
+        if record.advisory != advisory or record.component != component:
+            raise VulnerabilityValidationError(
+                "Advisory and component identify the alert and must match "
+                "the existing record."
+            )
+
+        updated = Vulnerability(
+            id=record.id,
+            advisory=record.advisory,
+            component=record.component,
+            severity=severity,
+            summary=summary,
+            fixed_version=fixed_version,
+        )
+        records[index] = updated
+        self._sequence = [
+            (owner_id, updated if alert is record else alert)
+            for owner_id, alert in self._sequence
+        ]
+        return updated
 
     def remove(
         self, resource_id: str, vulnerability_id: str
