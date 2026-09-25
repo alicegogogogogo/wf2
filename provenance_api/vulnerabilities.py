@@ -4,8 +4,8 @@ A vulnerability record pairs an advisory identifier with the affected
 component, a severity level, a summary and an optional fixed version.
 Records are kept per resource in submission order and are never persisted:
 stopping or restarting the service clears every alert, and no files are
-written. Batching, updates, deletion and concurrency are intentionally out
-of scope.
+written. Alerts can be registered one at a time or as an atomic batch;
+updates, deletion and concurrency are intentionally out of scope.
 """
 
 from __future__ import annotations
@@ -34,6 +34,9 @@ _ALLOWED_FIELDS = frozenset(
     {"advisory", "component", "severity", "summary", "fixed_version"}
 )
 _REQUIRED_FIELDS = ("advisory", "component", "severity", "summary")
+
+#: Maximum number of alerts accepted by a single batch registration.
+MAX_BATCH_SIZE = 100
 
 
 class VulnerabilityValidationError(ValueError):
@@ -167,6 +170,51 @@ def build_vulnerability_fields(
     return advisory, component, severity, summary, fixed_version
 
 
+def build_batch_fields(
+    payload: object,
+) -> list[tuple[str, str, str, str, str | None]]:
+    """Validate a decoded batch payload and return normalized field values.
+
+    The top level must be a JSON object with exactly one field,
+    ``vulnerabilities``: a non-empty array of at most
+    :data:`MAX_BATCH_SIZE` elements, each validated exactly like a single
+    registration payload. Returns one normalized field tuple per element,
+    in array order.
+    """
+
+    if not isinstance(payload, dict):
+        raise VulnerabilityValidationError(
+            "Request body must be a JSON object."
+        )
+
+    unknown_fields = set(payload) - {"vulnerabilities"}
+    if unknown_fields:
+        raise VulnerabilityValidationError(
+            f"Unknown field: {sorted(unknown_fields)[0]!r}."
+        )
+    if "vulnerabilities" not in payload:
+        raise VulnerabilityValidationError(
+            "Missing required field: 'vulnerabilities'."
+        )
+
+    items = payload["vulnerabilities"]
+    if not isinstance(items, list):
+        raise VulnerabilityValidationError(
+            "Field 'vulnerabilities' must be an array."
+        )
+    if not items:
+        raise VulnerabilityValidationError(
+            "Field 'vulnerabilities' must not be empty."
+        )
+    if len(items) > MAX_BATCH_SIZE:
+        raise VulnerabilityValidationError(
+            f"Field 'vulnerabilities' must not exceed {MAX_BATCH_SIZE} "
+            "entries."
+        )
+
+    return [build_vulnerability_fields(item) for item in items]
+
+
 def max_severity(severities: Iterable[str]) -> str | None:
     """Return the highest severity among ``severities``, else ``None``.
 
@@ -232,6 +280,57 @@ class VulnerabilityStore:
         resource_keys.add(key)
         self._sequence.append((resource_id, record))
         return record
+
+    def add_batch(
+        self, resource_id: str, payloads: object
+    ) -> list[Vulnerability]:
+        """Validate and atomically append a batch of alerts for ``resource_id``.
+
+        ``payloads`` must be the decoded ``vulnerabilities`` array of a
+        batch request. The elements are treated as submitted in array
+        order: on success every alert is recorded in that order and the
+        new records are returned in the same order. The batch is atomic —
+        raises :class:`VulnerabilityValidationError` when any element is
+        invalid, or :class:`VulnerabilityError` with code
+        ``duplicate_vulnerability`` when an advisory/component pair repeats
+        inside the batch or already exists for the resource; in both cases
+        nothing is recorded.
+        """
+
+        assert isinstance(payloads, list)
+        fields = [build_vulnerability_fields(item) for item in payloads]
+
+        existing = self._keys.get(resource_id, ())
+        seen: set[tuple[str, str]] = set()
+        for advisory, component, _severity, _summary, _fixed in fields:
+            key = (advisory, component)
+            if key in existing or key in seen:
+                raise VulnerabilityError(
+                    "duplicate_vulnerability",
+                    "An alert with the same advisory and component already "
+                    "exists for this resource.",
+                )
+            seen.add(key)
+
+        # Validation and duplicate checks are complete; only now mutate.
+        records = [
+            Vulnerability(
+                id=uuid.uuid4().hex,
+                advisory=advisory,
+                component=component,
+                severity=severity,
+                summary=summary,
+                fixed_version=fixed_version,
+            )
+            for advisory, component, severity, summary, fixed_version in fields
+        ]
+        resource_records = self._records.setdefault(resource_id, [])
+        resource_keys = self._keys.setdefault(resource_id, set())
+        for record in records:
+            resource_records.append(record)
+            resource_keys.add((record.advisory, record.component))
+            self._sequence.append((resource_id, record))
+        return records
 
     def list_all(self) -> list[tuple[str, Vulnerability]]:
         """Return every alert across resources in global submission order.

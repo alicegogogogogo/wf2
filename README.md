@@ -468,7 +468,7 @@ curl -s "http://127.0.0.1:8000/resources/$ID/release-blockers"
 
 ## 安全告警（漏洞）
 
-可以对已登记的资源逐条登记安全告警。告警只保存在当前进程内存中，服务停止或重启后随资源一起清空，不会写入任何文件，也不承诺跨进程同步。告警按提交顺序保存；批量登记、更新、删除与并发处理不在当前范围内。
+可以对已登记的资源逐条登记安全告警，也可以通过批量入口一次提交一组。告警只保存在当前进程内存中，服务停止或重启后随资源一起清空，不会写入任何文件，也不承诺跨进程同步。告警按提交顺序保存；更新、删除与并发处理不在当前范围内。
 
 ### 登记告警：`POST /resources/{id}/vulnerabilities`
 
@@ -495,6 +495,26 @@ curl -s -X POST http://127.0.0.1:8000/resources/$ID/vulnerabilities \
 ```
 
 同一资源下公告编号与组件均相同的重复登记返回 HTTP 409（错误码 `duplicate_vulnerability`），原告警保持不变；公告编号或组件任一不同即视为不同告警。告警的 `severity`、`summary`、`fixed_version` 不参与去重。
+
+### 批量登记告警：`POST /resources/{id}/vulnerabilities/batch`
+
+一次为一组告警提交批量登记。请求体必须是一个完整的 JSON 对象，且只允许 `vulnerabilities` 一个字段：其值是非空数组，单批最多 100 条，每个元素的字段与单条登记完全一致（`advisory`、`component`、`severity`、`summary` 必填，`fixed_version` 可选，不允许未知字段）。
+
+整批按数组顺序视为依次提交。成功时照此顺序生成全部新记录并逐条回显，返回 HTTP 201，响应体顶层是 `vulnerabilities` 记录数组，每条记录的键序与单条登记响应一致，正文仍以单个换行结束：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/resources/$ID/vulnerabilities/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"vulnerabilities":[{"advisory":"CVE-2026-0001","component":"openssl","severity":"HIGH","summary":"存在缓冲区溢出"},{"advisory":"CVE-2026-0002","component":"zlib","severity":"low","summary":"信息泄露","fixed_version":"1.3.1"}]}'
+```
+
+```json
+{"vulnerabilities":[{"id":"…","advisory":"CVE-2026-0001","component":"openssl","severity":"high","summary":"存在缓冲区溢出","fixed_version":null},{"id":"…","advisory":"CVE-2026-0002","component":"zlib","severity":"low","summary":"信息泄露","fixed_version":"1.3.1"}]}
+```
+
+整批按原子方式提交：任何一条不合法或冲突都不写入任何新告警。数组内部或与既有告警的公告编号、组件组合重复时返回 HTTP 409（错误码 `duplicate_vulnerability`）；任一元素缺字段、类型错误、为空、超长、级别非法或含未知字段时整批返回 HTTP 400（错误码 `invalid_request`），不生成任何记录。请求体缺失、无法解码、顶层不是 JSON 对象、数组为空、数组超过 100 条或请求携带任意查询参数时同样返回 HTTP 400。路径标识为空或含 `/`、`\\` 返回 HTTP 400；标识合法但资源不存在返回 HTTP 404（错误码 `resource_not_found`）。`POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: POST`）。
+
+批量登记的告警立刻按既有口径参与单条查询、豁免匹配与准入预览；单条登记与查询的行为不变，全局汇总的计数与排序口径也不变。
 
 ### 查询告警：`GET /resources/{id}/vulnerabilities`
 
