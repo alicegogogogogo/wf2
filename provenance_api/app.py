@@ -1382,6 +1382,70 @@ def _handle_lifecycle(
     )
 
 
+def _handle_release_blockers(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Read-only, computed on the fly from the very same promotion checks as
+    # the staged -> released transition, but never short-circuiting: both
+    # reason codes and every blocked dependency are reported. Nothing is
+    # recorded and no existing state is touched.
+    content_complete = content_store.is_complete(raw_id)
+    reasons: list[str] = []
+    if not content_complete:
+        reasons.append("content_not_complete")
+
+    blockers: list[dict[str, str]] = []
+    for dependency_id in store.list_dependencies(raw_id):
+        state = lifecycle_store.get(dependency_id).state
+        if state in BLOCKING_STATES:
+            blockers.append({"resource_id": dependency_id, "state": state})
+    if blockers:
+        reasons.append("dependency_blocked")
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {
+            "id": raw_id,
+            "blocked": bool(reasons),
+            "reasons": reasons,
+            "blockers": blockers,
+            "content_complete": content_complete,
+        },
+        trailing_newline=True,
+    )
+
+
 def _handle_vulnerabilities_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -3659,6 +3723,10 @@ def application(
                 return _handle_lifecycle(
                     method, environ, head, start_response
                 )
+            if separator and tail == "release-blockers":
+                return _handle_release_blockers(
+                    method, environ, head, start_response
+                )
             if separator and tail == "vulnerabilities":
                 return _handle_vulnerabilities(
                     method, environ, head, start_response
@@ -3776,6 +3844,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/lifecycle")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/release-blockers"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without reading any business data.
+                return _handle_release_blockers(
+                    method,
+                    environ,
+                    suffix[: -len("/release-blockers")],
                     start_response,
                 )
             if separator and suffix.endswith("/vulnerabilities"):
