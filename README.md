@@ -1139,6 +1139,43 @@ curl -s -X POST "http://127.0.0.1:8000/mirrors/$MIRROR_ID/pull/$DIGEST" --output
 - 上游返回的字节经 SHA-256 校验与请求摘要不符，返回 HTTP 502（错误码 `mirror_digest_mismatch`），不写入缓存。
 - 校验通过但写入会使已用字节超过配额，返回 HTTP 409（错误码 `cache_quota_exceeded`），缓存保持原样，响应体不是层字节。
 
+### 登记镜像源签名策略：`POST /mirrors/{id}/signature-policy`
+
+每个镜像源最多登记一份签名策略，登记后该镜像源的拉取必须携带签名请求头。请求体必须是一个完整的 JSON 对象，且只允许以下三个字段：
+
+| 字段 | 类型 | 是否必填 | 说明 |
+| --- | --- | --- | --- |
+| `algorithm` | string | 是 | 签名算法，只允许 `hmac-sha256`、`hmac-sha512`，区分大小写 |
+| `keys` | array | 是 | 受信密钥标识数组，非空，元素为非空字符串且不得重复，原样回显 |
+| `cover_digest` | boolean | 是 | 为 `true` 时被签摘要必须覆盖被拉层的摘要 |
+
+首次登记返回 HTTP 201，响应体回显镜像源 `id` 与上述三项内容（键序固定为 `id`、`algorithm`、`keys`、`cover_digest`，紧凑 JSON 以换行结束）；内容完全相同的重复提交返回 HTTP 200，内容不同返回 HTTP 409（错误码 `mirror_policy_conflict`），原策略不被覆盖。
+
+```bash
+curl -s -X POST "http://127.0.0.1:8000/mirrors/$MIRROR_ID/signature-policy" \
+  -H 'Content-Type: application/json' \
+  -d '{"algorithm":"hmac-sha256","keys":["key-one"],"cover_digest":true}'
+```
+
+```json
+{"id":"…","algorithm":"hmac-sha256","keys":["key-one"],"cover_digest":true}
+```
+
+### 查询镜像源签名策略：`GET /mirrors/{id}/signature-policy`
+
+返回该镜像源的签名策略，形状与登记响应相同，仍是 HTTP 200。镜像源存在但从未登记策略时返回 HTTP 404（错误码 `mirror_policy_not_found`）。
+
+### 拉取时的签名校验
+
+镜像源登记了签名策略后，`POST /mirrors/{id}/pull/{digest}` 必须携带三个请求头：`X-Key-Id`（密钥标识）、`X-Signature`（十六进制签名值）与 `X-Signed-Digest`（被签的 64 位十六进制摘要）。校验在层内容就绪（缓存命中或回源并校验摘要通过）之后、写缓存与返回字节之前进行，按既有口径重算：以密钥标识的 UTF-8 字节为密钥，对小写被签摘要文本做策略算法的 HMAC。判定按以下顺序进行，命中即止，只报一个错误码：
+
+1. 缺少任一签名请求头，返回 HTTP 403（错误码 `signature_missing`）。
+2. `X-Key-Id` 不在策略的 `keys` 中，返回 HTTP 403（错误码 `key_not_trusted`）。
+3. 策略 `cover_digest` 为 `true` 且 `X-Signed-Digest` 与被拉层摘要不符，返回 HTTP 403（错误码 `digest_uncovered`）。
+4. 重算签名与 `X-Signature` 不一致（比对忽略大小写），返回 HTTP 403（错误码 `signature_invalid`）。
+
+校验不通过时不返回层字节、不写缓存、不改缓存计数；校验通过时仍返回原始层字节。未登记策略的镜像源拉取行为与既有完全一致，即使携带签名请求头也不改变结果。
+
 ### 镜像源接口的错误
 
 下列情况都返回 HTTP 400（错误码 `invalid_request`），且不写入任何镜像源、不改变缓存或其他状态：
@@ -1147,11 +1184,13 @@ curl -s -X POST "http://127.0.0.1:8000/mirrors/$MIRROR_ID/pull/$DIGEST" --output
 - 登记请求体缺失、不是合法 UTF-8 JSON，或顶层不是 JSON 对象；
 - 缺少 `name`、`upstream`，出现未知字段，任一字段不是字符串或为空；
 - `upstream` 不是 `http` 或 `https` 的绝对地址；
+- 签名策略缺少 `algorithm`、`keys`、`cover_digest` 中任一字段，出现未知字段，`algorithm` 不是两个允许值之一，`keys` 不是非空数组、元素不是非空字符串或出现重复，`cover_digest` 不是布尔值；
+- 已登记策略的拉取请求中签名请求头取值非法（`X-Key-Id`、`X-Signature` 为空，或 `X-Signed-Digest` 不是 64 位十六进制）；
 - 任意镜像源接口携带查询参数。
 
-路径标识格式合法但镜像源不存在时，单条查询与拉取都返回 HTTP 404（错误码 `mirror_not_found`），且不改变状态。方法不符返回 HTTP 405（错误码 `method_not_allowed`，响应带 `Allow` 头）：`/mirrors` 为 `Allow: GET, POST`，`/mirrors/{id}` 为 `Allow: GET`，`/mirrors/{id}/pull/{digest}` 为 `Allow: POST`。
+路径标识格式合法但镜像源不存在时，单条查询、拉取与签名策略接口都返回 HTTP 404（错误码 `mirror_not_found`），且不改变状态。方法不符返回 HTTP 405（错误码 `method_not_allowed`，响应带 `Allow` 头）：`/mirrors` 为 `Allow: GET, POST`，`/mirrors/{id}` 为 `Allow: GET`，`/mirrors/{id}/pull/{digest}` 为 `Allow: POST`，`/mirrors/{id}/signature-policy` 为 `Allow: GET, POST`。
 
-镜像源数据与由拉取写入的缓存条目均仅存于当前进程内存，停止或重启即清空，不生成任何文件；缓存条目的删除与清空通过上文 `/cache` 的两个删除入口完成，镜像源的删除及并发处理不在当前范围内。
+镜像源数据、签名策略与由拉取写入的缓存条目均仅存于当前进程内存，停止或重启即清空，不生成任何文件；缓存条目的删除与清空通过上文 `/cache` 的两个删除入口完成，镜像源的删除及并发处理不在当前范围内。
 
 ## 跨仓库引用与解析
 

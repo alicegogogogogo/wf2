@@ -31,6 +31,13 @@ from .lifecycle import (
     LifecycleRecord,
     LifecycleStore,
 )
+from .mirror_policies import (
+    MirrorPolicy,
+    MirrorPolicyError,
+    MirrorPolicyStore,
+    MirrorPolicyValidationError,
+    build_mirror_policy_fields,
+)
 from .mirrors import (
     MirrorFetchError,
     MirrorStore,
@@ -129,6 +136,10 @@ cache_store = LayerCacheStore()
 #: Process-local image mirror registry; cleared on restart like everything.
 mirror_store = MirrorStore()
 
+#: Process-local mirror signature policies; cleared on restart like the
+#: rest, and never persisted.
+mirror_policy_store = MirrorPolicyStore()
+
 #: Process-local cross-repository references; cleared on restart like the
 #: rest.
 cross_reference_store = CrossReferenceStore()
@@ -152,6 +163,7 @@ def reset_state() -> None:
     notification_store.reset()
     cache_store.reset()
     mirror_store.reset()
+    mirror_policy_store.reset()
     cross_reference_store.reset()
     signature_store.reset()
 
@@ -168,6 +180,12 @@ _TOTAL_CHUNKS_HEADER = "HTTP_X_TOTAL_CHUNKS"
 _CONTENT_DIGEST_HEADER = "HTTP_X_CONTENT_DIGEST"
 _TOTAL_CHUNKS_HEADER_NAME = "X-Total-Chunks"
 _CONTENT_DIGEST_HEADER_NAME = "X-Content-Digest"
+_KEY_ID_HEADER = "HTTP_X_KEY_ID"
+_SIGNATURE_HEADER = "HTTP_X_SIGNATURE"
+_SIGNED_DIGEST_HEADER = "HTTP_X_SIGNED_DIGEST"
+_KEY_ID_HEADER_NAME = "X-Key-Id"
+_SIGNATURE_HEADER_NAME = "X-Signature"
+_SIGNED_DIGEST_HEADER_NAME = "X-Signed-Digest"
 
 #: Random per-process key so cursors cannot be forged and never survive a
 #: restart; nothing here is persisted to disk.
@@ -3137,6 +3155,218 @@ def _handle_mirror_item(
     )
 
 
+def _handle_mirror_signature_policy_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    if not raw_id or "/" in raw_id or "\\" in raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not be empty or contain path separators.",
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Validate the whole body before touching any store, so a bad request
+    # can never leave a partial policy.
+    try:
+        build_mirror_policy_fields(payload)
+    except MirrorPolicyValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    if mirror_store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_not_found",
+            "No mirror exists with the requested id.",
+        )
+
+    try:
+        policy, created = mirror_policy_store.add(raw_id, payload)
+    except MirrorPolicyError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created" if created else "200 OK",
+        policy.to_dict(raw_id),
+        trailing_newline=True,
+    )
+
+
+def _handle_mirror_signature_policy_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    if not raw_id or "/" in raw_id or "\\" in raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not be empty or contain path separators.",
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    if mirror_store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_not_found",
+            "No mirror exists with the requested id.",
+        )
+
+    policy = mirror_policy_store.get(raw_id)
+    if policy is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_policy_not_found",
+            "No signature policy is registered for this mirror.",
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        policy.to_dict(raw_id),
+        trailing_newline=True,
+    )
+
+
+def _handle_mirror_signature_policy(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_mirror_signature_policy_post(
+            environ, raw_id, start_response
+        )
+    if method == "GET":
+        return _handle_mirror_signature_policy_get(
+            environ, raw_id, start_response
+        )
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
+def _pull_signature_failure(
+    policy: MirrorPolicy, environ: dict[str, Any], digest: str
+) -> tuple[str, str, str] | None:
+    """Check the pull signature headers against ``policy``.
+
+    Returns ``(status, code, message)`` for the first failed check, in the
+    mandated order (missing headers, key trust, digest coverage, signature
+    value), or ``None`` when every check passes. The signature is
+    recomputed with the existing convention: the key id bytes are the key
+    and the lowercase signed digest text is the message.
+    """
+
+    key_id = environ.get(_KEY_ID_HEADER)
+    signature = environ.get(_SIGNATURE_HEADER)
+    signed_digest = environ.get(_SIGNED_DIGEST_HEADER)
+    if key_id is None or signature is None or signed_digest is None:
+        return (
+            "403 Forbidden",
+            "signature_missing",
+            f"This mirror requires the {_KEY_ID_HEADER_NAME}, "
+            f"{_SIGNATURE_HEADER_NAME} and {_SIGNED_DIGEST_HEADER_NAME} "
+            "headers.",
+        )
+
+    if not isinstance(key_id, str) or not key_id:
+        return (
+            "400 Bad Request",
+            "invalid_request",
+            f"{_KEY_ID_HEADER_NAME} header must be a non-empty string.",
+        )
+    if not isinstance(signature, str) or not signature:
+        return (
+            "400 Bad Request",
+            "invalid_request",
+            f"{_SIGNATURE_HEADER_NAME} header must be a non-empty string.",
+        )
+    if (
+        not isinstance(signed_digest, str)
+        or _DIGEST_PATTERN.fullmatch(signed_digest) is None
+    ):
+        return (
+            "400 Bad Request",
+            "invalid_request",
+            f"{_SIGNED_DIGEST_HEADER_NAME} header must be a 64-character "
+            "hexadecimal string.",
+        )
+    signed_digest = signed_digest.lower()
+
+    if key_id not in policy.keys:
+        return (
+            "403 Forbidden",
+            "key_not_trusted",
+            "The key id is not trusted by the mirror signature policy.",
+        )
+
+    if policy.cover_digest and signed_digest != digest:
+        return (
+            "403 Forbidden",
+            "digest_uncovered",
+            "The signed digest does not cover the pulled layer digest.",
+        )
+
+    expected = compute_signature(policy.algorithm, key_id, signed_digest)
+    try:
+        provided = signature.lower().encode("ascii")
+    except UnicodeEncodeError:
+        provided = b""
+    # The comparison ignores case; the recomputed value is already
+    # lowercase hexadecimal.
+    if not hmac.compare_digest(expected.encode("ascii"), provided):
+        return (
+            "403 Forbidden",
+            "signature_invalid",
+            "The signature does not match the recomputed value.",
+        )
+
+    return None
+
+
 def _raw_layer_response(
     start_response: StartResponse, data: bytes
 ) -> Iterable[bytes]:
@@ -3199,10 +3429,20 @@ def _handle_mirror_pull(
             "No mirror exists with the requested id.",
         )
 
+    # Without a registered policy the pull behaves exactly as before and
+    # any signature headers are ignored.
+    policy = mirror_policy_store.get(raw_id)
+
     # A cache hit is served straight from storage; pulling must not change
     # the cache counters, so the counter-free accessor is used.
     cached = cache_store.peek(digest)
     if cached is not None:
+        if policy is not None:
+            # The signature gate applies to cached bytes too: a failed
+            # check returns nothing and changes nothing.
+            failure = _pull_signature_failure(policy, environ, digest)
+            if failure is not None:
+                return _error(start_response, *failure)
         return _raw_layer_response(start_response, cached)
 
     try:
@@ -3220,6 +3460,13 @@ def _handle_mirror_pull(
             "mirror_digest_mismatch",
             "Upstream layer bytes do not match the requested digest.",
         )
+
+    if policy is not None:
+        # The layer content is ready; the signature gate runs before the
+        # cache write so a failed check neither serves bytes nor caches.
+        failure = _pull_signature_failure(policy, environ, digest)
+        if failure is not None:
+            return _error(start_response, *failure)
 
     try:
         # The digest was just verified, so ``put`` can only fail on quota;
@@ -3679,6 +3926,16 @@ def application(
                     environ,
                     suffix[: -len("/pull")],
                     "",
+                    start_response,
+                )
+            if suffix.endswith("/signature-policy"):
+                # Split on the policy marker even when the id segment embeds
+                # a separator, so the handler can reject the id as a bad
+                # request instead of treating the path as an unknown item.
+                return _handle_mirror_signature_policy(
+                    method,
+                    environ,
+                    suffix[: -len("/signature-policy")],
                     start_response,
                 )
             head, separator, _tail = suffix.partition("/")
