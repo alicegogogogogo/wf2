@@ -142,6 +142,21 @@ class MirrorStore:
         self._name_to_id[name] = mirror.id
         return mirror, None
 
+    def remove(self, mirror_id: str) -> Mirror | None:
+        """Remove and return the mirror with ``mirror_id``.
+
+        Returns ``None`` when no such mirror exists (including one that was
+        already removed); the name is freed so it can be registered again.
+        Nothing else is touched.
+        """
+
+        mirror = self._by_id.pop(mirror_id, None)
+        if mirror is None:
+            return None
+        self._mirrors = [m for m in self._mirrors if m.id != mirror_id]
+        del self._name_to_id[mirror.name]
+        return mirror
+
 
 def _layer_url(upstream: str, digest: str) -> str:
     return upstream.rstrip("/") + "/layers/" + digest

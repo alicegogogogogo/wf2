@@ -282,12 +282,12 @@ class MirrorPolicyRegistrationTests(unittest.TestCase):
 
     def test_method_not_allowed_has_allow_header(self) -> None:
         mirror = register()
-        for method in ("PUT", "DELETE", "PATCH"):
+        for method in ("PUT", "PATCH"):
             status, headers, body = call_json(
                 method, f"/mirrors/{mirror['id']}/signature-policy"
             )
             self.assertEqual(status, "405 Method Not Allowed")
-            self.assertIn(("Allow", "GET, POST"), headers)
+            self.assertIn(("Allow", "GET, POST, DELETE"), headers)
             self.assertEqual(body["error"], "method_not_allowed")
 
     def test_policies_are_independent_per_mirror(self) -> None:
@@ -299,6 +299,134 @@ class MirrorPolicyRegistrationTests(unittest.TestCase):
         )
         self.assertEqual(status, "404 Not Found")
         self.assertEqual(body["error"], "mirror_policy_not_found")
+
+
+class MirrorPolicyDeleteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_state()
+
+    def test_delete_returns_200_with_full_policy_echo(self) -> None:
+        mirror = register()
+        register_policy(str(mirror["id"]))
+        status, headers, raw = call(
+            "DELETE", f"/mirrors/{mirror['id']}/signature-policy"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertIn(
+            ("Content-Type", "application/json; charset=utf-8"), headers
+        )
+        body = json.loads(raw)
+        self.assertEqual(
+            list(body), ["id", "algorithm", "keys", "cover_digest"]
+        )
+        self.assertEqual(body["id"], mirror["id"])
+        self.assertEqual(body["algorithm"], "hmac-sha256")
+        self.assertEqual(body["keys"], ["key-one", "key-two"])
+        self.assertEqual(body["cover_digest"], True)
+        # Compact JSON with a single trailing newline.
+        self.assertEqual(
+            raw,
+            json.dumps(body, separators=(",", ":")).encode("utf-8") + b"\n",
+        )
+
+    def test_delete_removes_policy_but_keeps_mirror(self) -> None:
+        mirror = register()
+        register_policy(str(mirror["id"]))
+        call("DELETE", f"/mirrors/{mirror['id']}/signature-policy")
+
+        status, _h, body = call_json(
+            "GET", f"/mirrors/{mirror['id']}/signature-policy"
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "mirror_policy_not_found")
+
+        status, _h, body = call_json("GET", f"/mirrors/{mirror['id']}")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["id"], mirror["id"])
+
+    def test_second_delete_returns_404_without_side_effects(self) -> None:
+        mirror = register()
+        register_policy(str(mirror["id"]))
+        call("DELETE", f"/mirrors/{mirror['id']}/signature-policy")
+        status, _h, body = call_json(
+            "DELETE", f"/mirrors/{mirror['id']}/signature-policy"
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "mirror_policy_not_found")
+
+    def test_delete_without_policy_returns_404(self) -> None:
+        mirror = register()
+        status, _h, body = call_json(
+            "DELETE", f"/mirrors/{mirror['id']}/signature-policy"
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "mirror_policy_not_found")
+
+    def test_delete_on_unknown_mirror_returns_404(self) -> None:
+        status, _h, body = call_json(
+            "DELETE", "/mirrors/does-not-exist/signature-policy"
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "mirror_not_found")
+
+    def test_delete_with_invalid_id_returns_400(self) -> None:
+        for path in (
+            "/mirrors//signature-policy",
+            "/mirrors/a/b/signature-policy",
+            "/mirrors/a\\b/signature-policy",
+        ):
+            status, _h, body = call_json("DELETE", path)
+            self.assertEqual(status, "400 Bad Request", path)
+            self.assertEqual(body["error"], "invalid_request")
+
+    def test_delete_with_query_parameters_returns_400(self) -> None:
+        mirror = register()
+        register_policy(str(mirror["id"]))
+        status, _h, body = call_json(
+            "DELETE",
+            f"/mirrors/{mirror['id']}/signature-policy",
+            query_string="x=1",
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+        # The policy is untouched.
+        status, _h, _b = call_json(
+            "GET", f"/mirrors/{mirror['id']}/signature-policy"
+        )
+        self.assertEqual(status, "200 OK")
+
+    def test_delete_with_body_returns_400(self) -> None:
+        mirror = register()
+        register_policy(str(mirror["id"]))
+        status, _h, body = call_json(
+            "DELETE",
+            f"/mirrors/{mirror['id']}/signature-policy",
+            b'{"algorithm":"hmac-sha256"}',
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+        status, _h, _b = call_json(
+            "GET", f"/mirrors/{mirror['id']}/signature-policy"
+        )
+        self.assertEqual(status, "200 OK")
+
+    def test_policy_can_be_registered_again_after_delete(self) -> None:
+        mirror = register()
+        register_policy(str(mirror["id"]))
+        call("DELETE", f"/mirrors/{mirror['id']}/signature-policy")
+        status, _body = register_policy(str(mirror["id"]))
+        self.assertEqual(status, "201 Created")
+
+    def test_pull_after_policy_delete_ignores_signature_headers(self) -> None:
+        mirror = register()
+        register_policy(str(mirror["id"]))
+        call("DELETE", f"/mirrors/{mirror['id']}/signature-policy")
+        with patch_fetch(data=LAYER_A):
+            status, _h, raw = call(
+                "POST", f"/mirrors/{mirror['id']}/pull/{DIGEST_A}"
+            )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(raw, LAYER_A)
 
 
 class MirrorPullSignatureTests(unittest.TestCase):

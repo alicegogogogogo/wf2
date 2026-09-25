@@ -3105,21 +3105,9 @@ def _handle_mirrors_post(
     )
 
 
-def _handle_mirror_item(
-    method: str,
-    environ: dict[str, Any],
-    raw_id: str,
-    start_response: StartResponse,
+def _handle_mirror_item_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
-    if method != "GET":
-        return _error(
-            start_response,
-            "405 Method Not Allowed",
-            "method_not_allowed",
-            f"Method {method} is not allowed for this path.",
-            allowed="GET",
-        )
-
     if not raw_id:
         return _error(
             start_response,
@@ -3152,6 +3140,77 @@ def _handle_mirror_item(
 
     return _json_response(
         start_response, "200 OK", mirror.to_dict(), trailing_newline=True
+    )
+
+
+def _handle_mirror_item_delete(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    if not raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not be empty.",
+        )
+    if "/" in raw_id or "\\" in raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not contain path separators.",
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Deletion carries no body; a declared non-empty or malformed body is
+    # rejected without being read.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    mirror = mirror_store.get(raw_id)
+    if mirror is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_not_found",
+            "No mirror exists with the requested id.",
+        )
+
+    # Removing the mirror also drops its signature policy, if any; the echo
+    # still only carries the mirror's own three fields. Cache entries,
+    # counters and every other store are deliberately left untouched.
+    mirror_policy_store.remove(raw_id)
+    removed = mirror_store.remove(raw_id)
+    assert removed is not None
+    return _json_response(
+        start_response, "200 OK", removed.to_dict(), trailing_newline=True
+    )
+
+
+def _handle_mirror_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "GET":
+        return _handle_mirror_item_get(environ, raw_id, start_response)
+    if method == "DELETE":
+        return _handle_mirror_item_delete(environ, raw_id, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, DELETE",
     )
 
 
@@ -3265,6 +3324,55 @@ def _handle_mirror_signature_policy_get(
     )
 
 
+def _handle_mirror_signature_policy_delete(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    if not raw_id or "/" in raw_id or "\\" in raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not be empty or contain path separators.",
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Deletion carries no body; a declared non-empty or malformed body is
+    # rejected without being read.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    if mirror_store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_not_found",
+            "No mirror exists with the requested id.",
+        )
+
+    policy = mirror_policy_store.remove(raw_id)
+    if policy is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_policy_not_found",
+            "No signature policy is registered for this mirror.",
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        policy.to_dict(raw_id),
+        trailing_newline=True,
+    )
+
+
 def _handle_mirror_signature_policy(
     method: str,
     environ: dict[str, Any],
@@ -3279,12 +3387,16 @@ def _handle_mirror_signature_policy(
         return _handle_mirror_signature_policy_get(
             environ, raw_id, start_response
         )
+    if method == "DELETE":
+        return _handle_mirror_signature_policy_delete(
+            environ, raw_id, start_response
+        )
     return _error(
         start_response,
         "405 Method Not Allowed",
         "method_not_allowed",
         f"Method {method} is not allowed for this path.",
-        allowed="GET, POST",
+        allowed="GET, POST, DELETE",
     )
 
 

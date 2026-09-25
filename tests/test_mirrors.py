@@ -253,10 +253,10 @@ class MirrorRegistrationTests(unittest.TestCase):
 
     def test_item_method_not_allowed_has_allow_header(self) -> None:
         _s, created = register()
-        for method in ("POST", "PUT", "DELETE"):
+        for method in ("POST", "PUT", "PATCH"):
             status, headers, body = call_json(method, f"/mirrors/{created['id']}")
             self.assertEqual(status, "405 Method Not Allowed")
-            self.assertIn(("Allow", "GET"), headers)
+            self.assertIn(("Allow", "GET, DELETE"), headers)
             self.assertEqual(body["error"], "method_not_allowed")
 
 
@@ -287,6 +287,130 @@ class MirrorItemErrorTests(unittest.TestCase):
         )
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
+
+
+class MirrorDeleteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_state()
+
+    def test_delete_returns_200_with_compact_echo(self) -> None:
+        _s, created = register()
+        status, headers, raw = call("DELETE", f"/mirrors/{created['id']}")
+        self.assertEqual(status, "200 OK")
+        self.assertIn(
+            ("Content-Type", "application/json; charset=utf-8"), headers
+        )
+        body = json.loads(raw)
+        self.assertEqual(list(body), ["id", "name", "upstream"])
+        self.assertEqual(body["id"], created["id"])
+        self.assertEqual(body["name"], "primary")
+        self.assertEqual(body["upstream"], UPSTREAM)
+        # Compact JSON with a single trailing newline.
+        self.assertEqual(
+            raw,
+            json.dumps(body, separators=(",", ":")).encode("utf-8") + b"\n",
+        )
+
+    def test_deleted_mirror_is_gone_from_get_and_list(self) -> None:
+        _s, created = register()
+        call("DELETE", f"/mirrors/{created['id']}")
+        status, _h, body = call_json("GET", f"/mirrors/{created['id']}")
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "mirror_not_found")
+        _s, _h, listing = call_json("GET", "/mirrors")
+        self.assertEqual(listing, {"mirrors": []})
+
+    def test_second_delete_returns_404_without_side_effects(self) -> None:
+        _s, created = register()
+        call("DELETE", f"/mirrors/{created['id']}")
+        status, _h, body = call_json("DELETE", f"/mirrors/{created['id']}")
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "mirror_not_found")
+
+    def test_delete_unknown_mirror_returns_404(self) -> None:
+        status, _h, body = call_json("DELETE", "/mirrors/does-not-exist")
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "mirror_not_found")
+
+    def test_delete_with_invalid_id_returns_400(self) -> None:
+        for path in ("/mirrors/", "/mirrors/a/b", "/mirrors/a\\b"):
+            status, _h, body = call_json("DELETE", path)
+            self.assertEqual(status, "400 Bad Request", path)
+            self.assertEqual(body["error"], "invalid_request")
+
+    def test_delete_with_query_parameters_returns_400(self) -> None:
+        _s, created = register()
+        status, _h, body = call_json(
+            "DELETE", f"/mirrors/{created['id']}", query_string="x=1"
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+        # The mirror is untouched.
+        status, _h, _b = call_json("GET", f"/mirrors/{created['id']}")
+        self.assertEqual(status, "200 OK")
+
+    def test_delete_with_body_returns_400(self) -> None:
+        _s, created = register()
+        status, _h, body = call_json(
+            "DELETE", f"/mirrors/{created['id']}", b'{"name":"x"}'
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+        status, _h, _b = call_json("GET", f"/mirrors/{created['id']}")
+        self.assertEqual(status, "200 OK")
+
+    def test_delete_cascades_signature_policy_but_echoes_mirror_only(
+        self,
+    ) -> None:
+        _s, created = register()
+        status, _h, _p = call_json(
+            "POST",
+            f"/mirrors/{created['id']}/signature-policy",
+            json.dumps(
+                {
+                    "algorithm": "hmac-sha256",
+                    "keys": ["key-one"],
+                    "cover_digest": True,
+                }
+            ).encode("utf-8"),
+            headers={"CONTENT_TYPE": "application/json"},
+        )
+        self.assertEqual(status, "201 Created")
+
+        status, _h, raw = call("DELETE", f"/mirrors/{created['id']}")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(
+            list(json.loads(raw)), ["id", "name", "upstream"]
+        )
+
+    def test_name_can_be_registered_again_after_delete(self) -> None:
+        _s, created = register()
+        call("DELETE", f"/mirrors/{created['id']}")
+        status, body = register()
+        self.assertEqual(status, "201 Created")
+        self.assertEqual(body["name"], "primary")
+        self.assertNotEqual(body["id"], created["id"])
+
+    def test_delete_does_not_touch_cache_entries_or_counters(self) -> None:
+        _s, created = register()
+        put_cache_layer(LAYER_A)
+        _s, _h, before = call_json("GET", "/cache/status")
+
+        status, _h, _b = call_json("DELETE", f"/mirrors/{created['id']}")
+        self.assertEqual(status, "200 OK")
+
+        _s, _h, after = call_json("GET", "/cache/status")
+        self.assertEqual(before, after)
+        self.assertEqual(after["entries"], 1)
+
+    def test_pull_after_delete_returns_404(self) -> None:
+        _s, created = register()
+        call("DELETE", f"/mirrors/{created['id']}")
+        status, _h, body = call_json(
+            "POST", f"/mirrors/{created['id']}/pull/{DIGEST_A}"
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "mirror_not_found")
 
 
 class MirrorPullTests(unittest.TestCase):

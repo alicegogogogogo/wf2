@@ -164,3 +164,12 @@ class MirrorPolicyStore:
 
         self._policies[mirror_id] = policy
         return policy, True
+
+    def remove(self, mirror_id: str) -> MirrorPolicy | None:
+        """Remove and return the policy stored for ``mirror_id``.
+
+        Returns ``None`` when no policy is registered (including one that
+        was already removed); removing never leaves a partial record.
+        """
+
+        return self._policies.pop(mirror_id, None)
