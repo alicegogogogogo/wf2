@@ -253,10 +253,10 @@ class MirrorRegistrationTests(unittest.TestCase):
 
     def test_item_method_not_allowed_has_allow_header(self) -> None:
         _s, created = register()
-        for method in ("POST", "PUT", "DELETE"):
+        for method in ("POST", "PUT", "PATCH"):
             status, headers, body = call_json(method, f"/mirrors/{created['id']}")
             self.assertEqual(status, "405 Method Not Allowed")
-            self.assertIn(("Allow", "GET"), headers)
+            self.assertIn(("Allow", "DELETE, GET"), headers)
             self.assertEqual(body["error"], "method_not_allowed")
 
 

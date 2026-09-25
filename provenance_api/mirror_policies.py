@@ -132,6 +132,14 @@ class MirrorPolicyStore:
     def get(self, mirror_id: str) -> MirrorPolicy | None:
         return self._policies.get(mirror_id)
 
+    def remove(self, mirror_id: str) -> MirrorPolicy | None:
+        """Remove and return the policy for ``mirror_id``, else ``None``.
+
+        A missing or already removed policy changes nothing.
+        """
+
+        return self._policies.pop(mirror_id, None)
+
     def add(
         self, mirror_id: str, payload: object
     ) -> tuple[MirrorPolicy, bool]:

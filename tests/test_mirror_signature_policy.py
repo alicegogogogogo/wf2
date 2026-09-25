@@ -282,12 +282,12 @@ class MirrorPolicyRegistrationTests(unittest.TestCase):
 
     def test_method_not_allowed_has_allow_header(self) -> None:
         mirror = register()
-        for method in ("PUT", "DELETE", "PATCH"):
+        for method in ("PUT", "PATCH"):
             status, headers, body = call_json(
                 method, f"/mirrors/{mirror['id']}/signature-policy"
             )
             self.assertEqual(status, "405 Method Not Allowed")
-            self.assertIn(("Allow", "GET, POST"), headers)
+            self.assertIn(("Allow", "DELETE, GET, POST"), headers)
             self.assertEqual(body["error"], "method_not_allowed")
 
     def test_policies_are_independent_per_mirror(self) -> None:
