@@ -149,6 +149,13 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(body["evidence_requirements"], [])
         self.assertEqual(body["license_allowlist"], [])
 
+    def test_signature_is_a_valid_evidence_value(self) -> None:
+        status, _h, body = self._register(
+            evidence_requirements=["signature"]
+        )
+        self.assertEqual(status, "201 Created")
+        self.assertEqual(body["evidence_requirements"], ["signature"])
+
     def test_same_content_resubmitted_returns_200(self) -> None:
         first_status, _h, first = self._register()
         self.assertEqual(first_status, "201 Created")
@@ -432,6 +439,19 @@ class AdmissionTests(unittest.TestCase):
             },
         )
 
+    def _add_signature(self, resource_id: str | None = None) -> None:
+        call_json(
+            "POST",
+            f"/resources/{resource_id or self.resource_id}/signatures",
+            {
+                "signer": "alice",
+                "algorithm": "hmac-sha256",
+                "key_id": "secret",
+                "signature": "0" * 64,
+                "digest": DIGEST_A,
+            },
+        )
+
     def _add_alert(
         self, severity: str, resource_id: str | None = None
     ) -> None:
@@ -561,6 +581,60 @@ class AdmissionTests(unittest.TestCase):
             body["reasons"],
             ["no_sbom", "no_license", "no_provenance"],
         )
+
+    def test_missing_signature_reported_last_in_evidence_group(self) -> None:
+        self._register(
+            evidence_requirements=[
+                "sbom", "license", "provenance", "signature"
+            ],
+            license_allowlist=[],
+        )
+        _s, _h, body = self._admission()
+        self.assertIs(body["allowed"], False)
+        self.assertEqual(
+            body["reasons"],
+            ["no_sbom", "no_license", "no_provenance", "no_signature"],
+        )
+
+    def test_only_signature_missing_reports_no_signature(self) -> None:
+        self._register(
+            evidence_requirements=[
+                "sbom", "license", "provenance", "signature"
+            ],
+            license_allowlist=[],
+        )
+        self._add_sbom()
+        self._add_license()
+        self._add_provenance()
+        _s, _h, body = self._admission()
+        self.assertIs(body["allowed"], False)
+        self.assertEqual(body["reasons"], ["no_signature"])
+
+    def test_registered_signature_satisfies_evidence(self) -> None:
+        self._register(
+            evidence_requirements=["signature"], license_allowlist=[]
+        )
+        self._add_signature()
+        _s, _h, body = self._admission()
+        self.assertEqual(body["reasons"], [])
+        self.assertIs(body["allowed"], True)
+
+    def test_unverifiable_signature_still_satisfies_evidence(self) -> None:
+        # The registered signature value does not match the HMAC of the
+        # digest; verification never participates in admission.
+        self._register(
+            evidence_requirements=["signature"], license_allowlist=[]
+        )
+        self._add_signature()
+        status, _h, verify = call_json(
+            "POST", f"/resources/{self.resource_id}/signatures/verify"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertIs(verify["valid"], False)
+
+        _s, _h, body = self._admission()
+        self.assertEqual(body["reasons"], [])
+        self.assertIs(body["allowed"], True)
 
     def test_required_evidence_present_passes_evidence_check(self) -> None:
         self._register(

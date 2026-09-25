@@ -126,6 +126,20 @@ class RiskTests(unittest.TestCase):
         )
         self.assertEqual(status, "201 Created")
 
+    def _add_signature(self) -> None:
+        status, _h, _b = call_json(
+            "POST",
+            f"/resources/{self.resource_id}/signatures",
+            {
+                "signer": "alice",
+                "algorithm": "hmac-sha256",
+                "key_id": "secret",
+                "signature": "0" * 64,
+                "digest": DIGEST_A,
+            },
+        )
+        self.assertEqual(status, "201 Created")
+
     def _add_policy(self, allowlist: list[str]) -> None:
         status, _h, _b = call_json(
             "POST",
@@ -154,6 +168,7 @@ class RiskTests(unittest.TestCase):
         self._add_sbom()
         self._add_license()
         self._add_provenance()
+        self._add_signature()
 
         status, _h, body = self._risk()
 
@@ -163,17 +178,45 @@ class RiskTests(unittest.TestCase):
         )
 
     def test_missing_evidence_adds_five_each(self) -> None:
-        # Nothing registered at all: three missing evidence items.
+        # Nothing registered at all: four missing evidence items.
         status, _h, body = self._risk()
 
         self.assertEqual(status, "200 OK")
-        self.assertEqual(body["score"], 15)
+        self.assertEqual(body["score"], 20)
         self.assertEqual(body["level"], "low")
+
+    def test_missing_signature_adds_five(self) -> None:
+        self._add_sbom()
+        self._add_license()
+        self._add_provenance()
+
+        _s, _h, body = self._risk()
+
+        self.assertEqual(body["score"], 5)
+        self.assertEqual(body["level"], "low")
+
+    def test_unverifiable_signature_still_counts_as_evidence(self) -> None:
+        # The registered signature value does not match the HMAC of the
+        # digest, but verification never moves the score.
+        self._add_sbom()
+        self._add_license()
+        self._add_provenance()
+        self._add_signature()
+
+        status, _h, verify = call_json(
+            "POST", f"/resources/{self.resource_id}/signatures/verify"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertIs(verify["valid"], False)
+
+        _s, _h, body = self._risk()
+        self.assertEqual(body["score"], 0)
 
     def test_severity_points_per_alert(self) -> None:
         self._add_sbom()
         self._add_license()
         self._add_provenance()
+        self._add_signature()
         self._add_vulnerability("CRITICAL", "CVE-1")
         self._add_vulnerability("High", "CVE-2")
         self._add_vulnerability("medium", "CVE-3")
@@ -188,6 +231,7 @@ class RiskTests(unittest.TestCase):
         self._add_sbom()
         self._add_license()
         self._add_provenance()
+        self._add_signature()
         self._set_lifecycle("quarantined", "tainted")
 
         _s, _h, body = self._risk()
@@ -228,15 +272,16 @@ class RiskTests(unittest.TestCase):
 
         _s, _h, body = self._risk(resource_id)
 
-        # 20 for the withdrawn state + 15 for the three missing evidence
-        # items (no SBOM, license or provenance registered).
-        self.assertEqual(body["score"], 35)
+        # 20 for the withdrawn state + 20 for the four missing evidence
+        # items (no SBOM, license, provenance or signature registered).
+        self.assertEqual(body["score"], 40)
         self.assertEqual(body["level"], "medium")
 
     def test_returning_to_staged_clears_state_points(self) -> None:
         self._add_sbom()
         self._add_license()
         self._add_provenance()
+        self._add_signature()
         self._set_lifecycle("quarantined", "tainted")
         self._set_lifecycle("staged")
 
@@ -248,6 +293,7 @@ class RiskTests(unittest.TestCase):
         self._add_sbom()
         self._add_license("GPL-3.0")
         self._add_provenance()
+        self._add_signature()
         self._add_policy(["Apache-2.0", "MIT"])
 
         _s, _h, body = self._risk()
@@ -258,6 +304,7 @@ class RiskTests(unittest.TestCase):
     def test_allowlist_miss_without_license_adds_ten(self) -> None:
         self._add_sbom()
         self._add_provenance()
+        self._add_signature()
         self._add_policy(["Apache-2.0"])
 
         _s, _h, body = self._risk()
@@ -269,6 +316,7 @@ class RiskTests(unittest.TestCase):
         self._add_sbom()
         self._add_license("GPL-3.0")
         self._add_provenance()
+        self._add_signature()
         self._add_policy([])
 
         _s, _h, body = self._risk()
@@ -283,7 +331,7 @@ class RiskTests(unittest.TestCase):
 
         _s, _h, body = self._risk()
 
-        # 3*40 + 15 (missing evidence) + 20 (state) = 155, capped at 100.
+        # 3*40 + 20 (missing evidence) + 20 (state) = 160, capped at 100.
         self.assertEqual(body["score"], 100)
         self.assertEqual(body["level"], "critical")
 
@@ -292,6 +340,7 @@ class RiskTests(unittest.TestCase):
         self._add_sbom()
         self._add_license()
         self._add_provenance()
+        self._add_signature()
         self._add_vulnerability("high", "CVE-1")
         _s, _h, body = self._risk()
         self.assertEqual((body["score"], body["level"]), (25, "medium"))

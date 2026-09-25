@@ -1,21 +1,24 @@
 """In-process admission policies for registered resources.
 
 Each resource keeps at most one policy. A policy names a non-empty
-display name, the evidence it requires (``sbom``, ``license`` and/or
-``provenance``), an allowlist of accepted SPDX license identifiers
-(which may be empty) and the maximum accepted vulnerability severity.
-Nothing here is persisted: stopping or restarting the service clears
-every policy and every admission result; no files are written.
+display name, the evidence it requires (``sbom``, ``license``,
+``provenance`` and/or ``signature``), an allowlist of accepted SPDX
+license identifiers (which may be empty) and the maximum accepted
+vulnerability severity. Nothing here is persisted: stopping or
+restarting the service clears every policy and every admission result;
+no files are written.
 
 Admission is a single read-only decision per resource. A resource in a
 withdrawn or quarantined lifecycle state is denied with
 ``state_blocked`` before anything else is checked. Missing required
-evidence contributes ``no_sbom``, ``no_license`` or ``no_provenance``.
-A non-empty allowlist that does not contain the resource's declared
-SPDX identifier contributes ``license_denied``. Any recorded alert
-above the policy's severity ceiling contributes ``severity_exceeded``.
-When several groups fire, their codes are ordered as state, evidence,
-license and then severity.
+evidence contributes ``no_sbom``, ``no_license``, ``no_provenance`` or
+``no_signature``; a registered signature record counts as present
+evidence regardless of whether it would verify. A non-empty allowlist
+that does not contain the resource's declared SPDX identifier
+contributes ``license_denied``. Any recorded alert above the policy's
+severity ceiling contributes ``severity_exceeded``. When several
+groups fire, their codes are ordered as state, evidence, license and
+then severity.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from dataclasses import dataclass
 
 #: The fixed set of evidence a policy may require; order also fixes the
 #: stable order in which missing-evidence reason codes are reported.
-EVIDENCE: tuple[str, ...] = ("sbom", "license", "provenance")
+EVIDENCE: tuple[str, ...] = ("sbom", "license", "provenance", "signature")
 EVIDENCE_VALUES = frozenset(EVIDENCE)
 
 #: The four public severity levels, from most to least severe. Severity
@@ -52,6 +55,7 @@ _EVIDENCE_REASON = {
     "provenance": "no_provenance",
     "sbom": "no_sbom",
     "license": "no_license",
+    "signature": "no_signature",
 }
 
 
@@ -141,7 +145,7 @@ def build_policy_fields(
         if not isinstance(item, str) or item not in EVIDENCE_VALUES:
             raise PolicyValidationError(
                 "Field 'evidence_requirements' must only contain: "
-                "provenance, sbom, license."
+                "provenance, sbom, license, signature."
             )
         if item in seen_evidence:
             raise PolicyValidationError(
@@ -236,6 +240,7 @@ def evaluate_policy(
     has_sbom: bool,
     has_license: bool,
     has_provenance: bool,
+    has_signature: bool,
     license_spdx_id: str | None,
     severities: "list[str]",
 ) -> tuple[bool, list[str]]:
@@ -244,11 +249,13 @@ def evaluate_policy(
     Returns ``(allowed, reasons)``. A blocked lifecycle state short-
     circuits every other check. Otherwise missing evidence, a denied
     license and excessive severity are collected together and ordered
-    as state, evidence (sbom, license, provenance), license, severity.
+    as state, evidence (sbom, license, provenance, signature), license,
+    severity.
 
     ``severities`` are the stored lowercase severity levels of every
     alert recorded against the resource; comparison against the ceiling
-    is case-insensitive.
+    is case-insensitive. ``has_signature`` only reflects whether a
+    signature record is registered; verification never participates.
     """
 
     if lifecycle_state in ("withdrawn", "quarantined"):
@@ -260,6 +267,7 @@ def evaluate_policy(
         "provenance": has_provenance,
         "sbom": has_sbom,
         "license": has_license,
+        "signature": has_signature,
     }
     for item in EVIDENCE:
         if item in policy.evidence_requirements and not present[item]:

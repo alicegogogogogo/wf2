@@ -2045,6 +2045,7 @@ def _handle_admission(
         has_sbom=sbom_store.get_sbom(raw_id) is not None,
         has_license=license_record is not None,
         has_provenance=provenance_store.get(raw_id) is not None,
+        has_signature=signature_store.get(raw_id) is not None,
         license_spdx_id=(
             license_record.spdx_id if license_record is not None else None
         ),
@@ -2105,6 +2106,7 @@ def _handle_risk(
         has_sbom=sbom_store.get_sbom(raw_id) is not None,
         has_license=license_record is not None,
         has_provenance=provenance_store.get(raw_id) is not None,
+        has_signature=signature_store.get(raw_id) is not None,
         lifecycle_state=lifecycle_store.get(raw_id).state,
         license_allowlist=(
             policy.license_allowlist if policy is not None else ()
