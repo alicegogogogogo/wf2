@@ -2124,6 +2124,75 @@ def _handle_risk(
     )
 
 
+def _handle_component_risks(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    document = sbom_store.get_sbom(raw_id)
+    if document is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "sbom_not_found",
+            "No SBOM document is recorded for this resource.",
+        )
+
+    # Read-only, computed on the fly: an alert hits a component only when
+    # the names are byte-for-byte identical (case-sensitive, no trimming);
+    # versions and digests are never compared. Nothing is recorded.
+    alerts = vulnerability_store.list_for(raw_id)
+    components = [
+        {
+            "name": component.name,
+            "version": component.version,
+            "digest": component.digest,
+            "advisories": [
+                {"id": alert.id, "severity": alert.severity}
+                for alert in alerts
+                if alert.component == component.name
+            ],
+        }
+        for component in document.components
+    ]
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"components": components},
+        trailing_newline=True,
+    )
+
+
 def _handle_notifications_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -3192,6 +3261,10 @@ def application(
                 return _handle_risk(
                     method, environ, head, start_response
                 )
+            if separator and tail == "component-risks":
+                return _handle_component_risks(
+                    method, environ, head, start_response
+                )
             if separator and tail == "notifications":
                 return _handle_notifications(
                     method, environ, head, start_response
@@ -3320,6 +3393,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/risk")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/component-risks"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without computing any component risk.
+                return _handle_component_risks(
+                    method,
+                    environ,
+                    suffix[: -len("/component-risks")],
                     start_response,
                 )
             if separator and suffix.endswith("/notifications"):
