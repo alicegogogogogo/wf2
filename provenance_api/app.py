@@ -1703,6 +1703,73 @@ def _handle_vulnerabilities(
     )
 
 
+def _handle_vulnerability_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_vulnerability_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "DELETE":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="DELETE",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    if (
+        not raw_vulnerability_id
+        or "/" in raw_vulnerability_id
+        or "\\" in raw_vulnerability_id
+    ):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Vulnerability id must not be empty or contain path separators.",
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    try:
+        record = vulnerability_store.remove(raw_id, raw_vulnerability_id)
+    except VulnerabilityError as exc:
+        return _error(
+            start_response, "404 Not Found", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        record.to_dict(),
+        trailing_newline=True,
+    )
+
+
 def _handle_vulnerability_exceptions_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -4620,6 +4687,14 @@ def application(
                     tail[len("vulnerability-exceptions/"):],
                     start_response,
                 )
+            if separator and tail.startswith("vulnerabilities/"):
+                return _handle_vulnerability_item(
+                    method,
+                    environ,
+                    head,
+                    tail[len("vulnerabilities/"):],
+                    start_response,
+                )
             if separator and tail == "sbom":
                 return _handle_sbom(
                     method, environ, head, start_response
@@ -4748,6 +4823,20 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/vulnerabilities")],
+                    start_response,
+                )
+            if separator and "/vulnerabilities/" in suffix:
+                # Fallback for a separator inside the id segment of an alert
+                # item path so the handler rejects it without removing any
+                # alert.
+                malformed_id, _, raw_vulnerability_id = suffix.rpartition(
+                    "/vulnerabilities/"
+                )
+                return _handle_vulnerability_item(
+                    method,
+                    environ,
+                    malformed_id,
+                    raw_vulnerability_id,
                     start_response,
                 )
             if separator and "/vulnerability-exceptions/" in suffix:
