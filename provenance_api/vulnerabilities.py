@@ -190,10 +190,14 @@ class VulnerabilityStore:
         self._records: dict[str, list[Vulnerability]] = {}
         # resource id -> (advisory, component) duplicates already seen.
         self._keys: dict[str, set[tuple[str, str]]] = {}
+        # Every alert across every resource, in global submission order;
+        # used by views that aggregate beyond a single resource.
+        self._sequence: list[tuple[str, Vulnerability]] = []
 
     def reset(self) -> None:
         self._records = {}
         self._keys = {}
+        self._sequence = []
 
     def add(self, resource_id: str, payload: object) -> Vulnerability:
         """Validate and append a vulnerability alert for ``resource_id``.
@@ -226,7 +230,17 @@ class VulnerabilityStore:
         )
         self._records.setdefault(resource_id, []).append(record)
         resource_keys.add(key)
+        self._sequence.append((resource_id, record))
         return record
+
+    def list_all(self) -> list[tuple[str, Vulnerability]]:
+        """Return every alert across resources in global submission order.
+
+        Each entry pairs the resource id the alert was recorded against with
+        the alert itself.
+        """
+
+        return list(self._sequence)
 
     def list_for(
         self, resource_id: str, severity: str | None = None
