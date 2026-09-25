@@ -176,6 +176,20 @@ curl -s -X POST http://127.0.0.1:8000/resources/$A/dependencies \
 
 结果按登记顺序排列，**不包含起点自身**；没有受影响资源时返回空数组。
 
+### 依赖漏洞传导：`GET /resources/{id}/dependency-vulnerability-impact`
+
+把依赖图与安全告警串起来：沿依赖边取起点的可达闭包，逐资源汇总告警，形状为：
+
+```json
+{"impacts":[{"resource_id":"<id>","advisory_count":2,"max_severity":"high"}]}
+```
+
+- **起点自身排在首位**，其后是可达依赖，顺序与依赖查询接口一致（登记顺序），每个资源只出现一次；没有任何依赖时数组只含起点一条记录，仍是 HTTP 200。
+- 每条记录固定三个字段：`resource_id`（资源标识）、`advisory_count`（该资源已登记的告警总数，不去重不合并）、`max_severity`（该资源告警中最高的 severity，四档从高到低为 `critical`、`high`、`medium`、`low`，比较忽略大小写；没有告警时为 `null`，此时 `advisory_count` 为 `0`）。
+- 只接受 `GET` 只读查询，按资源标识即时计算，不落记录也不改既有状态；不提供筛选与分页。
+- 路径标识为空或含 `/`、`\\`，或请求携带任意查询参数，返回 HTTP 400（错误码 `invalid_request`），不读取业务数据；标识合法但资源不存在返回 HTTP 404（错误码 `resource_not_found`）；`GET` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET`）。
+- 响应顶层字段为 `impacts`，紧凑 UTF-8 JSON 并以单个换行结束。
+
 ### 依赖接口的错误
 
 - 路径标识为空，或含 `/`、`\\`，返回 HTTP 400（错误码 `invalid_request`），不执行任何操作。
