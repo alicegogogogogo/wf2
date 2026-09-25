@@ -696,6 +696,80 @@ curl -s -X POST http://127.0.0.1:8000/resources/$ID/admission
 
 任何失败都不会写入策略或评估结果，也不会修改资源、依赖、内容、游标、生命周期状态、安全告警、SBOM 文档、许可证声明、构建来源证明或签名记录；策略仅存于当前进程内存，停止或重启即清空，验签不参与准入判定，也不改变晋级条件。
 
+## 告警豁免与准入预览
+
+可以为已登记资源的某条安全告警登记一条豁免，表示该告警被有意放行；也可以按豁免口径对资源做一次只读的准入预览。豁免只保存在当前进程内存中，服务停止或重启后随资源一起清空，不会写入任何文件；豁免只影响准入预览，既有准入评估（`POST /resources/{id}/admission`）与风险评分等其他入口的口径完全不变。
+
+### 登记豁免：`POST /resources/{id}/vulnerability-exceptions`
+
+请求体必须是一个完整的 JSON 对象，且只允许以下三个字段，三者均必填：
+
+| 字段 | 类型 | 是否必填 | 说明 |
+| --- | --- | --- | --- |
+| `advisory` | string | 是 | 公告编号，非空字符串，逐字匹配（区分大小写，不裁剪） |
+| `component` | string | 是 | 组件名称，非空字符串，逐字匹配（区分大小写，不裁剪） |
+| `reason` | string | 是 | 豁免理由，非空字符串，原样回显 |
+
+登记时会按公告编号与组件名称逐字匹配该资源的一条已登记告警；匹配不到任何告警时返回 HTTP 404（错误码 `vulnerability_not_found`），不留下任何豁免记录。登记成功返回 HTTP 201，响应体为紧凑 UTF-8 JSON，键序固定（`id`、`advisory`、`component`、`reason`）并以换行结束：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/resources/$ID/vulnerability-exceptions \
+  -H 'Content-Type: application/json' \
+  -d '{"advisory":"CVE-2026-0001","component":"openssl","reason":"not exploitable internally"}'
+```
+
+```json
+{"id":"…","advisory":"CVE-2026-0001","component":"openssl","reason":"not exploitable internally"}
+```
+
+同一资源下公告编号与组件均相同的豁免重提返回 HTTP 409（错误码 `duplicate_exception`），原豁免保持不变。
+
+### 查询豁免：`GET /resources/{id}/vulnerability-exceptions`
+
+按登记顺序返回该资源的全部豁免，空集合也是成功：
+
+```json
+{"exceptions":[{"id":"…","advisory":"CVE-2026-0001","component":"openssl","reason":"not exploitable internally"}]}
+```
+
+### 删除豁免：`DELETE /resources/{id}/vulnerability-exceptions/{exception_id}`
+
+按豁免标识移除单条豁免，成功返回 HTTP 200 并回显被删记录的内容（形状与登记响应相同）。豁免标识未知或已被删除时返回 HTTP 404（错误码 `exception_not_found`）。删除不接受请求体。
+
+### 准入预览：`GET /resources/{id}/admission-preview`
+
+对资源执行一次只读判定，只接受 GET，不接受查询参数。判定规则与 `POST /resources/{id}/admission` 完全一致，唯一区别是严重度检查只统计**未被豁免**的告警：凡是被某条豁免逐字命中（公告编号与组件均相同）的告警不参与超限判断，其余条件（状态、证据、许可证）口径不变。预览不写入或修改任何状态。
+
+成功返回 HTTP 200，响应体为紧凑 UTF-8 JSON，键序固定（`id`、`allowed`、`reasons`、`exempted_count`）并以换行结束：
+
+```bash
+curl -s http://127.0.0.1:8000/resources/$ID/admission-preview
+```
+
+```json
+{"id":"…","allowed":true,"reasons":[],"exempted_count":1}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 被预览资源的标识 |
+| `allowed` | 全部条件通过为 `true`；命中任一拒绝原因为 `false` |
+| `reasons` | 命中的稳定原因代码数组，顺序与准入评估一致 |
+| `exempted_count` | 本次预览中被豁免跳过的告警条数 |
+
+### 豁免与预览接口的错误
+
+下列情况都返回 HTTP 400（错误码 `invalid_request`），且不写入或修改任何豁免或其他状态：
+
+- 登记请求体缺失、不是合法 UTF-8、无法解码为 JSON，或顶层不是 JSON 对象；
+- 缺少 `advisory`、`component`、`reason` 中任一字段、出现未知字段，或任一字段不是非空字符串；
+- 路径标识（资源标识或豁免标识）为空或含 `/`、`\\`；
+- 各入口携带任意查询参数；删除入口声明非空或格式非法的请求体。
+
+路径标识格式合法但资源不存在时，各入口都返回 HTTP 404（错误码 `resource_not_found`）；资源存在但尚未登记策略时，准入预览返回 HTTP 404（错误码 `policy_not_found`）。对 `/resources/{id}/vulnerability-exceptions` 使用 `GET`、`POST` 之外的方法返回 HTTP 405（`Allow: GET, POST`）；对 `/resources/{id}/vulnerability-exceptions/{exception_id}` 使用 `DELETE` 之外的方法返回 HTTP 405（`Allow: DELETE`）；对 `/resources/{id}/admission-preview` 使用 `GET` 之外的方法返回 HTTP 405（`Allow: GET`）。
+
+重复冲突、未知标识与各类失败都不覆盖或修改已存记录，也不留下半条豁免；豁免与预览结果只存当前进程内存，失败不改既有状态，既有准入评估行为保持不变。
+
 ## 风险评分
 
 可以对已登记的资源即时计算一次风险评分。评分只读取该资源当前的安全告警、SBOM、许可证声明、构建来源证明、内容签名记录、生命周期状态与准入策略，**不写入或修改任何状态**，也不留下任何评分记录；重启后随全部输入一起清空，不写入任何文件。
