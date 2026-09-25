@@ -394,7 +394,7 @@ def _handle_resources_get(
 def _json_response(
     start_response: StartResponse,
     status: str,
-    payload: dict[str, object],
+    payload: dict[str, object] | list[object],
     *,
     extra_headers: list[tuple[str, str]] | None = None,
     trailing_newline: bool = False,
@@ -807,6 +807,115 @@ def _handle_dependency_vulnerability_impact(
         start_response,
         "200 OK",
         {"impacts": impacts},
+        trailing_newline=True,
+    )
+
+
+def _handle_advisories(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The view is read-only and accepts no request body: a declared positive
+    # or malformed Content-Length is rejected before any business data is
+    # read. An omitted header (and the empty-string CONTENT_LENGTH real WSGI
+    # servers seed for a bodyless GET) or an explicit Content-Length of 0 is
+    # an empty body and is allowed.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``severity`` parameter is accepted; unknown or
+    # repeated parameters, including a repeated ``severity``, are rejected.
+    pairs = parse_qsl(
+        str(environ.get("QUERY_STRING", "")),
+        keep_blank_values=True,
+        strict_parsing=False,
+    )
+    severity: str | None = None
+    for key, value in pairs:
+        if key != "severity":
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                f"Unknown query parameter: {key!r}.",
+            )
+        if severity is not None:
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                "Query parameter 'severity' must not be repeated.",
+            )
+        if value == "" or value.lower() not in SEVERITY_VALUES:
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                "Severity must be one of: critical, high, medium, low "
+                "(case-insensitive).",
+            )
+        severity = value.lower()
+
+    # Read-only, computed on the fly. Alerts are walked in global submission
+    # order so advisory groups expand by first appearance, which is the
+    # commit time of the earliest matching alert and is unrelated to resource
+    # registration order. Counts are record totals (no dedup or merging),
+    # while affected resources are deduplicated and rendered in resource
+    # registration order afterwards.
+    resource_ids_by_advisory: dict[str, set[str]] = {}
+    counts: dict[str, int] = {}
+    max_by_advisory: dict[str, str] = {}
+    order: list[str] = []
+    for resource_id, alert in vulnerability_store.list_all():
+        if severity is not None and alert.severity != severity:
+            continue
+        if alert.advisory not in counts:
+            counts[alert.advisory] = 0
+            resource_ids_by_advisory[alert.advisory] = set()
+            order.append(alert.advisory)
+        counts[alert.advisory] += 1
+        resource_ids_by_advisory[alert.advisory].add(resource_id)
+        current = max_by_advisory.get(alert.advisory)
+        max_by_advisory[alert.advisory] = (
+            alert.severity
+            if current is None
+            else max_severity([current, alert.severity])
+        )
+
+    registration_order = [resource.id for resource in store.list_all()]
+    summaries: list[dict[str, object]] = []
+    for advisory in order:
+        affected = resource_ids_by_advisory[advisory]
+        summaries.append(
+            {
+                "advisory": advisory,
+                "affected_resources": [
+                    resource_id
+                    for resource_id in registration_order
+                    if resource_id in affected
+                ],
+                "advisory_count": counts[advisory],
+                "max_severity": max_by_advisory[advisory],
+            }
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        summaries,
         trailing_newline=True,
     )
 
@@ -4318,6 +4427,9 @@ def application(
         if method == "GET" and path == "/health":
             # Kept byte-for-byte compatible with the documented baseline.
             return _json_response(start_response, "200 OK", {"status": "ok"})
+
+        if path == "/advisories":
+            return _handle_advisories(method, environ, start_response)
 
         if path == "/resources":
             if method == "GET":

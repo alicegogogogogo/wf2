@@ -190,10 +190,15 @@ class VulnerabilityStore:
         self._records: dict[str, list[Vulnerability]] = {}
         # resource id -> (advisory, component) duplicates already seen.
         self._keys: dict[str, set[tuple[str, str]]] = {}
+        # Every accepted alert across all resources in global submission
+        # order, paired with the resource it was recorded against; this is
+        # what the global advisory summary expands by first appearance.
+        self._global: list[tuple[str, Vulnerability]] = []
 
     def reset(self) -> None:
         self._records = {}
         self._keys = {}
+        self._global = []
 
     def add(self, resource_id: str, payload: object) -> Vulnerability:
         """Validate and append a vulnerability alert for ``resource_id``.
@@ -226,6 +231,7 @@ class VulnerabilityStore:
         )
         self._records.setdefault(resource_id, []).append(record)
         resource_keys.add(key)
+        self._global.append((resource_id, record))
         return record
 
     def list_for(
@@ -241,3 +247,14 @@ class VulnerabilityStore:
         if severity is None:
             return list(records)
         return [record for record in records if record.severity == severity]
+
+    def list_all(self) -> list[tuple[str, Vulnerability]]:
+        """Return every accepted alert across all resources.
+
+        The pairs ``(resource_id, record)`` are in global submission order,
+        i.e. interleaved by the actual commit time of each alert rather than
+        grouped by resource registration. Used by the read-only global
+        advisory summary; nothing is recorded or reordered.
+        """
+
+        return list(self._global)
