@@ -39,6 +39,7 @@ from .mirror_policies import (
     build_mirror_policy_fields,
 )
 from .mirrors import (
+    Mirror,
     MirrorFetchError,
     MirrorStore,
     MirrorValidationError,
@@ -3486,6 +3487,63 @@ def _raw_layer_response(
     return [data]
 
 
+def _pull_one_layer(
+    mirror: Mirror,
+    policy: MirrorPolicy | None,
+    environ: dict[str, Any],
+    digest: str,
+) -> tuple[bytes | None, tuple[str, str, str] | None]:
+    """Run the existing single-digest pull chain for one normalized digest.
+
+    Returns ``(data, None)`` on success -- a counter-free cache hit or a
+    fresh upstream fetch that has been verified and cached -- or
+    ``(None, (status, code, message))`` for the first failure. Fetch,
+    digest, signature and quota errors all become the stable error tuple
+    instead of propagating; a failure never writes the cache.
+    """
+
+    # A cache hit is served straight from storage; pulling must not change
+    # the cache counters, so the counter-free accessor is used.
+    cached = cache_store.peek(digest)
+    if cached is not None:
+        if policy is not None:
+            # The signature gate applies to cached bytes too: a failed
+            # check returns nothing and changes nothing.
+            failure = _pull_signature_failure(policy, environ, digest)
+            if failure is not None:
+                return None, failure
+        return cached, None
+
+    try:
+        data = fetch_upstream_layer(mirror.upstream, digest)
+    except MirrorFetchError as exc:
+        return None, ("502 Bad Gateway", exc.code, exc.message)
+
+    # Only bytes that hash to the requested digest may enter the cache.
+    if hashlib.sha256(data).hexdigest() != digest:
+        return None, (
+            "502 Bad Gateway",
+            "mirror_digest_mismatch",
+            "Upstream layer bytes do not match the requested digest.",
+        )
+
+    if policy is not None:
+        # The layer content is ready; the signature gate runs before the
+        # cache write so a failed check neither serves bytes nor caches.
+        failure = _pull_signature_failure(policy, environ, digest)
+        if failure is not None:
+            return None, failure
+
+    try:
+        # The digest was just verified, so ``put`` can only fail on quota;
+        # either way the cache is left unchanged.
+        cache_store.put(digest, data)
+    except CacheError as exc:
+        return None, ("409 Conflict", exc.code, exc.message)
+
+    return data, None
+
+
 def _handle_mirror_pull(
     method: str,
     environ: dict[str, Any],
@@ -3537,51 +3595,147 @@ def _handle_mirror_pull(
     # any signature headers are ignored.
     policy = mirror_policy_store.get(raw_id)
 
-    # A cache hit is served straight from storage; pulling must not change
-    # the cache counters, so the counter-free accessor is used.
-    cached = cache_store.peek(digest)
-    if cached is not None:
-        if policy is not None:
-            # The signature gate applies to cached bytes too: a failed
-            # check returns nothing and changes nothing.
-            failure = _pull_signature_failure(policy, environ, digest)
-            if failure is not None:
-                return _error(start_response, *failure)
-        return _raw_layer_response(start_response, cached)
+    data, failure = _pull_one_layer(mirror, policy, environ, digest)
+    if failure is not None:
+        return _error(start_response, *failure)
+    assert data is not None
+    return _raw_layer_response(start_response, data)
 
+
+def _parse_prefetch_digests(
+    raw: bytes,
+) -> tuple[list[str] | None, str | None]:
+    """Validate a prefetch body and return the normalized lowercase digests.
+
+    The body must be a JSON object whose only field is ``digests``: a
+    non-empty array of distinct 64-character hexadecimal strings. Returns
+    ``(digests, None)`` or ``(None, message)`` for the first violation; a
+    rejected body never reaches the pull chain or the cache.
+    """
+
+    if not raw:
+        return None, "Request body is empty."
     try:
-        data = fetch_upstream_layer(mirror.upstream, digest)
-    except MirrorFetchError as exc:
-        return _error(
-            start_response, "502 Bad Gateway", exc.code, exc.message
-        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "Request body must be valid UTF-8 JSON."
 
-    # Only bytes that hash to the requested digest may enter the cache.
-    if hashlib.sha256(data).hexdigest() != digest:
+    if not isinstance(payload, dict):
+        return None, "Request body must be a JSON object."
+
+    unknown_fields = set(payload) - {"digests"}
+    if unknown_fields:
+        return None, f"Unknown field: {sorted(unknown_fields)[0]!r}."
+
+    if "digests" not in payload:
+        return None, "Missing required field: 'digests'."
+
+    raw_digests = payload["digests"]
+    if not isinstance(raw_digests, list):
+        return None, "Field 'digests' must be an array."
+    if not raw_digests:
+        return None, "Field 'digests' must not be empty."
+
+    digests: list[str] = []
+    seen: set[str] = set()
+    for element in raw_digests:
+        if not isinstance(element, str):
+            return None, "Field 'digests' elements must be strings."
+        if _DIGEST_PATTERN.fullmatch(element) is None:
+            return None, (
+                "Field 'digests' elements must be 64-character hexadecimal "
+                "strings."
+            )
+        digest = element.lower()
+        if digest in seen:
+            return None, "Field 'digests' elements must not repeat."
+        seen.add(digest)
+        digests.append(digest)
+
+    return digests, None
+
+
+def _handle_mirror_prefetch(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "POST":
         return _error(
             start_response,
-            "502 Bad Gateway",
-            "mirror_digest_mismatch",
-            "Upstream layer bytes do not match the requested digest.",
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
         )
 
-    if policy is not None:
-        # The layer content is ready; the signature gate runs before the
-        # cache write so a failed check neither serves bytes nor caches.
-        failure = _pull_signature_failure(policy, environ, digest)
-        if failure is not None:
-            return _error(start_response, *failure)
-
-    try:
-        # The digest was just verified, so ``put`` can only fail on quota;
-        # either way the cache is left unchanged.
-        cache_store.put(digest, data)
-    except CacheError as exc:
+    if not raw_id or "/" in raw_id or "\\" in raw_id:
         return _error(
-            start_response, "409 Conflict", exc.code, exc.message
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not be empty or contain path separators.",
         )
 
-    return _raw_layer_response(start_response, data)
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    digests, body_error = _parse_prefetch_digests(_read_body(environ))
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+    assert digests is not None
+
+    mirror = mirror_store.get(raw_id)
+    if mirror is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_not_found",
+            "No mirror exists with the requested id.",
+        )
+
+    # Without a registered policy the prefetch behaves exactly as a pull
+    # without one and any signature headers are ignored; with a policy the
+    # same signature headers are checked against every pulled digest.
+    policy = mirror_policy_store.get(raw_id)
+
+    # Each digest reuses the existing single-digest chain independently: a
+    # failure only marks that item, so later digests keep processing and a
+    # cache already written for an earlier item is never rolled back.
+    results: list[dict[str, object]] = []
+    for digest in digests:
+        # Classify before the chain runs; the counter-free peek does not
+        # touch hit/miss counters and the chain itself peeks again.
+        was_cached = cache_store.peek(digest) is not None
+        data, failure = _pull_one_layer(mirror, policy, environ, digest)
+        if failure is not None:
+            results.append(
+                {"digest": digest, "status": "failed", "size": 0,
+                 "error": failure[1]}
+            )
+            continue
+        assert data is not None
+        results.append(
+            {
+                "digest": digest,
+                "status": "cached" if was_cached else "fetched",
+                "size": len(data),
+            }
+        )
+
+    # Per-item failures never fail the batch: the overall answer is 200.
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"id": raw_id, "results": results},
+        trailing_newline=True,
+    )
 
 
 def _handle_mirrors(
@@ -4030,6 +4184,17 @@ def application(
                     environ,
                     suffix[: -len("/pull")],
                     "",
+                    start_response,
+                )
+            if suffix.endswith("/prefetch"):
+                # Split on the prefetch marker even when the id segment
+                # embeds a separator, so the handler can reject the id as a
+                # bad request instead of treating the path as an unknown
+                # item.
+                return _handle_mirror_prefetch(
+                    method,
+                    environ,
+                    suffix[: -len("/prefetch")],
                     start_response,
                 )
             if suffix.endswith("/signature-policy"):

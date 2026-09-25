@@ -1143,6 +1143,29 @@ curl -s -X POST "http://127.0.0.1:8000/mirrors/$MIRROR_ID/pull/$DIGEST" --output
 - 上游返回的字节经 SHA-256 校验与请求摘要不符，返回 HTTP 502（错误码 `mirror_digest_mismatch`），不写入缓存。
 - 校验通过但写入会使已用字节超过配额，返回 HTTP 409（错误码 `cache_quota_exceeded`），缓存保持原样，响应体不是层字节。
 
+### 按镜像源批量预取：`POST /mirrors/{id}/prefetch`
+
+在单个摘要拉取之外，可对某个镜像源一次提交多个摘要批量预取。请求体必须是一个完整的 JSON 对象，且只允许 `digests` 一个字段：它必须是非空字符串数组，每个元素都是 64 位十六进制摘要（大小写均可，统一按小写规范化）且数组内不得重复；数组顺序就是逐项处理顺序。
+
+```bash
+curl -s -X POST "http://127.0.0.1:8000/mirrors/$MIRROR_ID/prefetch" \
+  -H 'Content-Type: application/json' \
+  -d '{"digests":["'"$DIGEST_A"'","'"$DIGEST_B"'"]}'
+```
+
+逐项复用既有单摘要拉取链路：摘要已在缓存中命中即直接返回（不联系上游、不改缓存计数），未命中则回源取回、校验摘要后写入缓存。无论各项成败，整体成功一律返回 HTTP 200，响应体是紧凑 UTF-8 JSON 一行并以单个换行结束。顶层键序固定为 `id`、`results`，`results` 按提交顺序展开，每项依次为 `digest`、`status`、`size`：
+
+- `status` 取 `cached`（缓存命中）、`fetched`（本次新取回并写入缓存）或 `failed`（该项失败）。
+- 失败项在三项之外再带 `error` 字段，值沿用既有拉取与签名判定的稳定错误码（如 `mirror_fetch_failed`、`mirror_digest_mismatch`、`cache_quota_exceeded`、`signature_missing`、`key_not_trusted`、`digest_uncovered`、`signature_invalid`、`invalid_request`），失败项的 `size` 为 `0`。
+
+```json
+{"id":"…","results":[{"digest":"…","status":"cached","size":17},{"digest":"…","status":"fetched","size":22},{"digest":"…","status":"failed","size":0,"error":"mirror_fetch_failed"}]}
+```
+
+单项失败不影响其余项继续处理，全部失败时同样返回 HTTP 200 并逐项报告。配额不足、摘要不符或签名失败只影响该项，不回滚其他项已写入的缓存。镜像源已登记签名策略时，每个摘要都用同一组签名请求头（`X-Key-Id`、`X-Signature`、`X-Signed-Digest`）逐项校验，覆盖检查（`cover_digest` 为 `true` 时）对照各自被拉摘要；签名校验按既有判定顺序逐项执行，缺头、密钥、覆盖、签名命中即止，只报一个错误码。未登记策略时签名头被忽略。缓存条目的命中与未命中计数仍按既有拉取规则变化（预取的命中判定使用不计计数的读取，与单摘要拉取一致），本接口不改计数口径。
+
+预取结果与写入的缓存条目只存进程内存，重启清空，不生成文件。
+
 ### 登记镜像源签名策略：`POST /mirrors/{id}/signature-policy`
 
 每个镜像源最多登记一份签名策略，登记后该镜像源的拉取必须携带签名请求头。请求体必须是一个完整的 JSON 对象，且只允许以下三个字段：
@@ -1194,10 +1217,11 @@ curl -s -X POST "http://127.0.0.1:8000/mirrors/$MIRROR_ID/signature-policy" \
 - `upstream` 不是 `http` 或 `https` 的绝对地址；
 - 签名策略缺少 `algorithm`、`keys`、`cover_digest` 中任一字段，出现未知字段，`algorithm` 不是两个允许值之一，`keys` 不是非空数组、元素不是非空字符串或出现重复，`cover_digest` 不是布尔值；
 - 已登记策略的拉取请求中签名请求头取值非法（`X-Key-Id`、`X-Signature` 为空，或 `X-Signed-Digest` 不是 64 位十六进制）；
+- 批量预取请求体缺失、不是合法 UTF-8 JSON、顶层不是 JSON 对象，或 `digests` 缺失、不是数组、为空，元素不是字符串或不是 64 位十六进制、数组内重复，或出现 `digests` 之外的未知字段；
 - 两个删除入口携带请求体；
-- 任意镜像源接口携带查询参数。
+- 任意镜像源接口携带查询参数（批量预取携带任意查询参数时同样返回 400，且不写入任何缓存条目）。
 
-路径标识格式合法但镜像源不存在时，单条查询、删除、拉取与签名策略接口都返回 HTTP 404（错误码 `mirror_not_found`），且不改变状态。方法不符返回 HTTP 405（错误码 `method_not_allowed`，响应带 `Allow` 头）：`/mirrors` 为 `Allow: GET, POST`，`/mirrors/{id}` 为 `Allow: DELETE, GET`，`/mirrors/{id}/pull/{digest}` 为 `Allow: POST`，`/mirrors/{id}/signature-policy` 为 `Allow: DELETE, GET, POST`。
+路径标识格式合法但镜像源不存在时，单条查询、删除、拉取、批量预取与签名策略接口都返回 HTTP 404（错误码 `mirror_not_found`），且不改变状态。方法不符返回 HTTP 405（错误码 `method_not_allowed`，响应带 `Allow` 头）：`/mirrors` 为 `Allow: GET, POST`，`/mirrors/{id}` 为 `Allow: DELETE, GET`，`/mirrors/{id}/pull/{digest}` 为 `Allow: POST`，`/mirrors/{id}/prefetch` 为 `Allow: POST`，`/mirrors/{id}/signature-policy` 为 `Allow: DELETE, GET, POST`。
 
 镜像源数据、签名策略与由拉取写入的缓存条目均仅存于当前进程内存，停止或重启即清空，不生成任何文件；缓存条目的删除与清空通过上文 `/cache` 的两个删除入口完成，镜像源的并发处理不在当前范围内。
 
