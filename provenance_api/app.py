@@ -83,6 +83,7 @@ from .vulnerabilities import (
     VulnerabilityStore,
     VulnerabilityValidationError,
     build_vulnerability_fields,
+    max_severity,
 )
 
 StartResponse = Callable[[str, list[tuple[str, str]]], Any]
@@ -711,6 +712,64 @@ def _handle_impact(
         start_response,
         "200 OK",
         {"resources": store.list_impact(raw_id)},
+        trailing_newline=True,
+    )
+
+
+def _handle_dependency_vulnerability_impact(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Read-only, computed on the fly: the start resource comes first, then
+    # every reachable dependency in the same registration order the
+    # dependency query uses; each resource appears exactly once and nothing
+    # is recorded.
+    impacts: list[dict[str, object]] = []
+    for resource_id in [raw_id, *store.list_dependencies(raw_id)]:
+        alerts = vulnerability_store.list_for(resource_id)
+        impacts.append(
+            {
+                "resource_id": resource_id,
+                "advisory_count": len(alerts),
+                "max_severity": max_severity(
+                    alert.severity for alert in alerts
+                ),
+            }
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"impacts": impacts},
         trailing_newline=True,
     )
 
@@ -3294,6 +3353,10 @@ def application(
                 return _handle_impact(
                     method, environ, head, start_response
                 )
+            if separator and tail == "dependency-vulnerability-impact":
+                return _handle_dependency_vulnerability_impact(
+                    method, environ, head, start_response
+                )
             if separator and tail == "verify":
                 return _handle_verify(
                     method, environ, head, start_response
@@ -3501,6 +3564,17 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/notifications")],
+                    start_response,
+                )
+            if separator and suffix.endswith(
+                "/dependency-vulnerability-impact"
+            ):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without computing any impact.
+                return _handle_dependency_vulnerability_impact(
+                    method,
+                    environ,
+                    suffix[: -len("/dependency-vulnerability-impact")],
                     start_response,
                 )
             if separator and suffix.endswith("/cross-references"):

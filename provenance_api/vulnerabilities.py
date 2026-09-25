@@ -11,12 +11,17 @@ of scope.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 #: The four allowed severity levels; input is case-insensitive but the level
-#: is always stored and rendered in lowercase.
+#: is always stored and rendered in lowercase. The tuple is ordered from
+#: highest to lowest severity.
 SEVERITIES: tuple[str, ...] = ("critical", "high", "medium", "low")
 SEVERITY_VALUES = frozenset(SEVERITIES)
+
+#: Rank of each severity level; a lower number means a higher severity.
+_SEVERITY_RANK = {name: rank for rank, name in enumerate(SEVERITIES)}
 
 #: Length caps, counted in Unicode code points.
 MAX_ADVISORY_LENGTH = 256
@@ -160,6 +165,21 @@ def build_vulnerability_fields(
         fixed_version = value
 
     return advisory, component, severity, summary, fixed_version
+
+
+def max_severity(severities: Iterable[str]) -> str | None:
+    """Return the highest severity among ``severities``, else ``None``.
+
+    Comparison is case-insensitive and follows the fixed ordering
+    critical > high > medium > low; the result is always lowercase.
+    """
+
+    best: str | None = None
+    for severity in severities:
+        normalized = severity.lower()
+        if best is None or _SEVERITY_RANK[normalized] < _SEVERITY_RANK[best]:
+            best = normalized
+    return best
 
 
 class VulnerabilityStore:
