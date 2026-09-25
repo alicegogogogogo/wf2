@@ -122,6 +122,38 @@ class LayerCacheStore:
         self._used += len(data)
         return True, len(self._layers)
 
+    def put_reference_metadata(self, digest: str, data: bytes) -> bool:
+        """Cache cross-reference metadata bytes keyed by ``digest``.
+
+        Unlike :meth:`put`, the bytes are not content-addressed: the body is
+        remote resource metadata JSON stored under that resource's digest,
+        so its own SHA-256 is not compared to ``digest``. Re-submitting the
+        exact same bytes is an idempotent no-op; different bytes under an
+        already cached digest raise :class:`CacheError` with code
+        ``cache_conflict`` and the original entry is kept. A write that
+        would exceed the quota raises ``cache_quota_exceeded``; hit/miss
+        counters are never touched.
+        """
+
+        existing = self._layers.get(digest)
+        if existing is not None:
+            if existing != data:
+                raise CacheError(
+                    "cache_conflict",
+                    "A different layer is already cached for this digest.",
+                )
+            return False
+
+        if self._used + len(data) > self._quota:
+            raise CacheError(
+                "cache_quota_exceeded",
+                "Storing this layer would exceed the cache quota.",
+            )
+
+        self._layers[digest] = data
+        self._used += len(data)
+        return True
+
     def get(self, digest: str) -> bytes | None:
         """Return the cached bytes, counting a hit, or ``None`` on a miss."""
 

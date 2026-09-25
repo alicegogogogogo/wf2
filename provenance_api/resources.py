@@ -165,6 +165,56 @@ class ResourceStore:
     def get(self, resource_id: str) -> Resource | None:
         return self._by_id.get(resource_id)
 
+    def get_by_digest(self, digest: str) -> Resource | None:
+        """Return the first (registration-order) resource with ``digest``."""
+
+        for resource in self._resources:
+            if resource.digest == digest:
+                return resource
+        return None
+
+    def find_identity(
+        self, digest: str, name: str, category: str
+    ) -> Resource | None:
+        """Return a same-digest resource with an identical name and category."""
+
+        for resource in self._resources:
+            if (
+                resource.digest == digest
+                and resource.name == name
+                and resource.category == category
+            ):
+                return resource
+        return None
+
+    def create_resolved(
+        self,
+        name: str,
+        category: str,
+        digest: str,
+        source: str | None,
+    ) -> Resource:
+        """Insert an already validated resource record directly.
+
+        Used when resolving a cross-repository reference: the fields have
+        already been checked (and no resource with the same digest exists),
+        so the record is stored without going through payload validation.
+        """
+
+        resource = Resource(
+            id=uuid.uuid4().hex,
+            name=name,
+            category=category,
+            digest=digest,
+            source=source,
+        )
+        self._resources.append(resource)
+        self._by_id[resource.id] = resource
+        self._key_to_id[(category, name, digest)] = resource.id
+        self._dependencies[resource.id] = set()
+        self._dependents[resource.id] = set()
+        return resource
+
     def add(
         self, payload: object
     ) -> tuple[Resource | None, Resource | None]:
@@ -212,14 +262,13 @@ class ResourceStore:
     def _registration_order(self, ids: set[str]) -> list[str]:
         return [r.id for r in self._resources if r.id in ids]
 
-    def add_dependency(self, resource_id: str, dependency_id: str) -> None:
-        """Record that ``resource_id`` depends on ``dependency_id``.
+    def check_dependency(self, resource_id: str, dependency_id: str) -> None:
+        """Validate an edge without mutating the graph.
 
-        Both resources must already be registered. Raises
-        :class:`DependencyError` with code ``duplicate_dependency`` when the
-        same-direction relation already exists, or ``dependency_cycle`` for a
-        self loop or a relation that would introduce a cycle; in either case
-        the graph is left unchanged.
+        Raises :class:`DependencyError` with the same codes as
+        :meth:`add_dependency`: ``dependency_cycle`` for a self loop or an
+        edge that would introduce a cycle, ``duplicate_dependency`` when the
+        same-direction edge already exists.
         """
 
         if resource_id == dependency_id:
@@ -242,6 +291,17 @@ class ResourceStore:
                 "This dependency would introduce a cycle.",
             )
 
+    def add_dependency(self, resource_id: str, dependency_id: str) -> None:
+        """Record that ``resource_id`` depends on ``dependency_id``.
+
+        Both resources must already be registered. Raises
+        :class:`DependencyError` with code ``duplicate_dependency`` when the
+        same-direction relation already exists, or ``dependency_cycle`` for a
+        self loop or a relation that would introduce a cycle; in either case
+        the graph is left unchanged.
+        """
+
+        self.check_dependency(resource_id, dependency_id)
         self._dependencies[resource_id].add(dependency_id)
         self._dependents[dependency_id].add(resource_id)
 
