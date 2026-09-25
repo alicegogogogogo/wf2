@@ -43,7 +43,9 @@ from .mirrors import (
     MirrorFetchError,
     MirrorStore,
     MirrorValidationError,
+    ProbeStore,
     fetch_upstream_layer,
+    probe_upstream,
 )
 from .notifications import (
     NotificationStore,
@@ -141,6 +143,10 @@ mirror_store = MirrorStore()
 #: rest, and never persisted.
 mirror_policy_store = MirrorPolicyStore()
 
+#: Process-local latest mirror probe results; only the most recent result
+#: per mirror is kept, nothing is persisted and the cache is never touched.
+mirror_probe_store = ProbeStore()
+
 #: Process-local cross-repository references; cleared on restart like the
 #: rest.
 cross_reference_store = CrossReferenceStore()
@@ -165,6 +171,7 @@ def reset_state() -> None:
     cache_store.reset()
     mirror_store.reset()
     mirror_policy_store.reset()
+    mirror_probe_store.reset()
     cross_reference_store.reset()
     signature_store.reset()
 
@@ -3181,6 +3188,7 @@ def _handle_mirror_item_delete(
     # only carries the mirror fields. Cache entries, counters and every
     # other record are deliberately left alone.
     mirror_policy_store.remove(raw_id)
+    mirror_probe_store.discard(raw_id)
 
     return _json_response(
         start_response, "200 OK", mirror.to_dict(), trailing_newline=True
@@ -3472,6 +3480,80 @@ def _pull_signature_failure(
     return None
 
 
+def _prefetch_signature_failure(
+    policy: MirrorPolicy, environ: dict[str, Any], digest: str
+) -> tuple[str, str, str] | None:
+    """Check prefetch signature headers in the established precedence.
+
+    Unlike the single pull, a prefetch item reports only the four
+    signature determination codes and hits the first match in the fixed
+    order missing headers, key trust, digest coverage, signature value.
+    When several conditions fail at once the earliest one -- key trust --
+    wins, so an untrusted key always answers ``key_not_trusted`` even when
+    the coverage or signature value is also wrong.
+    """
+
+    key_id = environ.get(_KEY_ID_HEADER)
+    signature = environ.get(_SIGNATURE_HEADER)
+    signed_digest = environ.get(_SIGNED_DIGEST_HEADER)
+    if key_id is None or signature is None or signed_digest is None:
+        return (
+            "403 Forbidden",
+            "signature_missing",
+            f"This mirror requires the {_KEY_ID_HEADER_NAME}, "
+            f"{_SIGNATURE_HEADER_NAME} and {_SIGNED_DIGEST_HEADER_NAME} "
+            "headers.",
+        )
+
+    # Key trust comes before any value-level comparison: an empty or
+    # otherwise untrusted key reports key_not_trusted regardless of what
+    # the other headers look like.
+    if not isinstance(key_id, str) or key_id not in policy.keys:
+        return (
+            "403 Forbidden",
+            "key_not_trusted",
+            "The key id is not trusted by the mirror signature policy.",
+        )
+
+    normalized_digest = (
+        signed_digest.lower() if isinstance(signed_digest, str) else ""
+    )
+    if policy.cover_digest and normalized_digest != digest:
+        # A malformed signed digest can never cover the pulled layer, so it
+        # is reported as uncovered instead of as a malformed request.
+        return (
+            "403 Forbidden",
+            "digest_uncovered",
+            "The signed digest does not cover the pulled layer digest.",
+        )
+
+    try:
+        provided = (
+            signature.lower().encode("ascii")
+            if isinstance(signature, str)
+            else b""
+        )
+        # A non-hex/non-ASCII signed digest (only possible when coverage
+        # is not enforced) simply cannot match the recomputed signature.
+        expected = compute_signature(
+            policy.algorithm, key_id, normalized_digest
+        )
+    except UnicodeEncodeError:
+        return (
+            "403 Forbidden",
+            "signature_invalid",
+            "The signature does not match the recomputed value.",
+        )
+    if not hmac.compare_digest(expected.encode("ascii"), provided):
+        return (
+            "403 Forbidden",
+            "signature_invalid",
+            "The signature does not match the recomputed value.",
+        )
+
+    return None
+
+
 def _raw_layer_response(
     start_response: StartResponse, data: bytes
 ) -> Iterable[bytes]:
@@ -3492,6 +3574,11 @@ def _pull_one_layer(
     policy: MirrorPolicy | None,
     environ: dict[str, Any],
     digest: str,
+    *,
+    signature_check: Callable[
+        [MirrorPolicy, dict[str, Any], str],
+        tuple[str, str, str] | None,
+    ] = _pull_signature_failure,
 ) -> tuple[bytes | None, tuple[str, str, str] | None]:
     """Run the existing single-digest pull chain for one normalized digest.
 
@@ -3499,7 +3586,9 @@ def _pull_one_layer(
     fresh upstream fetch that has been verified and cached -- or
     ``(None, (status, code, message))`` for the first failure. Fetch,
     digest, signature and quota errors all become the stable error tuple
-    instead of propagating; a failure never writes the cache.
+    instead of propagating; a failure never writes the cache. The
+    prefetch flow supplies its own signature checker so its hit-and-stop
+    error precedence stays aligned across batch items.
     """
 
     # A cache hit is served straight from storage; pulling must not change
@@ -3509,7 +3598,7 @@ def _pull_one_layer(
         if policy is not None:
             # The signature gate applies to cached bytes too: a failed
             # check returns nothing and changes nothing.
-            failure = _pull_signature_failure(policy, environ, digest)
+            failure = signature_check(policy, environ, digest)
             if failure is not None:
                 return None, failure
         return cached, None
@@ -3530,7 +3619,7 @@ def _pull_one_layer(
     if policy is not None:
         # The layer content is ready; the signature gate runs before the
         # cache write so a failed check neither serves bytes nor caches.
-        failure = _pull_signature_failure(policy, environ, digest)
+        failure = signature_check(policy, environ, digest)
         if failure is not None:
             return None, failure
 
@@ -3713,7 +3802,13 @@ def _handle_mirror_prefetch(
         # Classify before the chain runs; the counter-free peek does not
         # touch hit/miss counters and the chain itself peeks again.
         was_cached = cache_store.peek(digest) is not None
-        data, failure = _pull_one_layer(mirror, policy, environ, digest)
+        data, failure = _pull_one_layer(
+            mirror,
+            policy,
+            environ,
+            digest,
+            signature_check=_prefetch_signature_failure,
+        )
         if failure is not None:
             results.append(
                 {"digest": digest, "status": "failed", "size": 0,
@@ -3736,6 +3831,95 @@ def _handle_mirror_prefetch(
         {"id": raw_id, "results": results},
         trailing_newline=True,
     )
+
+
+def _handle_mirror_probe_post(
+    environ: dict[str, Any], mirror: Mirror, start_response: StartResponse
+) -> Iterable[bytes]:
+    # A probe POST carries no body; a declared positive or malformed body
+    # is rejected without performing the attempt.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # One real connection attempt against the registered upstream address;
+    # reachable and unreachable are both ordinary HTTP 200 business
+    # outcomes. The result overwrites the previous probe for this mirror
+    # and touches neither cache entries nor counters.
+    result = probe_upstream(mirror.upstream)
+    mirror_probe_store.set(mirror.id, result)
+    return _json_response(
+        start_response,
+        "200 OK",
+        result.to_dict(mirror.id),
+        trailing_newline=True,
+    )
+
+
+def _handle_mirror_probe_get(
+    raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    # GET only reads the most recent probe result; it never performs an
+    # attempt and writes no state.
+    result = mirror_probe_store.get(raw_id)
+    if result is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "probe_not_found",
+            "No probe has been performed for this mirror.",
+        )
+    return _json_response(
+        start_response,
+        "200 OK",
+        result.to_dict(raw_id),
+        trailing_newline=True,
+    )
+
+
+def _handle_mirror_probe(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method not in ("GET", "POST"):
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET, POST",
+        )
+
+    if not raw_id or "/" in raw_id or "\\" in raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not be empty or contain path separators.",
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    mirror = mirror_store.get(raw_id)
+    if mirror is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_not_found",
+            "No mirror exists with the requested id.",
+        )
+
+    if method == "POST":
+        return _handle_mirror_probe_post(environ, mirror, start_response)
+    return _handle_mirror_probe_get(raw_id, start_response)
 
 
 def _handle_mirrors(
@@ -4195,6 +4379,16 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/prefetch")],
+                    start_response,
+                )
+            if suffix.endswith("/probe"):
+                # Split on the probe marker even when the id segment embeds
+                # a separator, so the handler can reject the id as a bad
+                # request instead of treating the path as an unknown item.
+                return _handle_mirror_probe(
+                    method,
+                    environ,
+                    suffix[: -len("/probe")],
                     start_response,
                 )
             if suffix.endswith("/signature-policy"):

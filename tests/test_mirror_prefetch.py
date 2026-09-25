@@ -430,7 +430,12 @@ class PrefetchSignatureTests(unittest.TestCase):
         self.assertEqual(status, "200 OK")
         self.assertEqual(body["results"][0]["error"], "key_not_trusted")
 
-    def test_invalid_header_value_is_item_invalid_request(self) -> None:
+    def test_invalid_header_value_follows_signature_precedence(self) -> None:
+        # The prefetch signature determination follows the established
+        # missing/key/coverage/signature order and reports only one code:
+        # a malformed value never surfaces invalid_request. A trusted key
+        # and covered digest with an empty signature value fail at the
+        # signature-value step.
         headers = signature_headers("key-one", DIGEST_A)
         headers["HTTP_X_SIGNATURE"] = ""
         with patch_fetch(fake_fetch):
@@ -439,7 +444,80 @@ class PrefetchSignatureTests(unittest.TestCase):
             )
         self.assertEqual(status, "200 OK")
         self.assertEqual(body["results"][0]["status"], "failed")
-        self.assertEqual(body["results"][0]["error"], "invalid_request")
+        self.assertEqual(body["results"][0]["error"], "signature_invalid")
+
+    def test_untrusted_key_wins_over_coverage_and_signature_errors(self) -> None:
+        # Key trust is checked before coverage and signature value, so an
+        # untrusted key combined with an uncovered digest and an empty
+        # signature reports only key_not_trusted.
+        headers = {
+            "HTTP_X_KEY_ID": "stranger",
+            "HTTP_X_SIGNED_DIGEST": "not-a-digest",
+            "HTTP_X_SIGNATURE": "",
+        }
+        with patch_fetch(fake_fetch):
+            status, _h, body = prefetch_json(
+                self.mirror_id, [DIGEST_A], headers=headers
+            )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["results"][0]["status"], "failed")
+        self.assertEqual(body["results"][0]["error"], "key_not_trusted")
+
+    def test_untrusted_empty_key_reports_key_not_trusted(self) -> None:
+        headers = {
+            "HTTP_X_KEY_ID": "",
+            "HTTP_X_SIGNED_DIGEST": DIGEST_A,
+            "HTTP_X_SIGNATURE": sign("hmac-sha256", "key-one", DIGEST_A),
+        }
+        with patch_fetch(fake_fetch):
+            status, _h, body = prefetch_json(
+                self.mirror_id, [DIGEST_A], headers=headers
+            )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["results"][0]["error"], "key_not_trusted")
+
+    def test_malformed_signed_digest_with_cover_policy_is_uncovered(self) -> None:
+        headers = {
+            "HTTP_X_KEY_ID": "key-one",
+            "HTTP_X_SIGNED_DIGEST": "not-a-digest",
+            "HTTP_X_SIGNATURE": sign(
+                "hmac-sha256", "key-one", "not-a-digest"
+            ),
+        }
+        with patch_fetch(fake_fetch):
+            status, _h, body = prefetch_json(
+                self.mirror_id, [DIGEST_A], headers=headers
+            )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["results"][0]["error"], "digest_uncovered")
+
+    def test_non_ascii_digest_without_cover_is_signature_invalid(self) -> None:
+        # With cover_digest disabled a non-ASCII signed digest reaches the
+        # signature comparison; it can never match a hexadecimal HMAC and
+        # reports signature_invalid rather than failing the whole request.
+        reset_state()
+        mirror = register()
+        mirror_id = str(mirror["id"])
+        register_policy(
+            mirror_id,
+            {
+                "algorithm": "hmac-sha256",
+                "keys": ["key-one"],
+                "cover_digest": False,
+            },
+        )
+        headers = {
+            "HTTP_X_KEY_ID": "key-one",
+            "HTTP_X_SIGNED_DIGEST": "café",
+            "HTTP_X_SIGNATURE": "00" * 32,
+        }
+        with patch_fetch(fake_fetch):
+            status, _h, body = prefetch_json(
+                mirror_id, [DIGEST_A], headers=headers
+            )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["results"][0]["status"], "failed")
+        self.assertEqual(body["results"][0]["error"], "signature_invalid")
 
     def test_wrong_signature_fails_item(self) -> None:
         headers = signature_headers("key-one", DIGEST_A)

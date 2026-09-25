@@ -13,6 +13,7 @@ and nothing is ever written to a file.
 
 from __future__ import annotations
 
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -22,6 +23,9 @@ from urllib.parse import urlsplit
 
 #: Fetch timeout in seconds for contacting an upstream mirror.
 DEFAULT_FETCH_TIMEOUT = 10.0
+
+#: Probe timeout in seconds for contacting an upstream mirror.
+DEFAULT_PROBE_TIMEOUT = DEFAULT_FETCH_TIMEOUT
 
 _ALLOWED_FIELDS = frozenset({"name", "upstream"})
 _REQUIRED_FIELDS = ("name", "upstream")
@@ -57,6 +61,57 @@ class Mirror:
 
     def to_dict(self) -> dict[str, object]:
         return {"id": self.id, "name": self.name, "upstream": self.upstream}
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeResult:
+    """The most recent upstream probe outcome for one mirror.
+
+    Successful probes carry the upstream status code and a non-negative
+    latency in milliseconds; failed probes carry ``None`` for both. The
+    stable ``probe_failed`` error code is reported on the wire for
+    unreachable mirrors.
+    """
+
+    reachable: bool
+    status_code: int | None
+    latency_ms: int | None
+
+    def to_dict(self, mirror_id: str) -> dict[str, object]:
+        result: dict[str, object] = {
+            "id": mirror_id,
+            "reachable": self.reachable,
+            "status_code": self.status_code,
+            "latency_ms": self.latency_ms,
+        }
+        if not self.reachable:
+            result["error"] = "probe_failed"
+        return result
+
+
+class ProbeStore:
+    """Process-local storage of the latest probe result per mirror.
+
+    Only the most recent result of each mirror is kept and a new probe
+    overwrites the previous one. Results are never persisted to disk and
+    are lost on restart; probe state never touches cache entries, counters
+    or any other record.
+    """
+
+    def __init__(self) -> None:
+        self._results: dict[str, ProbeResult] = {}
+
+    def reset(self) -> None:
+        self._results = {}
+
+    def get(self, mirror_id: str) -> ProbeResult | None:
+        return self._results.get(mirror_id)
+
+    def set(self, mirror_id: str, result: ProbeResult) -> None:
+        self._results[mirror_id] = result
+
+    def discard(self, mirror_id: str) -> None:
+        self._results.pop(mirror_id, None)
 
 
 def _require_non_empty_string(value: object, label: str) -> str:
@@ -199,3 +254,49 @@ def fetch_upstream_layer(
             "mirror_fetch_failed",
             "Upstream mirror could not be reached.",
         ) from exc
+
+
+def probe_upstream(
+    upstream: str,
+    *,
+    timeout: float = DEFAULT_PROBE_TIMEOUT,
+) -> ProbeResult:
+    """Probe the registered ``upstream`` address once.
+
+    Issues a GET to the registered upstream base address (with no extra
+    path appended) and records the attempt latency. Any HTTP response
+    that completes the connection attempt -- including non-2xx statuses,
+    which are normal upstream answers -- counts as reachable. Connection
+    failures and timeouts count as unreachable; the failed attempt reports
+    no status code and no latency. The response body is not consumed
+    beyond what is needed to complete the attempt.
+    """
+
+    request = urllib.request.Request(upstream, method="GET")
+    start = time.monotonic()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            latency_ms = max(0, int((time.monotonic() - start) * 1000))
+            status_code = getattr(response, "status", response.getcode())
+            try:
+                # Drain the response so the connection can be released;
+                # the body itself is irrelevant to reachability.
+                response.read()
+            except OSError:
+                # Headers were already received, so the upstream answered:
+                # a body read failure does not turn this into unreachable.
+                pass
+    except urllib.error.HTTPError as exc:
+        latency_ms = max(0, int((time.monotonic() - start) * 1000))
+        try:
+            exc.read()
+        except OSError:
+            pass
+        finally:
+            exc.close()
+        status_code = exc.code
+    except (urllib.error.URLError, OSError, ValueError):
+        return ProbeResult(reachable=False, status_code=None, latency_ms=None)
+    return ProbeResult(
+        reachable=True, status_code=status_code, latency_ms=latency_ms
+    )
