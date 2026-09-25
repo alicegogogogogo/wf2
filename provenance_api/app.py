@@ -38,6 +38,7 @@ from .mirror_policies import (
     MirrorPolicyValidationError,
     build_mirror_policy_fields,
 )
+from .mirror_probes import MirrorProbeStore, probe_upstream
 from .mirrors import (
     Mirror,
     MirrorFetchError,
@@ -141,6 +142,10 @@ mirror_store = MirrorStore()
 #: rest, and never persisted.
 mirror_policy_store = MirrorPolicyStore()
 
+#: Process-local latest upstream probe results per mirror; cleared on
+#: restart like everything else and never persisted.
+mirror_probe_store = MirrorProbeStore()
+
 #: Process-local cross-repository references; cleared on restart like the
 #: rest.
 cross_reference_store = CrossReferenceStore()
@@ -165,6 +170,7 @@ def reset_state() -> None:
     cache_store.reset()
     mirror_store.reset()
     mirror_policy_store.reset()
+    mirror_probe_store.reset()
     cross_reference_store.reset()
     signature_store.reset()
 
@@ -3181,6 +3187,7 @@ def _handle_mirror_item_delete(
     # only carries the mirror fields. Cache entries, counters and every
     # other record are deliberately left alone.
     mirror_policy_store.remove(raw_id)
+    mirror_probe_store.remove(raw_id)
 
     return _json_response(
         start_response, "200 OK", mirror.to_dict(), trailing_newline=True
@@ -3403,6 +3410,10 @@ def _pull_signature_failure(
     value), or ``None`` when every check passes. The signature is
     recomputed with the existing convention: the key id bytes are the key
     and the lowercase signed digest text is the message.
+
+    A present but untrusted key always reports ``key_not_trusted`` before
+    malformed values of the other headers: when several conditions hold at
+    once, only the earliest code in the canonical order is reported.
     """
 
     key_id = environ.get(_KEY_ID_HEADER)
@@ -3415,6 +3426,16 @@ def _pull_signature_failure(
             f"This mirror requires the {_KEY_ID_HEADER_NAME}, "
             f"{_SIGNATURE_HEADER_NAME} and {_SIGNED_DIGEST_HEADER_NAME} "
             "headers.",
+        )
+
+    # Key trust outranks the format checks for the other headers, so an
+    # untrusted key id is reported even when the signature or signed
+    # digest is also malformed or empty.
+    if isinstance(key_id, str) and key_id and key_id not in policy.keys:
+        return (
+            "403 Forbidden",
+            "key_not_trusted",
+            "The key id is not trusted by the mirror signature policy.",
         )
 
     if not isinstance(key_id, str) or not key_id:
@@ -3440,13 +3461,6 @@ def _pull_signature_failure(
             "hexadecimal string.",
         )
     signed_digest = signed_digest.lower()
-
-    if key_id not in policy.keys:
-        return (
-            "403 Forbidden",
-            "key_not_trusted",
-            "The key id is not trusted by the mirror signature policy.",
-        )
 
     if policy.cover_digest and signed_digest != digest:
         return (
@@ -3735,6 +3749,75 @@ def _handle_mirror_prefetch(
         "200 OK",
         {"id": raw_id, "results": results},
         trailing_newline=True,
+    )
+
+
+def _handle_mirror_probe(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method not in ("GET", "POST"):
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET, POST",
+        )
+
+    if not raw_id or "/" in raw_id or "\\" in raw_id:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Mirror id must not be empty or contain path separators.",
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    if method == "POST":
+        # A probe is triggered by the request alone; a declared body is a
+        # bad request and is rejected without contacting the upstream.
+        body_error = _bodyless_request_error(environ)
+        if body_error is not None:
+            return _error(
+                start_response, "400 Bad Request", "invalid_request", body_error
+            )
+
+    mirror = mirror_store.get(raw_id)
+    if mirror is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "mirror_not_found",
+            "No mirror exists with the requested id.",
+        )
+
+    if method == "POST":
+        # One real connection attempt against the registered upstream; the
+        # new result replaces the previous one, if any. Only this probe
+        # result is written -- cache entries and counters stay untouched.
+        result = probe_upstream(mirror.upstream, raw_id)
+        mirror_probe_store.set(raw_id, result)
+    else:
+        # GET only reads the most recent result and never writes state.
+        result = mirror_probe_store.get(raw_id)
+        if result is None:
+            return _error(
+                start_response,
+                "404 Not Found",
+                "probe_not_found",
+                "No probe has been run for this mirror.",
+            )
+
+    return _json_response(
+        start_response, "200 OK", result.to_dict(), trailing_newline=True
     )
 
 
@@ -4195,6 +4278,16 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/prefetch")],
+                    start_response,
+                )
+            if suffix.endswith("/probe"):
+                # Split on the probe marker even when the id segment embeds
+                # a separator, so the handler can reject the id as a bad
+                # request instead of treating the path as an unknown item.
+                return _handle_mirror_probe(
+                    method,
+                    environ,
+                    suffix[: -len("/probe")],
                     start_response,
                 )
             if suffix.endswith("/signature-policy"):
