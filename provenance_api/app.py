@@ -69,6 +69,13 @@ from .sbom import (
     build_license_fields,
     build_sbom_fields,
 )
+from .signatures import (
+    SignatureError,
+    SignatureStore,
+    SignatureValidationError,
+    build_signature_fields,
+    compute_signature,
+)
 from .vulnerabilities import (
     SEVERITY_VALUES,
     VulnerabilityError,
@@ -114,6 +121,10 @@ mirror_store = MirrorStore()
 #: rest.
 cross_reference_store = CrossReferenceStore()
 
+#: Process-local content signature records; cleared on restart like the
+#: rest.
+signature_store = SignatureStore()
+
 
 def reset_state() -> None:
     """Clear every in-process store (test and tooling helper)."""
@@ -129,6 +140,7 @@ def reset_state() -> None:
     cache_store.reset()
     mirror_store.reset()
     cross_reference_store.reset()
+    signature_store.reset()
 
 #: Listing defaults and bounds.
 DEFAULT_LIMIT = 50
@@ -2857,6 +2869,194 @@ def _handle_cross_references(
     )
 
 
+def _handle_signatures_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Validate the whole body before touching any store, so a bad request
+    # can never leave a partial record.
+    try:
+        record = build_signature_fields(payload)
+    except SignatureValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    resource = store.get(raw_id)
+    if resource is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # The signed digest must be the digest the resource was registered with.
+    if record.digest != resource.digest:
+        return _error(
+            start_response,
+            "409 Conflict",
+            "signed_digest_mismatch",
+            "The signed digest does not match the resource digest.",
+        )
+
+    try:
+        record, created = signature_store.add(raw_id, payload)
+    except SignatureError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created" if created else "200 OK",
+        record.to_dict(raw_id),
+        trailing_newline=True,
+    )
+
+
+def _handle_signatures_get(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    record = signature_store.get(raw_id)
+    if record is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "signature_not_found",
+            "No signature is registered for this resource.",
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        record.to_dict(raw_id),
+        trailing_newline=True,
+    )
+
+
+def _handle_signatures(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_signatures_post(environ, raw_id, start_response)
+    if method == "GET":
+        return _handle_signatures_get(environ, raw_id, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
+def _handle_signatures_verify(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    record = signature_store.get(raw_id)
+    if record is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "signature_not_found",
+            "No signature is registered for this resource.",
+        )
+
+    # Read-only: the signature is recomputed on the fly and compared with
+    # the registered value; nothing is recorded anywhere.
+    expected = compute_signature(record.algorithm, record.key_id, record.digest)
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"id": raw_id, "valid": hmac.compare_digest(expected, record.signature)},
+        trailing_newline=True,
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -2993,6 +3193,14 @@ def application(
                 return _handle_cross_references(
                     method, environ, head, start_response
                 )
+            if separator and tail == "signatures":
+                return _handle_signatures(
+                    method, environ, head, start_response
+                )
+            if separator and tail == "signatures/verify":
+                return _handle_signatures_verify(
+                    method, environ, head, start_response
+                )
             if separator and tail == "chunks/status":
                 return _handle_chunks_status(
                     method, environ, head, start_response
@@ -3123,6 +3331,24 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/cross-references")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/signatures/verify"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without verifying anything.
+                return _handle_signatures_verify(
+                    method,
+                    environ,
+                    suffix[: -len("/signatures/verify")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/signatures"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without recording any signature.
+                return _handle_signatures(
+                    method,
+                    environ,
+                    suffix[: -len("/signatures")],
                     start_response,
                 )
             # Any other suffix keeps the baseline item semantics (embedded
