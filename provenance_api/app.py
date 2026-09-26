@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
-from .advisories import advisory_detail, summarize_advisories
+from .advisories import advisory_detail, advisory_fixes, summarize_advisories
 from .cache import CacheError, LayerCacheStore
 from .component_fixes import recommended_fix_version
 from .content import ContentError, ContentStore
@@ -4686,6 +4686,89 @@ def _handle_advisory_item(
     )
 
 
+def _handle_advisory_fixes(
+    method: str,
+    environ: dict[str, Any],
+    raw_advisory: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The view is read-only: a declared non-empty (or malformed) body is a
+    # bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # The advisory identifier is matched verbatim; only its shape is
+    # validated here, never its existence.
+    if not raw_advisory:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Advisory id must not be empty.",
+        )
+    if "/" in raw_advisory or "\\" in raw_advisory:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Advisory id must not contain path separators.",
+        )
+
+    # Only the optional ``severity`` parameter is accepted; unknown or
+    # repeated parameters, including a repeated ``severity``, are rejected.
+    pairs = parse_qsl(
+        str(environ.get("QUERY_STRING", "")),
+        keep_blank_values=True,
+        strict_parsing=False,
+    )
+    severity: str | None = None
+    for key, value in pairs:
+        if key != "severity":
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                f"Unknown query parameter: {key!r}.",
+            )
+        if severity is not None:
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                "Query parameter 'severity' must not be repeated.",
+            )
+        if value == "" or value.lower() not in SEVERITY_VALUES:
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                "Severity must be one of: critical, high, medium, low "
+                "(case-insensitive).",
+            )
+        severity = value.lower()
+
+    fixes = advisory_fixes(store, vulnerability_store, raw_advisory, severity)
+    return _json_response(
+        start_response,
+        "200 OK",
+        fixes,
+        trailing_newline=True,
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -4702,9 +4785,16 @@ def application(
 
         if path.startswith("/advisories/"):
             # The identifier segment is validated by the handler; an
-            # embedded separator or an empty segment is a bad request.
+            # embedded separator or an empty segment is a bad request. A
+            # trailing "/fixes" segment selects the per-advisory component
+            # fix view instead of the alert detail view.
+            tail = path[len("/advisories/"):]
+            if tail.endswith("/fixes"):
+                return _handle_advisory_fixes(
+                    method, environ, tail[: -len("/fixes")], start_response
+                )
             return _handle_advisory_item(
-                method, environ, path[len("/advisories/"):], start_response
+                method, environ, tail, start_response
             )
 
         if path == "/resources":
