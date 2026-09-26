@@ -563,6 +563,40 @@ def _query_parameter_error(environ: dict[str, Any]) -> str | None:
     return None
 
 
+def _parse_severity_query(
+    environ: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Parse the optional ``severity`` query parameter shared by the views.
+
+    Returns ``(severity, None)`` with the value normalized to lowercase (or
+    ``None`` when the parameter is absent), or ``(None, message)`` for the
+    first violation in query-string order: an unknown parameter, a repeated
+    ``severity``, or an empty or out-of-range value. The four levels are
+    compared case-insensitively. This is the single implementation used by
+    every view that accepts the parameter, so the rejection rules and
+    messages cannot drift apart.
+    """
+
+    pairs = parse_qsl(
+        str(environ.get("QUERY_STRING", "")),
+        keep_blank_values=True,
+        strict_parsing=False,
+    )
+    severity: str | None = None
+    for key, value in pairs:
+        if key != "severity":
+            return None, f"Unknown query parameter: {key!r}."
+        if severity is not None:
+            return None, "Query parameter 'severity' must not be repeated."
+        if value == "" or value.lower() not in SEVERITY_VALUES:
+            return None, (
+                "Severity must be one of: critical, high, medium, low "
+                "(case-insensitive)."
+            )
+        severity = value.lower()
+    return severity, None
+
+
 def _handle_dependencies_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -1589,8 +1623,9 @@ def _handle_vulnerabilities_batch(
     try:
         # Validate the whole batch before touching any store, so a bad
         # request can never leave a partial record and always answers 400
-        # (even for a resource that does not exist).
-        build_batch_fields(payload)
+        # (even for a resource that does not exist). Element validation
+        # lives only here; the store consumes the normalized fields.
+        fields = build_batch_fields(payload)
     except VulnerabilityValidationError as exc:
         return _error(
             start_response,
@@ -1607,11 +1642,8 @@ def _handle_vulnerabilities_batch(
             "No resource exists with the requested id.",
         )
 
-    assert isinstance(payload, dict)
     try:
-        records = vulnerability_store.add_batch(
-            raw_id, payload["vulnerabilities"]
-        )
+        records = vulnerability_store.add_batch(raw_id, fields)
     except VulnerabilityError as exc:
         return _error(
             start_response, "409 Conflict", exc.code, exc.message
@@ -1636,36 +1668,11 @@ def _handle_vulnerabilities_get(
 
     # Only the optional ``severity`` parameter is accepted; unknown or
     # repeated parameters, including a repeated ``severity``, are rejected.
-    pairs = parse_qsl(
-        str(environ.get("QUERY_STRING", "")),
-        keep_blank_values=True,
-        strict_parsing=False,
-    )
-    severity: str | None = None
-    for key, value in pairs:
-        if key != "severity":
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                f"Unknown query parameter: {key!r}.",
-            )
-        if severity is not None:
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                "Query parameter 'severity' must not be repeated.",
-            )
-        if value == "" or value.lower() not in SEVERITY_VALUES:
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                "Severity must be one of: critical, high, medium, low "
-                "(case-insensitive).",
-            )
-        severity = value.lower()
+    severity, severity_error = _parse_severity_query(environ)
+    if severity_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", severity_error
+        )
 
     if store.get(raw_id) is None:
         return _error(
@@ -3631,16 +3638,36 @@ def _handle_mirror_signature_policy(
     )
 
 
-def _pull_signature_failure(
-    policy: MirrorPolicy, environ: dict[str, Any], digest: str
+def _signature_failure(
+    policy: MirrorPolicy,
+    environ: dict[str, Any],
+    digest: str,
+    *,
+    strict_headers: bool,
 ) -> tuple[str, str, str] | None:
-    """Check the pull signature headers against ``policy``.
+    """Check the signature headers against ``policy`` for one pulled digest.
 
-    Returns ``(status, code, message)`` for the first failed check, in the
-    mandated order (missing headers, key trust, digest coverage, signature
-    value), or ``None`` when every check passes. The signature is
-    recomputed with the existing convention: the key id bytes are the key
-    and the lowercase signed digest text is the message.
+    This is the single signature determination shared by the single-digest
+    pull and the batch prefetch. Both run the same checks in the mandated
+    order -- missing headers, key trust, digest coverage, signature value --
+    and stop at the first failure, so a request that fails several checks
+    reports only the earliest code. ``strict_headers`` selects how malformed
+    header values are classified:
+
+    - ``True`` (single-digest pull only): an empty ``X-Key-Id`` or
+      ``X-Signature``, or an ``X-Signed-Digest`` that is not a 64-character
+      hexadecimal string, is a request-level error and answers
+      ``400 invalid_request`` before any trust or coverage check.
+    - ``False`` (batch prefetch item): malformed values never surface
+      ``invalid_request``; an empty or untrusted key reports
+      ``key_not_trusted``, a malformed signed digest can never cover the
+      pulled layer and reports ``digest_uncovered``, and an unmatchable
+      signature value reports ``signature_invalid``.
+
+    Returns ``(status, code, message)`` for the first failed check, or
+    ``None`` when every check passes. The signature is recomputed with the
+    existing convention: the key id bytes are the key and the lowercase
+    signed digest text is the message.
     """
 
     key_id = environ.get(_KEY_ID_HEADER)
@@ -3655,85 +3682,31 @@ def _pull_signature_failure(
             "headers.",
         )
 
-    if not isinstance(key_id, str) or not key_id:
-        return (
-            "400 Bad Request",
-            "invalid_request",
-            f"{_KEY_ID_HEADER_NAME} header must be a non-empty string.",
-        )
-    if not isinstance(signature, str) or not signature:
-        return (
-            "400 Bad Request",
-            "invalid_request",
-            f"{_SIGNATURE_HEADER_NAME} header must be a non-empty string.",
-        )
-    if (
-        not isinstance(signed_digest, str)
-        or _DIGEST_PATTERN.fullmatch(signed_digest) is None
-    ):
-        return (
-            "400 Bad Request",
-            "invalid_request",
-            f"{_SIGNED_DIGEST_HEADER_NAME} header must be a 64-character "
-            "hexadecimal string.",
-        )
-    signed_digest = signed_digest.lower()
-
-    if key_id not in policy.keys:
-        return (
-            "403 Forbidden",
-            "key_not_trusted",
-            "The key id is not trusted by the mirror signature policy.",
-        )
-
-    if policy.cover_digest and signed_digest != digest:
-        return (
-            "403 Forbidden",
-            "digest_uncovered",
-            "The signed digest does not cover the pulled layer digest.",
-        )
-
-    expected = compute_signature(policy.algorithm, key_id, signed_digest)
-    try:
-        provided = signature.lower().encode("ascii")
-    except UnicodeEncodeError:
-        provided = b""
-    # The comparison ignores case; the recomputed value is already
-    # lowercase hexadecimal.
-    if not hmac.compare_digest(expected.encode("ascii"), provided):
-        return (
-            "403 Forbidden",
-            "signature_invalid",
-            "The signature does not match the recomputed value.",
-        )
-
-    return None
-
-
-def _prefetch_signature_failure(
-    policy: MirrorPolicy, environ: dict[str, Any], digest: str
-) -> tuple[str, str, str] | None:
-    """Check prefetch signature headers in the established precedence.
-
-    Unlike the single pull, a prefetch item reports only the four
-    signature determination codes and hits the first match in the fixed
-    order missing headers, key trust, digest coverage, signature value.
-    When several conditions fail at once the earliest one -- key trust --
-    wins, so an untrusted key always answers ``key_not_trusted`` even when
-    the coverage or signature value is also wrong.
-    """
-
-    key_id = environ.get(_KEY_ID_HEADER)
-    signature = environ.get(_SIGNATURE_HEADER)
-    signed_digest = environ.get(_SIGNED_DIGEST_HEADER)
-    if key_id is None or signature is None or signed_digest is None:
-        return (
-            "403 Forbidden",
-            "signature_missing",
-            f"This mirror requires the {_KEY_ID_HEADER_NAME}, "
-            f"{_SIGNATURE_HEADER_NAME} and {_SIGNED_DIGEST_HEADER_NAME} "
-            "headers.",
-        )
+    if strict_headers:
+        # Only the single-digest pull rejects malformed header values as
+        # request errors; the prefetch folds them into the 403 codes below.
+        if not isinstance(key_id, str) or not key_id:
+            return (
+                "400 Bad Request",
+                "invalid_request",
+                f"{_KEY_ID_HEADER_NAME} header must be a non-empty string.",
+            )
+        if not isinstance(signature, str) or not signature:
+            return (
+                "400 Bad Request",
+                "invalid_request",
+                f"{_SIGNATURE_HEADER_NAME} header must be a non-empty string.",
+            )
+        if (
+            not isinstance(signed_digest, str)
+            or _DIGEST_PATTERN.fullmatch(signed_digest) is None
+        ):
+            return (
+                "400 Bad Request",
+                "invalid_request",
+                f"{_SIGNED_DIGEST_HEADER_NAME} header must be a 64-character "
+                "hexadecimal string.",
+            )
 
     # Key trust comes before any value-level comparison: an empty or
     # otherwise untrusted key reports key_not_trusted regardless of what
@@ -3757,23 +3730,36 @@ def _prefetch_signature_failure(
             "The signed digest does not cover the pulled layer digest.",
         )
 
-    try:
-        provided = (
-            signature.lower().encode("ascii")
-            if isinstance(signature, str)
-            else b""
-        )
-        # A non-hex/non-ASCII signed digest (only possible when coverage
-        # is not enforced) simply cannot match the recomputed signature.
+    if strict_headers:
+        # The header values were validated above; a non-ASCII signature
+        # value simply cannot match the recomputed hexadecimal HMAC.
         expected = compute_signature(
             policy.algorithm, key_id, normalized_digest
         )
-    except UnicodeEncodeError:
-        return (
-            "403 Forbidden",
-            "signature_invalid",
-            "The signature does not match the recomputed value.",
-        )
+        try:
+            provided = signature.lower().encode("ascii")
+        except UnicodeEncodeError:
+            provided = b""
+    else:
+        try:
+            provided = (
+                signature.lower().encode("ascii")
+                if isinstance(signature, str)
+                else b""
+            )
+            # A non-hex/non-ASCII signed digest (only possible when coverage
+            # is not enforced) simply cannot match the recomputed signature.
+            expected = compute_signature(
+                policy.algorithm, key_id, normalized_digest
+            )
+        except UnicodeEncodeError:
+            return (
+                "403 Forbidden",
+                "signature_invalid",
+                "The signature does not match the recomputed value.",
+            )
+    # The comparison ignores case; the recomputed value is already
+    # lowercase hexadecimal.
     if not hmac.compare_digest(expected.encode("ascii"), provided):
         return (
             "403 Forbidden",
@@ -3805,10 +3791,7 @@ def _pull_one_layer(
     environ: dict[str, Any],
     digest: str,
     *,
-    signature_check: Callable[
-        [MirrorPolicy, dict[str, Any], str],
-        tuple[str, str, str] | None,
-    ] = _pull_signature_failure,
+    strict_headers: bool = True,
 ) -> tuple[bytes | None, tuple[str, str, str] | None]:
     """Run the existing single-digest pull chain for one normalized digest.
 
@@ -3817,8 +3800,10 @@ def _pull_one_layer(
     ``(None, (status, code, message))`` for the first failure. Fetch,
     digest, signature and quota errors all become the stable error tuple
     instead of propagating; a failure never writes the cache. The
-    prefetch flow supplies its own signature checker so its hit-and-stop
-    error precedence stays aligned across batch items.
+    signature gate is the shared :func:`_signature_failure`; the prefetch
+    flow passes ``strict_headers=False`` so its per-item determination
+    reports only the four signature codes while the single-digest pull
+    keeps its request-level rejection of malformed header values.
     """
 
     # A cache hit is served straight from storage; pulling must not change
@@ -3828,7 +3813,9 @@ def _pull_one_layer(
         if policy is not None:
             # The signature gate applies to cached bytes too: a failed
             # check returns nothing and changes nothing.
-            failure = signature_check(policy, environ, digest)
+            failure = _signature_failure(
+                policy, environ, digest, strict_headers=strict_headers
+            )
             if failure is not None:
                 return None, failure
         return cached, None
@@ -3849,7 +3836,9 @@ def _pull_one_layer(
     if policy is not None:
         # The layer content is ready; the signature gate runs before the
         # cache write so a failed check neither serves bytes nor caches.
-        failure = signature_check(policy, environ, digest)
+        failure = _signature_failure(
+            policy, environ, digest, strict_headers=strict_headers
+        )
         if failure is not None:
             return None, failure
 
@@ -4037,7 +4026,7 @@ def _handle_mirror_prefetch(
             policy,
             environ,
             digest,
-            signature_check=_prefetch_signature_failure,
+            strict_headers=False,
         )
         if failure is not None:
             results.append(
@@ -4563,36 +4552,11 @@ def _handle_advisories(
 
     # Only the optional ``severity`` parameter is accepted; unknown or
     # repeated parameters, including a repeated ``severity``, are rejected.
-    pairs = parse_qsl(
-        str(environ.get("QUERY_STRING", "")),
-        keep_blank_values=True,
-        strict_parsing=False,
-    )
-    severity: str | None = None
-    for key, value in pairs:
-        if key != "severity":
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                f"Unknown query parameter: {key!r}.",
-            )
-        if severity is not None:
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                "Query parameter 'severity' must not be repeated.",
-            )
-        if value == "" or value.lower() not in SEVERITY_VALUES:
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                "Severity must be one of: critical, high, medium, low "
-                "(case-insensitive).",
-            )
-        severity = value.lower()
+    severity, severity_error = _parse_severity_query(environ)
+    if severity_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", severity_error
+        )
 
     advisories = summarize_advisories(store, vulnerability_store, severity)
     return _json_response(
@@ -4646,36 +4610,11 @@ def _handle_advisory_item(
 
     # Only the optional ``severity`` parameter is accepted; unknown or
     # repeated parameters, including a repeated ``severity``, are rejected.
-    pairs = parse_qsl(
-        str(environ.get("QUERY_STRING", "")),
-        keep_blank_values=True,
-        strict_parsing=False,
-    )
-    severity: str | None = None
-    for key, value in pairs:
-        if key != "severity":
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                f"Unknown query parameter: {key!r}.",
-            )
-        if severity is not None:
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                "Query parameter 'severity' must not be repeated.",
-            )
-        if value == "" or value.lower() not in SEVERITY_VALUES:
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                "Severity must be one of: critical, high, medium, low "
-                "(case-insensitive).",
-            )
-        severity = value.lower()
+    severity, severity_error = _parse_severity_query(environ)
+    if severity_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", severity_error
+        )
 
     detail = advisory_detail(store, vulnerability_store, raw_advisory, severity)
     return _json_response(
@@ -4729,36 +4668,11 @@ def _handle_advisory_fixes(
 
     # Only the optional ``severity`` parameter is accepted; unknown or
     # repeated parameters, including a repeated ``severity``, are rejected.
-    pairs = parse_qsl(
-        str(environ.get("QUERY_STRING", "")),
-        keep_blank_values=True,
-        strict_parsing=False,
-    )
-    severity: str | None = None
-    for key, value in pairs:
-        if key != "severity":
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                f"Unknown query parameter: {key!r}.",
-            )
-        if severity is not None:
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                "Query parameter 'severity' must not be repeated.",
-            )
-        if value == "" or value.lower() not in SEVERITY_VALUES:
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                "Severity must be one of: critical, high, medium, low "
-                "(case-insensitive).",
-            )
-        severity = value.lower()
+    severity, severity_error = _parse_severity_query(environ)
+    if severity_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", severity_error
+        )
 
     fixes = advisory_fixes(store, vulnerability_store, raw_advisory, severity)
     return _json_response(

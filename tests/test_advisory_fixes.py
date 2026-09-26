@@ -490,12 +490,26 @@ class AdvisoryFixesTests(unittest.TestCase):
                 self.assertEqual(body["error"], "invalid_request")
 
     def test_bad_request_does_not_read_business_data(self) -> None:
-        # A bad query parameter is rejected before aggregation; the response
-        # is the same with or without any recorded alerts.
+        # A bad query parameter is rejected before aggregation; the
+        # business state is byte-for-byte identical before and after the
+        # rejected request.
         self._alert("first", advisory="ADV-A", severity="high")
+        before_fixes = call("GET", "/advisories/ADV-A/fixes")
+        before_detail = call("GET", "/advisories/ADV-A")
+        before_alerts = call(
+            "GET", f"/resources/{self.ids['first']}/vulnerabilities"
+        )
+
         status, _h, body = self._fixes("ADV-A", query_string="severity=urgent")
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
+
+        self.assertEqual(call("GET", "/advisories/ADV-A/fixes"), before_fixes)
+        self.assertEqual(call("GET", "/advisories/ADV-A"), before_detail)
+        self.assertEqual(
+            call("GET", f"/resources/{self.ids['first']}/vulnerabilities"),
+            before_alerts,
+        )
 
     def test_error_body_shape_and_newline(self) -> None:
         status, headers, raw = call(

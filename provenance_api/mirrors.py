@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -260,6 +261,7 @@ def probe_upstream(
     upstream: str,
     *,
     timeout: float = DEFAULT_PROBE_TIMEOUT,
+    urlopen: Callable[..., Any] = urllib.request.urlopen,
 ) -> ProbeResult:
     """Probe the registered ``upstream`` address once.
 
@@ -270,12 +272,17 @@ def probe_upstream(
     failures and timeouts count as unreachable; the failed attempt reports
     no status code and no latency. The response body is not consumed
     beyond what is needed to complete the attempt.
+
+    ``urlopen`` is the network entry point; callers (notably tests) may
+    pass a call-local stand-in such as an opener's ``open`` method, so a
+    substitution never touches the process-global
+    ``urllib.request.urlopen`` and cannot leak into other callers.
     """
 
     request = urllib.request.Request(upstream, method="GET")
     start = time.monotonic()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urlopen(request, timeout=timeout) as response:
             latency_ms = max(0, int((time.monotonic() - start) * 1000))
             status_code = getattr(response, "status", response.getcode())
             try:

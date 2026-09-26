@@ -338,13 +338,14 @@ class ProbeUpstreamIntegrationTests(unittest.TestCase):
     def _direct_open(self):
         # Loopback targets must be contacted directly: an ambient HTTP
         # proxy would otherwise answer for every closed local port and
-        # make reachability environment-dependent.
+        # make reachability environment-dependent. The opener's ``open``
+        # is handed to the probe as a call-local stand-in, so the
+        # process-global ``urllib.request.urlopen`` is never replaced and
+        # no other test can be affected.
         import urllib.request
 
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        return mock.patch(
-            "provenance_api.mirrors.urllib.request.urlopen", opener.open
-        )
+        return opener.open
 
     def test_probe_against_real_local_server(self) -> None:
         server = HTTPServer(("127.0.0.1", 0), _RecordingHandler)
@@ -352,18 +353,20 @@ class ProbeUpstreamIntegrationTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with self._direct_open():
-                result = probe_upstream(f"http://127.0.0.1:{port}/", timeout=5)
+            result = probe_upstream(
+                f"http://127.0.0.1:{port}/", timeout=5,
+                urlopen=self._direct_open(),
+            )
             self.assertTrue(result.reachable)
             self.assertEqual(result.status_code, 204)
             self.assertIsInstance(result.latency_ms, int)
             self.assertGreaterEqual(result.latency_ms, 0)
             self.assertEqual(_RecordingHandler.last_path, "/")
 
-            with self._direct_open():
-                result = probe_upstream(
-                    f"http://127.0.0.1:{port}/boom", timeout=5
-                )
+            result = probe_upstream(
+                f"http://127.0.0.1:{port}/boom", timeout=5,
+                urlopen=self._direct_open(),
+            )
             self.assertTrue(result.reachable)
             self.assertEqual(result.status_code, 500)
         finally:
@@ -381,10 +384,10 @@ class ProbeUpstreamIntegrationTests(unittest.TestCase):
         holder.bind(("127.0.0.1", 0))
         port = holder.getsockname()[1]
         try:
-            with self._direct_open():
-                result = probe_upstream(
-                    f"http://127.0.0.1:{port}/", timeout=1
-                )
+            result = probe_upstream(
+                f"http://127.0.0.1:{port}/", timeout=1,
+                urlopen=self._direct_open(),
+            )
         finally:
             holder.close()
         self.assertFalse(result.reachable)

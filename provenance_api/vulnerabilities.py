@@ -181,7 +181,9 @@ def build_batch_fields(
     ``vulnerabilities``: a non-empty array of at most
     :data:`MAX_BATCH_SIZE` elements, each validated exactly like a single
     registration payload. Returns one normalized field tuple per element,
-    in array order.
+    in array order. This is the only place batch elements are validated:
+    :meth:`VulnerabilityStore.add_batch` consumes these tuples directly
+    and never repeats the same rule.
     """
 
     if not isinstance(payload, dict):
@@ -284,23 +286,23 @@ class VulnerabilityStore:
         return record
 
     def add_batch(
-        self, resource_id: str, payloads: object
+        self,
+        resource_id: str,
+        fields: list[tuple[str, str, str, str, str | None]],
     ) -> list[Vulnerability]:
-        """Validate and atomically append a batch of alerts for ``resource_id``.
+        """Atomically append a batch of alerts for ``resource_id``.
 
-        ``payloads`` must be the decoded ``vulnerabilities`` array of a
-        batch request. The elements are treated as submitted in array
-        order: on success every alert is recorded in that order and the
-        new records are returned in the same order. The batch is atomic —
-        raises :class:`VulnerabilityValidationError` when any element is
-        invalid, or :class:`VulnerabilityError` with code
+        ``fields`` must be the normalized field tuples produced by
+        :func:`build_batch_fields`; element validation lives there alone
+        and is deliberately not repeated here, so the same rule has a
+        single implementation. The elements are treated as submitted in
+        array order: on success every alert is recorded in that order and
+        the new records are returned in the same order. The batch is
+        atomic — raises :class:`VulnerabilityError` with code
         ``duplicate_vulnerability`` when an advisory/component pair repeats
-        inside the batch or already exists for the resource; in both cases
+        inside the batch or already exists for the resource; in that case
         nothing is recorded.
         """
-
-        assert isinstance(payloads, list)
-        fields = [build_vulnerability_fields(item) for item in payloads]
 
         existing = self._keys.get(resource_id, ())
         seen: set[tuple[str, str]] = set()
