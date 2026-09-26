@@ -2683,6 +2683,61 @@ def _handle_vulnerability_exceptions(
     )
 
 
+def _handle_vulnerability_exception_summary(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Global read-only summary of every exemption at ``GET /vulnerability-exceptions``.
+
+    Entries are grouped by resource in registration order and, within one
+    resource, keep their own exemption registration order; the list is
+    never reordered. Each entry leads with ``resource_id`` and then echoes
+    the exemption's own fields in the same key order as the per-resource
+    listing. Computed on the fly and recorded nowhere; no exemption,
+    alert or any other state is touched, and a resource's existence is
+    never an error condition.
+    """
+
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # Read-only: a declared non-empty (or malformed) body is a bad request
+    # without consulting any business data. An omitted header and an
+    # explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    records: list[dict[str, object]] = []
+    for resource in store.list_all():
+        for record in vulnerability_exception_store.list_for(resource.id):
+            entry: dict[str, object] = {"resource_id": resource.id}
+            entry.update(record.to_dict())
+            records.append(entry)
+    return _json_response(
+        start_response,
+        "200 OK",
+        records,
+        trailing_newline=True,
+    )
+
+
 def _handle_sbom_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -5673,6 +5728,13 @@ def application(
             # Global risk summary; the handler answers the 405 (Allow: GET)
             # for every other method.
             return _handle_risk_summary(method, environ, start_response)
+
+        if path == "/vulnerability-exceptions":
+            # Global exemption summary; the handler answers the 405
+            # (Allow: GET) for every other method.
+            return _handle_vulnerability_exception_summary(
+                method, environ, start_response
+            )
 
         if path.startswith("/advisories/"):
             # The identifier segment is validated by the handler; an
