@@ -1135,6 +1135,105 @@ def _handle_graph_stats(
     )
 
 
+def _parse_graph_path_query(
+    query_string: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Parse the required ``from`` and ``to`` query parameters of
+    ``GET /graph/path``.
+
+    Returns ``(from_id, to_id, None)`` when both parameters are present
+    exactly once with legal values, or ``(None, None, message)`` for an
+    unknown parameter, a repeated parameter, a missing parameter, an
+    empty value or a value containing a path separator. Values are
+    matched verbatim against resource ids: no trimming, no case folding.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    values: dict[str, str] = {}
+    for key, value in pairs:
+        if key not in ("from", "to"):
+            return None, None, f"Unknown query parameter: {key!r}."
+        if key in values:
+            return None, None, (
+                f"Query parameter {key!r} must not be repeated."
+            )
+        if value == "":
+            return None, None, f"Query parameter {key!r} must not be empty."
+        if "/" in value or "\\" in value:
+            return None, None, (
+                f"Query parameter {key!r} must not contain path separators."
+            )
+        values[key] = value
+    for name in ("from", "to"):
+        if name not in values:
+            return None, None, (
+                f"Missing required query parameter: {name!r}."
+            )
+    return values["from"], values["to"], None
+
+
+def _handle_graph_path(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The path query is read-only: a declared non-empty (or malformed) body
+    # is a bad request without consulting any business data. An omitted
+    # header and an explicit zero length count as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Both ``from`` and ``to`` are required exactly once; anything else is
+    # rejected before any business data is read.
+    from_id, to_id, query_error = _parse_graph_path_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    assert from_id is not None and to_id is not None
+
+    if store.get(from_id) is None or store.get(to_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Computed on the fly from the current registry; nothing is recorded.
+    path = store.shortest_path(from_id, to_id)
+    found = path is not None
+    nodes = path if found else []
+    return _json_response(
+        start_response,
+        "200 OK",
+        {
+            "from": from_id,
+            "to": to_id,
+            "found": found,
+            "path": nodes,
+            "length": len(nodes),
+        },
+        trailing_newline=True,
+    )
+
+
 def _read_declared_body(environ: dict[str, Any]) -> tuple[bytes | None, str | None]:
     """Read exactly the declared request body for content verification.
 
@@ -5794,6 +5893,9 @@ def application(
 
         if path == "/graph/stats":
             return _handle_graph_stats(method, environ, start_response)
+
+        if path == "/graph/path":
+            return _handle_graph_path(method, environ, start_response)
 
         if path == "/promotion/blockers":
             return _handle_promotion_blockers(method, environ, start_response)

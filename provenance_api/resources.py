@@ -370,6 +370,55 @@ class ResourceStore:
             self._reachable(resource_id, self._dependencies)
         )
 
+    def shortest_path(self, start: str, end: str) -> list[str] | None:
+        """Return the shortest directed path from ``start`` to ``end``.
+
+        The path follows dependency edges in their direction (the start
+        resource depends on the end resource) and is reported as the list
+        of node ids, ``start`` first and ``end`` last, with no repeated
+        nodes. ``start == end`` yields the single-node path. Returns
+        ``None`` when ``end`` is not reachable from ``start``. Among
+        equally short paths the one whose nodes come earliest in
+        registration order -- compared from the second node onward -- is
+        picked, so the answer is stable.
+        """
+
+        if start == end:
+            return [start]
+
+        # Hops from every node to ``end`` along the edge direction,
+        # computed as a breadth-first walk over the reverse graph.
+        dist: dict[str, int] = {end: 0}
+        queue = [end]
+        for node in queue:
+            for predecessor in self._dependents.get(node, ()):
+                if predecessor not in dist:
+                    dist[predecessor] = dist[node] + 1
+                    queue.append(predecessor)
+        if start not in dist:
+            return None
+
+        order = {
+            resource.id: index
+            for index, resource in enumerate(self._resources)
+        }
+        path = [start]
+        current = start
+        while current != end:
+            remaining = dist[current]
+            # Every candidate continues on a shortest path; taking the
+            # earliest-registered one at each step yields the stable pick.
+            current = min(
+                (
+                    successor
+                    for successor in self._dependencies.get(current, ())
+                    if dist.get(successor) == remaining - 1
+                ),
+                key=lambda node: order[node],
+            )
+            path.append(current)
+        return path
+
     def list_impact(self, resource_id: str) -> list[str]:
         """Return ids that directly or transitively depend on ``resource_id``.
 
