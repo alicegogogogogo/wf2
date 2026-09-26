@@ -3484,6 +3484,43 @@ def _handle_admission_preview(
     )
 
 
+def _risk_report(resource_id: str) -> dict[str, object]:
+    """Build one risk-score record for ``resource_id``.
+
+    Shared by the per-resource risk view and the global risk summary so
+    both answers always come from the very same scoring inputs and rules:
+    recorded alerts, SBOM / license / provenance / signature evidence,
+    lifecycle state and the license allowlist of the resource's own policy
+    (falling back to the global default policy). Read-only and computed on
+    the fly; nothing is recorded.
+    """
+
+    license_record = sbom_store.get_license(resource_id)
+    policy = policy_store.get(resource_id)
+    if policy is None:
+        # Without a resource policy the license allowlist comes from the
+        # global default policy, if one is registered.
+        policy = default_policy_store.get()
+    score = compute_risk_score(
+        severities=[
+            alert.severity
+            for alert in vulnerability_store.list_for(resource_id)
+        ],
+        has_sbom=sbom_store.get_sbom(resource_id) is not None,
+        has_license=license_record is not None,
+        has_provenance=provenance_store.get(resource_id) is not None,
+        has_signature=signature_store.get(resource_id) is not None,
+        lifecycle_state=lifecycle_store.get(resource_id).state,
+        license_allowlist=(
+            policy.license_allowlist if policy is not None else ()
+        ),
+        license_spdx_id=(
+            license_record.spdx_id if license_record is not None else None
+        ),
+    )
+    return {"id": resource_id, "score": score, "level": risk_level(score)}
+
+
 def _handle_risk(
     method: str,
     environ: dict[str, Any],
@@ -3519,33 +3556,53 @@ def _handle_risk(
         )
 
     # Read-only, computed on the fly: the score is never recorded anywhere.
-    license_record = sbom_store.get_license(raw_id)
-    policy = policy_store.get(raw_id)
-    if policy is None:
-        # Without a resource policy the license allowlist comes from the
-        # global default policy, if one is registered.
-        policy = default_policy_store.get()
-    score = compute_risk_score(
-        severities=[
-            alert.severity for alert in vulnerability_store.list_for(raw_id)
-        ],
-        has_sbom=sbom_store.get_sbom(raw_id) is not None,
-        has_license=license_record is not None,
-        has_provenance=provenance_store.get(raw_id) is not None,
-        has_signature=signature_store.get(raw_id) is not None,
-        lifecycle_state=lifecycle_store.get(raw_id).state,
-        license_allowlist=(
-            policy.license_allowlist if policy is not None else ()
-        ),
-        license_spdx_id=(
-            license_record.spdx_id if license_record is not None else None
-        ),
-    )
-
     return _json_response(
         start_response,
         "200 OK",
-        {"id": raw_id, "score": score, "level": risk_level(score)},
+        _risk_report(raw_id),
+        trailing_newline=True,
+    )
+
+
+def _handle_risk_summary(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # One record per registered resource in registration order, each with
+    # the same fields and key order as the per-resource risk view. Nothing
+    # is recorded and no state is touched; an empty registry is a valid
+    # empty array.
+    reports = [_risk_report(resource.id) for resource in store.list_all()]
+    return _json_response(
+        start_response,
+        "200 OK",
+        reports,
         trailing_newline=True,
     )
 
@@ -5611,6 +5668,11 @@ def application(
 
         if path == "/promotion/blockers":
             return _handle_promotion_blockers(method, environ, start_response)
+
+        if path == "/risk":
+            # Global risk summary; the handler answers the 405 (Allow: GET)
+            # for every other method.
+            return _handle_risk_summary(method, environ, start_response)
 
         if path.startswith("/advisories/"):
             # The identifier segment is validated by the handler; an
