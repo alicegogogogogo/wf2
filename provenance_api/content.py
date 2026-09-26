@@ -79,6 +79,37 @@ class ContentStore:
         session = self._sessions.get(resource_id)
         return session is not None and session.complete
 
+    def reset_session(self, resource_id: str) -> tuple[str, int]:
+        """Tear an in-progress upload session back to the unstarted state.
+
+        Received chunks, the fixed total chunk count and the bound target
+        digest are all discarded together, so a later upload may open with a
+        different total and digest (still checked against the resource
+        registration by the caller). Returns ``(digest, removed_chunks)``
+        echoing the cleared session's target digest and the number of
+        distinct chunks held. Raises :class:`ContentError` with
+        ``chunks_not_started`` when no chunk has ever been accepted, or
+        ``content_already_complete`` after assembly; a completed session is
+        never torn down and its finalized bytes stay untouched.
+        """
+
+        session = self._sessions.get(resource_id)
+        if session is None:
+            raise ContentError(
+                "chunks_not_started",
+                "No chunk upload has been started for this resource.",
+            )
+        if session.complete:
+            raise ContentError(
+                "content_already_complete",
+                "Content for this resource is already complete.",
+            )
+
+        digest = session.digest
+        removed = len(session.chunks)
+        del self._sessions[resource_id]
+        return digest, removed
+
     def add_chunk(
         self,
         resource_id: str,

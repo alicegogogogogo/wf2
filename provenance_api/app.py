@@ -1264,6 +1264,60 @@ def _handle_chunks_status(
     )
 
 
+def _handle_chunks_reset(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "DELETE":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="DELETE",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    try:
+        digest, removed = content_store.reset_session(raw_id)
+    except ContentError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"id": raw_id, "digest": digest, "removed_chunks": removed},
+        trailing_newline=True,
+    )
+
+
 def _handle_assemble(
     method: str,
     environ: dict[str, Any],
@@ -5229,10 +5283,11 @@ def application(
                     start_response,
                 )
             if separator and tail == "chunks":
-                # The collection itself cannot be addressed: a chunk index is
-                # required, so POST is a bad request and other methods 405.
-                return _handle_chunk(
-                    method, environ, head, "", start_response
+                # The collection path without a chunk index is the upload
+                # session reset path: DELETE only; every other method is a
+                # 405 whose Allow header names DELETE alone.
+                return _handle_chunks_reset(
+                    method, environ, head, start_response
                 )
             if separator and suffix.endswith("/verify"):
                 # The id segment itself contained a path separator; let the
@@ -5247,6 +5302,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/chunks/status")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/chunks"):
+                # Fallback for a separator inside the id segment so the
+                # reset handler rejects it without tearing down any session.
+                return _handle_chunks_reset(
+                    method,
+                    environ,
+                    suffix[: -len("/chunks")],
                     start_response,
                 )
             if separator and "/chunks/" in suffix:

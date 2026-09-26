@@ -510,21 +510,25 @@ class ChunkFlowTests(unittest.TestCase):
                 self.assertEqual(body["error"], "method_not_allowed")
                 self.assertIn(("Allow", allow), headers)
 
-    def test_chunk_collection_without_index_is_bad_request_on_post(self) -> None:
+    def test_chunk_collection_is_reset_path_delete_only(self) -> None:
         resource_id = self._create(DIGEST_A)
-        status, _h, body = call_json(
-            "POST",
-            f"/resources/{resource_id}/chunks",
-            b"x",
-            headers=chunk_headers(2, DIGEST_A),
-        )
-        self.assertEqual(status, "400 Bad Request")
-        self.assertEqual(body["error"], "invalid_request")
-        status, headers, body = call_json(
-            "GET", f"/resources/{resource_id}/chunks"
-        )
-        self.assertEqual(status, "405 Method Not Allowed")
-        self.assertIn(("Allow", "POST"), headers)
+        # The collection path without an index is the reset path: it accepts
+        # DELETE only, so a POST that omits the index is a 405 rather than a
+        # chunk upload, and the Allow header names DELETE alone.
+        for method in ("POST", "GET", "PUT", "PATCH"):
+            with self.subTest(method=method):
+                kwargs: dict[str, object] = {}
+                if method == "POST":
+                    kwargs["headers"] = chunk_headers(2, DIGEST_A)
+                status, headers, body = call_json(
+                    method,
+                    f"/resources/{resource_id}/chunks",
+                    b"x" if method == "POST" else b"",
+                    **kwargs,
+                )
+                self.assertEqual(status, "405 Method Not Allowed")
+                self.assertEqual(body["error"], "method_not_allowed")
+                self.assertIn(("Allow", "DELETE"), headers)
 
     # --- Assembly ----------------------------------------------------------
 
@@ -888,6 +892,280 @@ class ChunkFlowTests(unittest.TestCase):
                 self.assertEqual(status, "405 Method Not Allowed")
                 self.assertEqual(body["error"], "method_not_allowed")
                 self.assertIn(("Allow", "GET"), headers)
+
+    # --- Session reset -----------------------------------------------------
+
+    def test_reset_mid_upload_returns_echo_and_clears_session(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(3, DIGEST_A),
+        )
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/2",
+            b"c",
+            headers=chunk_headers(3, DIGEST_A),
+        )
+        status, headers, raw = call(
+            "DELETE", f"/resources/{resource_id}/chunks"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertIn(
+            ("Content-Type", "application/json; charset=utf-8"), headers
+        )
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertFalse(raw.endswith(b"\n\n"))
+        body = json.loads(raw)
+        self.assertEqual(body["id"], resource_id)
+        self.assertEqual(body["digest"], DIGEST_A)
+        self.assertEqual(body["removed_chunks"], 2)
+        # Compact JSON and the documented fixed key order.
+        text = raw.decode("utf-8").rstrip("\n")
+        self.assertNotIn(" ", text)
+        self.assertLess(text.index('"id"'), text.index('"digest"'))
+        self.assertLess(
+            text.index('"digest"'), text.index('"removed_chunks"')
+        )
+        # No half record remains: status is back to the unstarted 409.
+        self.assertNotIn(resource_id, content_store._sessions)
+        status, _h, payload = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(payload["error"], "chunks_not_started")
+
+    def test_reset_accepts_missing_or_zero_content_length(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(2, DIGEST_A),
+        )
+        for kwargs in (
+            {"content_length": 0},
+            {"omit_content_length": True},
+        ):
+            with self.subTest(kwargs=kwargs):
+                # Re-open a session before each reset attempt.
+                call(
+                    "POST",
+                    f"/resources/{resource_id}/chunks/0",
+                    b"a",
+                    headers=chunk_headers(2, DIGEST_A),
+                )
+                status, _h, body = call_json(
+                    "DELETE",
+                    f"/resources/{resource_id}/chunks",
+                    **kwargs,
+                )
+                self.assertEqual(status, "200 OK")
+                self.assertEqual(body["removed_chunks"], 1)
+
+    def test_reset_allows_reupload_with_new_binding_from_zero(self) -> None:
+        # Registered digest is fixed; the new session may use a different
+        # total while indices restart at zero and the target still matches
+        # the registered digest.
+        digest = hashlib.sha256(b"abcd").hexdigest()
+        resource_id = self._create(digest)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"ab",
+            headers=chunk_headers(2, digest),
+        )
+        status, _h, body = call_json(
+            "DELETE", f"/resources/{resource_id}/chunks"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["removed_chunks"], 1)
+
+        for index, part in enumerate((b"a", b"b", b"cd")):
+            status, _h, _b = call(
+                "POST",
+                f"/resources/{resource_id}/chunks/{index}",
+                part,
+                headers=chunk_headers(3, digest),
+            )
+            self.assertEqual(status, "201 Created")
+        status, _h, body = call_json(
+            "POST", f"/resources/{resource_id}/assemble"
+        )
+        self.assertEqual(status, "201 Created")
+        self.assertEqual(body["size"], 4)
+
+    def test_reset_keeps_digest_conflict_guard_for_new_session(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(2, DIGEST_A),
+        )
+        status, _h, _b = call_json(
+            "DELETE", f"/resources/{resource_id}/chunks"
+        )
+        self.assertEqual(status, "200 OK")
+        # A target digest other than the registered one is still refused.
+        status, _h, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"x",
+            headers=chunk_headers(1, DIGEST_B),
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "digest_conflict")
+        self.assertNotIn(resource_id, content_store._sessions)
+
+    def test_reset_before_start_is_chunks_not_started(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, _h, body = call_json(
+            "DELETE", f"/resources/{resource_id}/chunks"
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "chunks_not_started")
+        # Nothing is recorded by the failed reset.
+        self.assertNotIn(resource_id, content_store._sessions)
+
+    def test_reset_after_complete_is_refused_and_bytes_untouched(self) -> None:
+        resource_id, digest = self._chunks([b"ab", b"cd"])
+        call("POST", f"/resources/{resource_id}/assemble")
+        status, _h, body = call_json(
+            "DELETE", f"/resources/{resource_id}/chunks"
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "content_already_complete")
+        # Finalized bytes and session status are exactly as before.
+        status, _h, raw = call(
+            "GET", f"/resources/{resource_id}/content"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(raw, b"abcd")
+        status, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertIs(body["complete"], True)
+        self.assertEqual(body["digest"], digest)
+        self.assertEqual(body["size"], 4)
+
+    def test_reset_after_digest_mismatch_clears_retained_chunks(self) -> None:
+        registered = hashlib.sha256(b"abc").hexdigest()
+        resource_id = self._create(registered)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"abd",
+            headers=chunk_headers(1, registered),
+        )
+        status, _h, body = call_json(
+            "POST", f"/resources/{resource_id}/assemble"
+        )
+        self.assertEqual(body["error"], "digest_mismatch")
+        status, _h, body = call_json(
+            "DELETE", f"/resources/{resource_id}/chunks"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["digest"], registered)
+        self.assertEqual(body["removed_chunks"], 1)
+        status, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "chunks_not_started")
+
+    def test_reset_rejects_body_query_and_bad_id(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(2, DIGEST_A),
+        )
+        # A declared non-empty or malformed body is a bad request.
+        for declared in ("3", "-1", "1.5", "abc"):
+            with self.subTest(declared=declared):
+                status, _h, body = call_json(
+                    "DELETE",
+                    f"/resources/{resource_id}/chunks",
+                    body=b"abc",
+                    content_length=declared,
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+        # Query parameters are a bad request.
+        status, _h, body = call_json(
+            "DELETE",
+            f"/resources/{resource_id}/chunks",
+            query_string="x=1",
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+        # Empty or separator-bearing ids are bad requests, including via the
+        # embedded-separator fallback route.
+        for path in (
+            "/resources//chunks",
+            "/resources/a/b/chunks",
+            "/resources/a\\b/chunks",
+        ):
+            with self.subTest(path=path):
+                status, _h, body = call_json("DELETE", path)
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+        # The rejected resets changed nothing: the one chunk is still held.
+        status, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(body["received_chunks"], 1)
+
+    def test_reset_unknown_resource_is_404_without_state_change(self) -> None:
+        status, _h, body = call_json(
+            "DELETE", "/resources/missing/chunks"
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "resource_not_found")
+        self.assertEqual(content_store._sessions, {})
+
+    def test_reset_non_delete_methods_405_with_allow_delete(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        for method in ("GET", "POST", "PUT", "PATCH"):
+            with self.subTest(method=method):
+                status, headers, body = call_json(
+                    method, f"/resources/{resource_id}/chunks"
+                )
+                self.assertEqual(status, "405 Method Not Allowed")
+                self.assertEqual(body["error"], "method_not_allowed")
+                self.assertIn(("Allow", "DELETE"), headers)
+
+    def test_reset_is_isolated_per_resource(self) -> None:
+        resource_a, digest_a = self._chunks([b"aa"])
+        resource_b = self._create(hashlib.sha256(b"bb").hexdigest())
+        call(
+            "POST",
+            f"/resources/{resource_b}/chunks/0",
+            b"bb",
+            headers=chunk_headers(1, hashlib.sha256(b"bb").hexdigest()),
+        )
+        status, _h, body = call_json(
+            "DELETE", f"/resources/{resource_b}/chunks"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["removed_chunks"], 1)
+        # A's in-progress session survives B's reset and still assembles.
+        status, _h, _b = call_json(
+            "POST", f"/resources/{resource_a}/assemble"
+        )
+        self.assertEqual(status, "201 Created")
+        _s, _h, raw_a = call("GET", f"/resources/{resource_a}/content")
+        self.assertEqual(raw_a, b"aa")
+        self.assertEqual(digest_a, hashlib.sha256(b"aa").hexdigest())
+        status, _h, body = call_json(
+            "GET", f"/resources/{resource_b}/chunks/status"
+        )
+        self.assertEqual(body["error"], "chunks_not_started")
 
     # --- Isolation ---------------------------------------------------------
 

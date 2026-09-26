@@ -233,7 +233,7 @@ curl -s -X POST http://127.0.0.1:8000/resources/$A/dependencies \
 - 请求体缺失、不是合法 UTF-8 JSON、顶层不是 JSON 对象、缺少 `dependency_id`、`dependency_id` 不是字符串/为空/含分隔符，或出现未知字段，均返回 HTTP 400（错误码 `invalid_request`）。
 - 这些接口不接受查询参数；出现任意查询参数返回 HTTP 400（错误码 `invalid_request`）。
 - 起点不存在时，两个查询接口都返回 HTTP 404（错误码 `resource_not_found`），且不改变状态。
-- 对 `/resources/{id}/dependencies` 使用 `GET`、`POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET, POST`）；对 `/resources/{id}/impact` 使用 `GET` 之外的方法返回 HTTP 405（`Allow: GET`）。
+- 对 `/resources/{id}/dependencies` 使用 `GET`、`POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET, POST`）；对 `/resources/{id}/dependencies/{dependency_id}` 使用 `DELETE` 之外的方法返回 HTTP 405（`Allow: DELETE`）；对 `/resources/{id}/impact` 使用 `GET` 之外的方法返回 HTTP 405（`Allow: GET`）。
 - 任何非法请求都不会新增或修改资源、关系或分页游标。
 
 
@@ -373,6 +373,36 @@ curl -s "http://127.0.0.1:8000/resources/$ID/chunks/status"
 
 组装成功后再次查询仍为 HTTP 200：`missing_chunks` 为空数组、`complete` 为 `true`、`size` 为成品实际字节长度。组装因摘要不符（`digest_mismatch`）失败后，已收分块继续保留：查询仍返回 HTTP 200、`missing_chunks` 为空、`complete` 为 `false`、`size` 为 `null`，不会误报完成，也不会生成成品。
 
+### 重置上传会话：`DELETE /resources/{id}/chunks`
+
+入口挂在分块上传路径去掉序号的那一段上（即分块集合本身），只接受 `DELETE` 方法。请求不得携带任何查询参数，也不得声明非空请求体（显式 `Content-Length: 0` 视为空体）。重置把该资源已收分块、首个分块确定的总块数与目标摘要绑定一并清掉，会话整体回到**尚未开始**的状态：不留下半条记录。之后可以用不同的总块数与目标摘要重新开传，序号依旧从 `0` 开始收齐；新目标摘要仍须与资源登记摘要一致，不一致仍按分块上传的既有口径（`digest_conflict`）拒绝写入。
+
+成功返回 HTTP 200，响应体为一行紧凑 UTF-8 JSON，键序固定（`id`、`digest`、`removed_chunks`）并以单个换行结束：
+
+```bash
+curl -s -X DELETE "http://127.0.0.1:8000/resources/$ID/chunks"
+```
+
+```json
+{"id":"<资源 id>","digest":"<被清掉会话的目标摘要>","removed_chunks":2}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 资源标识 |
+| `digest` | 被清掉会话此前绑定的目标摘要（小写） |
+| `removed_chunks` | 本次清掉的不同序号分块数量（幂等重复提交不重复计数） |
+
+边界与错误：
+
+- 资源存在但**从未开始上传**（没有任何分块被接受）时返回 HTTP 409（错误码 `chunks_not_started`），不改动任何状态。
+- 已经组装完成的会话不得重置：返回 HTTP 409（错误码 `content_already_complete`）；成品字节保持原样，成品读取与会话状态查询的既有结果都不受影响。
+- 组装因摘要不符（`digest_mismatch`）失败后，已收分块仍可照常补传，也可以直接重置整场会话。
+- 重置成功后再查询会话状态，回到尚未开始的既有 409 口径（`chunks_not_started`），不留任何会话痕迹。
+- 请求声明了非空（或非法）请求体、携带任意查询参数，返回 HTTP 400（错误码 `invalid_request`）；路径标识为空或含 `/`、`\\` 同样返回 HTTP 400。
+- 标识合法但资源不存在时返回 HTTP 404（错误码 `resource_not_found`），且不改动任何状态。
+- `DELETE` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow` 头只给出 `DELETE`）。
+
 ### 读取成品：`GET /resources/{id}/content`
 
 - 成功时返回 HTTP 200，响应体**只包含成品的原始字节**（无 JSON 包装、无末尾换行），`Content-Type: application/octet-stream`，`Content-Length` 为准确字节数；空成品对应 `Content-Length: 0` 与空响应体。
@@ -391,7 +421,7 @@ curl -s "http://127.0.0.1:8000/resources/$ID/content" --output artifact.bin
 - `Content-Type` 不是 `application/octet-stream`，返回 HTTP 400（错误码 `invalid_request`）。
 - 缺少 `Content-Length`、其值不是非负十进制整数，或实际字节数不足声明长度，返回 HTTP 400（错误码 `invalid_request`）；失败请求不会留下分块片段。
 - 资源不存在返回 HTTP 404（错误码 `resource_not_found`）。
-- 方法限制：`/resources/{id}/chunks/{index}` 与 `/resources/{id}/assemble` 仅允许 `POST`（`Allow: POST`）；`/resources/{id}/content` 与 `/resources/{id}/chunks/status` 仅允许 `GET`（`Allow: GET`）；其他方法返回 HTTP 405（错误码 `method_not_allowed`）。
+- 方法限制：`/resources/{id}/chunks/{index}` 与 `/resources/{id}/assemble` 仅允许 `POST`（`Allow: POST`）；`/resources/{id}/content` 与 `/resources/{id}/chunks/status` 仅允许 `GET`（`Allow: GET`）；`/resources/{id}/chunks` 仅允许 `DELETE`（`Allow: DELETE`）；其他方法返回 HTTP 405（错误码 `method_not_allowed`）。
 - `/resources/{id}/chunks/status` 额外约定：资源存在但尚未开始上传时返回 HTTP 409（错误码 `chunks_not_started`）；该查询只读，任何情况下都不会新增会话、分块或成品。
 - 除 JSON 错误响应外，成品读取成功时只返回原始字节。
 
