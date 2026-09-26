@@ -54,6 +54,7 @@ from .notifications import (
     build_notification_fields,
 )
 from .policies import (
+    DefaultPolicyStore,
     PolicyError,
     PolicyStore,
     PolicyValidationError,
@@ -132,6 +133,10 @@ provenance_store = ProvenanceStore()
 #: persisted and never materialized as records.
 policy_store = PolicyStore()
 
+#: Process-local global default admission policy; a single record consulted
+#: only for resources without their own policy, never persisted.
+default_policy_store = DefaultPolicyStore()
+
 #: Process-local notification records; cleared on restart like the rest.
 notification_store = NotificationStore()
 
@@ -169,6 +174,7 @@ def reset_state() -> None:
     sbom_store.reset()
     provenance_store.reset()
     policy_store.reset()
+    default_policy_store.reset()
     notification_store.reset()
     cache_store.reset()
     mirror_store.reset()
@@ -2592,6 +2598,111 @@ def _handle_policies(
     )
 
 
+def _handle_default_policy_post(
+    environ: dict[str, Any], start_response: StartResponse
+) -> Iterable[bytes]:
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Validate the whole body before touching the store, so a bad request
+    # can never leave a partial policy.
+    try:
+        build_policy_fields(payload)
+    except PolicyValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    try:
+        record, created = default_policy_store.add(payload)
+    except PolicyError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    # The echo is the policy content alone; no resource identifier exists
+    # for the global default.
+    return _json_response(
+        start_response,
+        "201 Created" if created else "200 OK",
+        record.to_policy_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_default_policy_get(
+    environ: dict[str, Any], start_response: StartResponse
+) -> Iterable[bytes]:
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    record = default_policy_store.get()
+    if record is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "policy_not_found",
+            "No global default policy is registered.",
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        record.to_policy_dict(),
+        trailing_newline=True,
+    )
+
+
+def _handle_default_policy(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_default_policy_post(environ, start_response)
+    if method == "GET":
+        return _handle_default_policy_get(environ, start_response)
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="GET, POST",
+    )
+
+
 def _admission_body_error(environ: dict[str, Any]) -> str | None:
     """Reject an admission request that declares or carries a body."""
 
@@ -2670,6 +2781,10 @@ def _handle_admission(
 
     policy = policy_store.get(raw_id)
     if policy is None:
+        # Resources without their own policy fall back to the single
+        # global default policy; the evaluation itself is unchanged.
+        policy = default_policy_store.get()
+    if policy is None:
         return _error(
             start_response,
             "404 Not Found",
@@ -2736,6 +2851,10 @@ def _handle_admission_preview(
         )
 
     policy = policy_store.get(raw_id)
+    if policy is None:
+        # Same fallback as the admission evaluation: the global default
+        # policy applies when the resource has none of its own.
+        policy = default_policy_store.get()
     if policy is None:
         return _error(
             start_response,
@@ -2821,6 +2940,10 @@ def _handle_risk(
     # Read-only, computed on the fly: the score is never recorded anywhere.
     license_record = sbom_store.get_license(raw_id)
     policy = policy_store.get(raw_id)
+    if policy is None:
+        # Without a resource policy the license allowlist comes from the
+        # global default policy, if one is registered.
+        policy = default_policy_store.get()
     score = compute_risk_score(
         severities=[
             alert.severity for alert in vulnerability_store.list_for(raw_id)
@@ -4804,6 +4927,9 @@ def application(
                 f"Method {method} is not allowed for this path.",
                 allowed="GET, POST",
             )
+
+        if path == "/policies":
+            return _handle_default_policy(method, environ, start_response)
 
         if path == "/cache":
             return _handle_cache_root(method, environ, start_response)

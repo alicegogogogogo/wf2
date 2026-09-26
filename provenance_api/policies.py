@@ -19,6 +19,10 @@ contributes ``license_denied``. Any recorded alert above the policy's
 severity ceiling contributes ``severity_exceeded``. When several
 groups fire, their codes are ordered as state, evidence, license and
 then severity.
+
+A single global default policy may also be registered; it shares the
+field set and validation of a per-resource policy and is consulted only
+for resources that have no policy of their own.
 """
 
 from __future__ import annotations
@@ -87,6 +91,16 @@ class PolicyRecord:
     evidence_requirements: tuple[str, ...]
     license_allowlist: tuple[str, ...]
     max_severity: str
+
+    def to_policy_dict(self) -> dict[str, object]:
+        """The policy content alone, without any resource identifier."""
+
+        return {
+            "name": self.name,
+            "evidence_requirements": list(self.evidence_requirements),
+            "license_allowlist": list(self.license_allowlist),
+            "max_severity": self.max_severity,
+        }
 
     def to_dict(self, resource_id: str) -> dict[str, object]:
         return {
@@ -239,6 +253,55 @@ class PolicyStore:
 
     def get(self, resource_id: str) -> PolicyRecord | None:
         return self._records.get(resource_id)
+
+
+class DefaultPolicyStore:
+    """Process-local storage of the single global default admission policy.
+
+    At most one default policy exists at any time. It uses the exact same
+    fields and validation as a per-resource policy and is only consulted
+    for resources that have no policy of their own. Like everything else
+    it lives in process memory only and is never persisted.
+    """
+
+    def __init__(self) -> None:
+        self._record: PolicyRecord | None = None
+
+    def reset(self) -> None:
+        self._record = None
+
+    def add(self, payload: object) -> tuple[PolicyRecord, bool]:
+        """Validate and record the global default policy.
+
+        Returns ``(record, created)`` where ``created`` is ``True`` for the
+        first registration (HTTP 201) and ``False`` for an idempotent
+        resubmission of the exact same content (HTTP 200). Any different
+        content raises :class:`PolicyError` with code ``policy_conflict``
+        and the stored record is never overwritten.
+        """
+
+        name, evidence, allowlist, max_severity = build_policy_fields(payload)
+        record = PolicyRecord(
+            name=name,
+            evidence_requirements=evidence,
+            license_allowlist=allowlist,
+            max_severity=max_severity,
+        )
+
+        existing = self._record
+        if existing is not None:
+            if existing == record:
+                return existing, False
+            raise PolicyError(
+                "policy_conflict",
+                "A different global default policy is already registered.",
+            )
+
+        self._record = record
+        return record, True
+
+    def get(self) -> PolicyRecord | None:
+        return self._record
 
 
 def evaluate_policy(
