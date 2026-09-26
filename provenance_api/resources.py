@@ -335,6 +335,29 @@ class ResourceStore:
         self._dependencies[resource_id].add(dependency_id)
         self._dependents[dependency_id].add(resource_id)
 
+    def remove_dependency(self, resource_id: str, dependency_id: str) -> None:
+        """Remove the direct edge ``resource_id`` -> ``dependency_id``.
+
+        Only this one edge disappears from both graph views; both
+        resources, every other edge and all derived records are left
+        untouched, so relations that stay reachable through other paths
+        keep showing up in the read views. Raises
+        :class:`DependencyError` with code ``dependency_not_found`` when
+        no such direct edge exists -- including when the dependency id is
+        unknown or was already unregistered.
+        """
+
+        dependencies = self._dependencies.get(resource_id)
+        if dependencies is None or dependency_id not in dependencies:
+            raise DependencyError(
+                "dependency_not_found",
+                "No such dependency relation exists.",
+            )
+        dependencies.discard(dependency_id)
+        dependents = self._dependents.get(dependency_id)
+        if dependents is not None:
+            dependents.discard(resource_id)
+
     def list_dependencies(self, resource_id: str) -> list[str]:
         """Return every reachable dependency id in registration order."""
 

@@ -798,6 +798,75 @@ def _handle_dependencies(
     )
 
 
+def _handle_dependency_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_dependency_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "DELETE":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="DELETE",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    if (
+        not raw_dependency_id
+        or "/" in raw_dependency_id
+        or "\\" in raw_dependency_id
+    ):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Dependency id must not be empty or contain path separators.",
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Only the one direct edge is removed; both resources, every other
+    # edge and all derived records stay exactly as they are.
+    try:
+        store.remove_dependency(raw_id, raw_dependency_id)
+    except DependencyError as exc:
+        return _error(
+            start_response, "404 Not Found", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"resource_id": raw_id, "dependency_id": raw_dependency_id},
+        trailing_newline=True,
+    )
+
+
 def _handle_impact(
     method: str,
     environ: dict[str, Any],
@@ -5018,6 +5087,14 @@ def application(
                 return _handle_dependencies(
                     method, environ, head, start_response
                 )
+            if separator and tail.startswith("dependencies/"):
+                return _handle_dependency_item(
+                    method,
+                    environ,
+                    head,
+                    tail[len("dependencies/"):],
+                    start_response,
+                )
             if separator and tail == "impact":
                 return _handle_impact(
                     method, environ, head, start_response
@@ -5340,6 +5417,20 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/dependency-vulnerability-impact")],
+                    start_response,
+                )
+            if separator and "/dependencies/" in suffix:
+                # Fallback for a separator inside the id segment of a
+                # dependency item path so the handler rejects it without
+                # removing any edge.
+                malformed_id, _, raw_dependency_id = suffix.rpartition(
+                    "/dependencies/"
+                )
+                return _handle_dependency_item(
+                    method,
+                    environ,
+                    malformed_id,
+                    raw_dependency_id,
                     start_response,
                 )
             if separator and suffix.endswith("/cross-references"):

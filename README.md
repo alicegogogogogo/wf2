@@ -174,6 +174,28 @@ curl -s -X POST http://127.0.0.1:8000/resources/$A/dependencies \
 - 已经间接可达、但尚不存在的直接边不算重复也不算环，仍以 HTTP 201 建立。
 - 起点资源或 `dependency_id` 指向的资源不存在时返回 HTTP 404（错误码 `resource_not_found`），不会自动建资源。
 
+### 解除依赖：`DELETE /resources/{id}/dependencies/{dependency_id}`
+
+解除路径中起点资源（`resource_id`）到末段被依赖资源（`dependency_id`）的**这一条直接依赖边**，只接受 `DELETE` 方法。成功返回 HTTP 200，响应体按登记响应的键序回显这条关系，紧凑 JSON 并以单个换行结束：
+
+```bash
+curl -s -X DELETE http://127.0.0.1:8000/resources/$A/dependencies/$B
+```
+
+```json
+{"resource_id":"<资源 A 的 id>","dependency_id":"<资源 B 的 id>"}
+```
+
+- 删除只作用于图上这一条直接边：两个资源的登记内容与各条派生记录（告警、豁免、SBOM、溯源、策略、签名、通知、生命周期、内容、跨仓库引用等）一律不动。
+- 被删的边不再参与依赖查询、影响分析、晋级阻塞明细与依赖漏洞传导这四类视图；这些视图都按剩余的边即时重算，间接可达却因其他路径保留的关系照常出现。
+- 删除之后再登记同一方向的关系会重新建立这条边，按既有 HTTP 201 口径返回。
+- 由跨仓库引用建立的边也按同样的直接边移除，引用记录与远端本地资源保持不变；之后重提同一引用仍按既有重复登记拒绝（HTTP 409，`duplicate_reference`），也不会自动把这条边重建回来。
+- 路径里任一标识为空或含 `/`、`\\` 时返回 HTTP 400（错误码 `invalid_request`）；请求带任意查询参数或声明了非空请求体，同样返回 HTTP 400。
+- 起点资源不存在时返回 HTTP 404（错误码 `resource_not_found`），且不改动任何既有状态。
+- 没有这条直接边，或被依赖资源已注销时，返回 HTTP 404（错误码 `dependency_not_found`）；重复删除同一关系也是同样的未找到结果，不会影响其他关系、资源与游标。
+- `DELETE` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: DELETE`）。
+- 删除成功后资源列表与筛选分页的既有创建顺序不变，此前签发的列表游标继续可用。
+
 ### 查询依赖：`GET /resources/{id}/dependencies`
 
 返回起点资源**可达的全部依赖**（直接与间接），形状为：
@@ -214,7 +236,7 @@ curl -s -X POST http://127.0.0.1:8000/resources/$A/dependencies \
 - 请求体缺失、不是合法 UTF-8 JSON、顶层不是 JSON 对象、缺少 `dependency_id`、`dependency_id` 不是字符串/为空/含分隔符，或出现未知字段，均返回 HTTP 400（错误码 `invalid_request`）。
 - 这些接口不接受查询参数；出现任意查询参数返回 HTTP 400（错误码 `invalid_request`）。
 - 起点不存在时，两个查询接口都返回 HTTP 404（错误码 `resource_not_found`），且不改变状态。
-- 对 `/resources/{id}/dependencies` 使用 `GET`、`POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET, POST`）；对 `/resources/{id}/impact` 使用 `GET` 之外的方法返回 HTTP 405（`Allow: GET`）。
+- 对 `/resources/{id}/dependencies` 使用 `GET`、`POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET, POST`）；对 `/resources/{id}/dependencies/{dependency_id}` 使用 `DELETE` 之外的方法返回 HTTP 405（`Allow: DELETE`）；对 `/resources/{id}/impact` 使用 `GET` 之外的方法返回 HTTP 405（`Allow: GET`）。
 - 任何非法请求都不会新增或修改资源、关系或分页游标。
 
 
