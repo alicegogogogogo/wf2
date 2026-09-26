@@ -2683,6 +2683,56 @@ def _handle_vulnerability_exceptions(
     )
 
 
+def _handle_global_vulnerability_exceptions(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current stores: groups unfold in resource
+    # registration order, and within one resource the exemptions keep their
+    # own registration order. Each record puts the owning resource id first,
+    # followed by the same fields (and key order) as a single-resource entry.
+    # Whether a resource still exists is never an error condition; nothing is
+    # recorded and no state is touched.
+    exceptions: list[dict[str, object]] = []
+    for resource in store.list_all():
+        for record in vulnerability_exception_store.list_for(resource.id):
+            exceptions.append(
+                {"resource_id": resource.id, **record.to_dict()}
+            )
+    return _json_response(
+        start_response,
+        "200 OK",
+        exceptions,
+        trailing_newline=True,
+    )
+
+
 def _handle_sbom_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -5668,6 +5718,13 @@ def application(
 
         if path == "/promotion/blockers":
             return _handle_promotion_blockers(method, environ, start_response)
+
+        if path == "/vulnerability-exceptions":
+            # Global exemption summary; the handler answers the 405
+            # (Allow: GET) for every other method.
+            return _handle_global_vulnerability_exceptions(
+                method, environ, start_response
+            )
 
         if path == "/risk":
             # Global risk summary; the handler answers the 405 (Allow: GET)
