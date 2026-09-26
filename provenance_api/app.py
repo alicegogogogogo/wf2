@@ -1093,6 +1093,48 @@ def _handle_graph(
     )
 
 
+def _handle_graph_stats(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # Like the snapshot, the statistics view is read-only: a declared
+    # non-empty (or malformed) body is a bad request without consulting any
+    # business data. An omitted header and an explicit zero length count as
+    # an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current registry; manual and
+    # cross-reference-resolved edges are counted alike, and nothing is
+    # recorded or cached.
+    return _json_response(
+        start_response,
+        "200 OK",
+        store.graph_stats(),
+        trailing_newline=True,
+    )
+
+
 def _read_declared_body(environ: dict[str, Any]) -> tuple[bytes | None, str | None]:
     """Read exactly the declared request body for content verification.
 
@@ -5445,6 +5487,9 @@ def application(
 
         if path == "/graph":
             return _handle_graph(method, environ, start_response)
+
+        if path == "/graph/stats":
+            return _handle_graph_stats(method, environ, start_response)
 
         if path.startswith("/advisories/"):
             # The identifier segment is validated by the handler; an

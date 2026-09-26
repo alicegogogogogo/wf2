@@ -417,3 +417,78 @@ class ResourceStore:
             for resource in self._resources
             for dependency_id in self._dependencies.get(resource.id, ())
         ]
+
+    def graph_stats(self) -> dict[str, object]:
+        """Compute whole-graph statistics from the current registry.
+
+        Counts nodes and direct edges, lists isolated resources, ranks
+        resources by out/in degree and measures the longest dependency
+        chain (in nodes). Manually registered and cross-reference-resolved
+        edges are counted alike, since both flow through
+        :meth:`add_dependency`. Everything is derived on the fly.
+        """
+
+        ids = [resource.id for resource in self._resources]
+        out_degree = {
+            resource_id: len(self._dependencies.get(resource_id, ()))
+            for resource_id in ids
+        }
+        in_degree = {
+            resource_id: len(self._dependents.get(resource_id, ()))
+            for resource_id in ids
+        }
+
+        isolated = [
+            resource_id
+            for resource_id in ids
+            if out_degree[resource_id] == 0 and in_degree[resource_id] == 0
+        ]
+
+        # The graph is a DAG (cycles are rejected at registration time), so
+        # the longest chain is the maximum successor-path depth. The
+        # iterative postorder walk avoids any recursion limit on long
+        # chains; ``depth`` counts nodes, so an isolated node scores one.
+        depth: dict[str, int] = {}
+        for root in ids:
+            stack: list[tuple[str, bool]] = [(root, False)]
+            while stack:
+                node, expanded = stack.pop()
+                if node in depth:
+                    continue
+                successors = self._dependencies.get(node, ())
+                if not expanded:
+                    stack.append((node, True))
+                    for successor in successors:
+                        if successor not in depth:
+                            stack.append((successor, False))
+                    continue
+                depth[node] = (
+                    1
+                    if not successors
+                    else 1 + max(depth[successor] for successor in successors)
+                )
+        max_depth = max((depth[resource_id] for resource_id in ids), default=0)
+
+        def ranking(counts: dict[str, int]) -> list[dict[str, object]]:
+            # ``sorted`` is stable, so equal degrees keep registration order.
+            ordered = sorted(
+                (
+                    (resource_id, counts[resource_id])
+                    for resource_id in ids
+                    if counts[resource_id] > 0
+                ),
+                key=lambda item: -item[1],
+            )
+            return [
+                {"resource_id": resource_id, "degree": degree}
+                for resource_id, degree in ordered
+            ]
+
+        return {
+            "nodes": len(ids),
+            "edges": sum(out_degree.values()),
+            "isolated": isolated,
+            "out_degree": ranking(out_degree),
+            "in_degree": ranking(in_degree),
+            "max_depth": max_depth,
+        }
