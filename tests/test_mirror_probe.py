@@ -338,13 +338,17 @@ class ProbeUpstreamIntegrationTests(unittest.TestCase):
     def _direct_open(self):
         # Loopback targets must be contacted directly: an ambient HTTP
         # proxy would otherwise answer for every closed local port and
-        # make reachability environment-dependent.
+        # make reachability environment-dependent. This patch only swaps
+        # the mirrors module's own network entry point for the duration of
+        # the enclosing call; it never touches the process-global
+        # urllib.request.urlopen, so the substitution cannot leak into or
+        # contaminate any other test case.
         import urllib.request
 
+        from provenance_api import mirrors
+
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        return mock.patch(
-            "provenance_api.mirrors.urllib.request.urlopen", opener.open
-        )
+        return mock.patch.object(mirrors, "_url_open", opener.open)
 
     def test_probe_against_real_local_server(self) -> None:
         server = HTTPServer(("127.0.0.1", 0), _RecordingHandler)

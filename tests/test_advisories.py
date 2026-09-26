@@ -256,7 +256,19 @@ class AdvisorySummaryTests(unittest.TestCase):
         self._alert("second", advisory="ADV-B", severity="low")
 
         _s, _h, body = self._summaries(query_string="severity=HIGH")
-        self.assertEqual([row["advisory"] for row in body], ["ADV-A"])
+        # Normalized to lowercase, and the whole surviving row -- not just
+        # its advisory name -- is verified.
+        self.assertEqual(
+            body,
+            [
+                {
+                    "advisory": "ADV-A",
+                    "affected_resources": [self.ids["first"]],
+                    "advisory_count": 1,
+                    "max_severity": "high",
+                }
+            ],
+        )
 
     def test_severity_filter_first_appearance_uses_matching_alerts(self) -> None:
         # ADV-A's first alert overall is low, but its first high-severity
@@ -297,12 +309,19 @@ class AdvisorySummaryTests(unittest.TestCase):
                 status, headers, body = call_json(method, "/advisories")
                 self.assertEqual(status, "405 Method Not Allowed")
                 self.assertEqual(body["error"], "method_not_allowed")
+                self.assertEqual(
+                    body["message"],
+                    f"Method {method} is not allowed for this path.",
+                )
                 self.assertEqual(dict(headers)["Allow"], "GET")
 
     def test_declared_non_empty_body_returns_400(self) -> None:
         status, _h, body = call_json("GET", "/advisories", {"unexpected": True})
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(
+            body["message"], "This endpoint does not accept a request body."
+        )
 
     def test_malformed_content_length_returns_400(self) -> None:
         status, _h, body = call_json(
@@ -310,6 +329,9 @@ class AdvisorySummaryTests(unittest.TestCase):
         )
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(
+            body["message"], "This endpoint does not accept a request body."
+        )
 
     def test_empty_body_declared_zero_is_accepted(self) -> None:
         status, _h, body = call_json(
@@ -319,11 +341,16 @@ class AdvisorySummaryTests(unittest.TestCase):
         self.assertEqual(body, [])
 
     def test_unknown_query_parameter_returns_400(self) -> None:
-        for qs in ("x=1", "limit=10", "severity=high&foo=bar"):
+        for qs, message in (
+            ("x=1", "Unknown query parameter: 'x'."),
+            ("limit=10", "Unknown query parameter: 'limit'."),
+            ("severity=high&foo=bar", "Unknown query parameter: 'foo'."),
+        ):
             with self.subTest(qs=qs):
                 status, _h, body = self._summaries(query_string=qs)
                 self.assertEqual(status, "400 Bad Request")
                 self.assertEqual(body["error"], "invalid_request")
+                self.assertEqual(body["message"], message)
 
     def test_repeated_severity_returns_400(self) -> None:
         status, _h, body = self._summaries(
@@ -331,6 +358,9 @@ class AdvisorySummaryTests(unittest.TestCase):
         )
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(
+            body["message"], "Query parameter 'severity' must not be repeated."
+        )
 
     def test_empty_or_unknown_severity_returns_400(self) -> None:
         for qs in ("severity=", "severity=urgent", "severity=HIG"):
@@ -338,14 +368,40 @@ class AdvisorySummaryTests(unittest.TestCase):
                 status, _h, body = self._summaries(query_string=qs)
                 self.assertEqual(status, "400 Bad Request")
                 self.assertEqual(body["error"], "invalid_request")
+                self.assertEqual(
+                    body["message"],
+                    "Severity must be one of: critical, high, medium, low "
+                    "(case-insensitive).",
+                )
 
     def test_bad_request_does_not_read_business_data(self) -> None:
-        # A bad query parameter is rejected before aggregation; the response
-        # is the same with or without any recorded alerts.
+        # A bad query parameter is rejected before aggregation; record the
+        # full business state beforehand and prove it is unchanged after.
         self._alert("first", advisory="ADV-A", severity="high")
+        _s, _h, before_alerts = call_json(
+            "GET", f"/resources/{self.ids['first']}/vulnerabilities"
+        )
+        _s, _h, before_advisories = call_json("GET", "/advisories")
+        _s, _h, before_resources = call_json("GET", "/resources")
+
         status, _h, body = self._summaries(query_string="severity=urgent")
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(
+            body["message"],
+            "Severity must be one of: critical, high, medium, low "
+            "(case-insensitive).",
+        )
+
+        _s, _h, after_alerts = call_json(
+            "GET", f"/resources/{self.ids['first']}/vulnerabilities"
+        )
+        _s, _h, after_advisories = call_json("GET", "/advisories")
+        _s, _h, after_resources = call_json("GET", "/resources")
+        self.assertEqual(after_alerts, before_alerts)
+        self.assertEqual(after_advisories, before_advisories)
+        self.assertEqual(after_resources, before_resources)
+        self.assertEqual(len(after_alerts["vulnerabilities"]), 1)
 
     def test_error_body_shape_and_newline(self) -> None:
         status, headers, raw = call("GET", "/advisories", query_string="x=1")

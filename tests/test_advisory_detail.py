@@ -245,13 +245,54 @@ class AdvisoryDetailTests(unittest.TestCase):
         self.assertEqual(body["alerts"][0]["advisory"], "ADV-A")
 
     def test_counts_and_max_severity_match_summary_view(self) -> None:
+        # Independent inputs, fixed up front: alerts land out of resource
+        # order and span every level, so the filtered expectations below
+        # are non-degenerate (each filter drops at least one alert).
         self._alert("second", advisory="ADV-B", severity="medium")
         self._alert("third", advisory="ADV-A", severity="HIGH")
         self._alert("first", advisory="ADV-A", severity="critical", component="o")
         self._alert("first", advisory="ADV-A", severity="low", component="z")
         self._alert("second", advisory="ADV-A", severity="low", component="z")
 
-        for query_string in (None, "severity=LOW", "severity=high"):
+        # Expectations recomputed from the documented rules alone --
+        # detail expands in resource registration order (first, second,
+        # third), keeping submission order inside a resource; count is the
+        # raw number of matching alerts; max follows critical > high >
+        # medium > low.
+        expectations = {
+            None: {
+                "resources": [
+                    self.ids["first"],
+                    self.ids["second"],
+                    self.ids["third"],
+                ],
+                "pairs": [
+                    (self.ids["first"], "o", "critical"),
+                    (self.ids["first"], "z", "low"),
+                    (self.ids["second"], "z", "low"),
+                    (self.ids["third"], "lib", "high"),
+                ],
+                "count": 4,
+                "max": "critical",
+            },
+            "severity=LOW": {
+                "resources": [self.ids["first"], self.ids["second"]],
+                "pairs": [
+                    (self.ids["first"], "z", "low"),
+                    (self.ids["second"], "z", "low"),
+                ],
+                "count": 2,
+                "max": "low",
+            },
+            "severity=high": {
+                "resources": [self.ids["third"]],
+                "pairs": [(self.ids["third"], "lib", "high")],
+                "count": 1,
+                "max": "high",
+            },
+        }
+
+        for query_string, expected in expectations.items():
             with self.subTest(query_string=query_string):
                 _s, _h, detail = self._detail("ADV-A", query_string=query_string)
                 _s, _h, summary = call_json(
@@ -260,16 +301,27 @@ class AdvisoryDetailTests(unittest.TestCase):
                 row = next(
                     r for r in summary if r["advisory"] == "ADV-A"
                 )
-                self.assertEqual(len(detail["alerts"]), row["advisory_count"])
+
                 self.assertEqual(
-                    detail["affected_resources"], row["affected_resources"]
+                    [
+                        (
+                            alert["resource_id"],
+                            alert["component"],
+                            alert["severity"],
+                        )
+                        for alert in detail["alerts"]
+                    ],
+                    expected["pairs"],
                 )
-                severities = [a["severity"] for a in detail["alerts"]]
-                expected_max = min(
-                    severities,
-                    key=lambda s: ("critical", "high", "medium", "low").index(s),
+                self.assertEqual(
+                    detail["affected_resources"], expected["resources"]
                 )
-                self.assertEqual(expected_max, row["max_severity"])
+                self.assertEqual(len(detail["alerts"]), expected["count"])
+                self.assertEqual(row["advisory_count"], expected["count"])
+                self.assertEqual(
+                    row["affected_resources"], expected["resources"]
+                )
+                self.assertEqual(row["max_severity"], expected["max"])
 
     # --- Severity filter ----------------------------------------------------
 
@@ -288,9 +340,37 @@ class AdvisoryDetailTests(unittest.TestCase):
         )
 
     def test_severity_filter_is_case_insensitive(self) -> None:
-        self._alert("first", advisory="ADV-A", severity="high")
-        _s, _h, body = self._detail("ADV-A", query_string="severity=HIGH")
+        self._alert(
+            "first",
+            advisory="ADV-A",
+            severity="HIGH",
+            component="openssl",
+            summary="buffer overflow",
+            fixed_version="3.0.8",
+        )
+        status, _h, body = self._detail("ADV-A", query_string="severity=HIGH")
+        self.assertEqual(status, "200 OK")
+        # The filter matches case-insensitively but the stored level is
+        # always rendered in lowercase, and the full alert is returned.
         self.assertEqual(len(body["alerts"]), 1)
+        self.assertEqual(
+            body["alerts"],
+            [
+                {
+                    "resource_id": self.ids["first"],
+                    "id": body["alerts"][0]["id"],
+                    "advisory": "ADV-A",
+                    "component": "openssl",
+                    "severity": "high",
+                    "summary": "buffer overflow",
+                    "fixed_version": "3.0.8",
+                }
+            ],
+        )
+        self.assertEqual(body["affected_resources"], [self.ids["first"]])
+        self.assertEqual(body["advisory"], "ADV-A")
+        self.assertIsInstance(body["alerts"][0]["id"], str)
+        self.assertTrue(body["alerts"][0]["id"])
 
     def test_severity_filter_no_match_is_success_empty_arrays(self) -> None:
         self._alert("first", advisory="ADV-A", severity="low")
@@ -354,12 +434,17 @@ class AdvisoryDetailTests(unittest.TestCase):
                 status, headers, body = call_json(method, "/advisories/ADV-A")
                 self.assertEqual(status, "405 Method Not Allowed")
                 self.assertEqual(body["error"], "method_not_allowed")
+                self.assertEqual(
+                    body["message"],
+                    f"Method {method} is not allowed for this path.",
+                )
                 self.assertEqual(dict(headers)["Allow"], "GET")
 
     def test_empty_advisory_id_returns_400(self) -> None:
         status, _h, body = call_json("GET", "/advisories/")
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(body["message"], "Advisory id must not be empty.")
 
     def test_advisory_id_with_path_separator_returns_400(self) -> None:
         for path in ("/advisories/A/B", "/advisories/A\\B"):
@@ -367,6 +452,10 @@ class AdvisoryDetailTests(unittest.TestCase):
                 status, _h, body = call_json("GET", path)
                 self.assertEqual(status, "400 Bad Request")
                 self.assertEqual(body["error"], "invalid_request")
+                self.assertEqual(
+                    body["message"],
+                    "Advisory id must not contain path separators.",
+                )
 
     def test_declared_non_empty_body_returns_400(self) -> None:
         status, _h, body = call_json(
@@ -374,6 +463,9 @@ class AdvisoryDetailTests(unittest.TestCase):
         )
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(
+            body["message"], "This endpoint does not accept a request body."
+        )
 
     def test_malformed_content_length_returns_400(self) -> None:
         status, _h, body = call_json(
@@ -381,6 +473,9 @@ class AdvisoryDetailTests(unittest.TestCase):
         )
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(
+            body["message"], "This endpoint does not accept a request body."
+        )
 
     def test_empty_body_declared_zero_is_accepted(self) -> None:
         status, _h, body = call_json(
@@ -390,11 +485,16 @@ class AdvisoryDetailTests(unittest.TestCase):
         self.assertEqual(body["alerts"], [])
 
     def test_unknown_query_parameter_returns_400(self) -> None:
-        for qs in ("x=1", "limit=10", "severity=high&foo=bar"):
+        for qs, message in (
+            ("x=1", "Unknown query parameter: 'x'."),
+            ("limit=10", "Unknown query parameter: 'limit'."),
+            ("severity=high&foo=bar", "Unknown query parameter: 'foo'."),
+        ):
             with self.subTest(qs=qs):
                 status, _h, body = self._detail("ADV-A", query_string=qs)
                 self.assertEqual(status, "400 Bad Request")
                 self.assertEqual(body["error"], "invalid_request")
+                self.assertEqual(body["message"], message)
 
     def test_repeated_severity_returns_400(self) -> None:
         status, _h, body = self._detail(
@@ -402,6 +502,9 @@ class AdvisoryDetailTests(unittest.TestCase):
         )
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(
+            body["message"], "Query parameter 'severity' must not be repeated."
+        )
 
     def test_empty_or_unknown_severity_returns_400(self) -> None:
         for qs in ("severity=", "severity=urgent", "severity=HIG"):
@@ -409,14 +512,45 @@ class AdvisoryDetailTests(unittest.TestCase):
                 status, _h, body = self._detail("ADV-A", query_string=qs)
                 self.assertEqual(status, "400 Bad Request")
                 self.assertEqual(body["error"], "invalid_request")
+                self.assertEqual(
+                    body["message"],
+                    "Severity must be one of: critical, high, medium, low "
+                    "(case-insensitive).",
+                )
 
     def test_bad_request_does_not_read_business_data(self) -> None:
-        # A bad query parameter is rejected before aggregation; the response
-        # is the same with or without any recorded alerts.
-        self._alert("first", advisory="ADV-A", severity="high")
+        # A bad query parameter is rejected before aggregation; record the
+        # full business state before the rejected call and prove it is
+        # byte-for-byte unchanged afterwards.
+        alert_id = self._alert(
+            "first", advisory="ADV-A", severity="high", component="lib"
+        )
+        _s, _h, before_alerts = call_json(
+            "GET", f"/resources/{self.ids['first']}/vulnerabilities"
+        )
+        _s, _h, before_advisories = call_json("GET", "/advisories")
+        _s, _h, before_resources = call_json("GET", "/resources")
+
         status, _h, body = self._detail("ADV-A", query_string="severity=urgent")
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(
+            body["message"],
+            "Severity must be one of: critical, high, medium, low "
+            "(case-insensitive).",
+        )
+
+        _s, _h, after_alerts = call_json(
+            "GET", f"/resources/{self.ids['first']}/vulnerabilities"
+        )
+        _s, _h, after_advisories = call_json("GET", "/advisories")
+        _s, _h, after_resources = call_json("GET", "/resources")
+        self.assertEqual(after_alerts, before_alerts)
+        self.assertEqual(after_advisories, before_advisories)
+        self.assertEqual(after_resources, before_resources)
+        # The recorded alert is exactly the one created up front.
+        self.assertEqual(len(after_alerts["vulnerabilities"]), 1)
+        self.assertEqual(after_alerts["vulnerabilities"][0]["id"], alert_id)
 
     def test_error_body_shape_and_newline(self) -> None:
         status, headers, raw = call(

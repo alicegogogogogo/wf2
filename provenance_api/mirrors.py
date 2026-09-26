@@ -219,6 +219,19 @@ def _layer_url(upstream: str, digest: str) -> str:
     return upstream.rstrip("/") + "/layers/" + digest
 
 
+def _url_open(request: urllib.request.Request, *, timeout: float):
+    """Open a request through this module's own network entry point.
+
+    Both layer fetches and upstream probes call this thin wrapper instead
+    of touching the process-global ``urllib.request.urlopen`` directly.
+    Tests therefore substitute only this module-level name for a single
+    call; replacing it never affects any other module's network access or
+    leaks across test cases.
+    """
+
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
 def fetch_upstream_layer(
     upstream: str,
     digest: str,
@@ -235,7 +248,7 @@ def fetch_upstream_layer(
     url = _layer_url(upstream, digest)
     request = urllib.request.Request(url, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _url_open(request, timeout=timeout) as response:
             if getattr(response, "status", response.getcode()) != 200:
                 raise MirrorFetchError(
                     "mirror_fetch_failed",
@@ -275,7 +288,7 @@ def probe_upstream(
     request = urllib.request.Request(upstream, method="GET")
     start = time.monotonic()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _url_open(request, timeout=timeout) as response:
             latency_ms = max(0, int((time.monotonic() - start) * 1000))
             status_code = getattr(response, "status", response.getcode())
             try:
