@@ -194,6 +194,17 @@ class ContentStore:
             )
         return session.content
 
+    def remove_resource(self, resource_id: str) -> None:
+        """Discard any upload session and finalized content for a resource.
+
+        Used when the resource itself is deregistered: the chunk session,
+        received chunks and the assembled artifact bytes all become void, so
+        earlier upload progress is no longer queryable. A no-op when the
+        resource never uploaded anything.
+        """
+
+        self._sessions.pop(resource_id, None)
+
     def session_status(self, resource_id: str) -> SessionStatus | None:
         """Return a read-only snapshot of the upload session, or ``None``.
 

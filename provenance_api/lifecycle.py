@@ -77,6 +77,15 @@ class LifecycleStore:
     def set(self, resource_id: str, record: LifecycleRecord) -> None:
         self._records[resource_id] = record
 
+    def remove_resource(self, resource_id: str) -> None:
+        """Drop the recorded state for a deregistered resource.
+
+        A later registration with the same name starts over from the
+        default ``staged`` state and inherits nothing.
+        """
+
+        self._records.pop(resource_id, None)
+
     def apply(
         self, current: LifecycleRecord, target: str, reason: str | None
     ) -> LifecycleRecord:

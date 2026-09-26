@@ -538,16 +538,69 @@ def _handle_resources_post(
     return _resource_response(start_response, "201 Created", created)
 
 
-def _handle_resource_item(
-    method: str, raw_id: str, start_response: StartResponse
+def _handle_resource_item_delete(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    # Deregistration carries no body; a declared non-empty or malformed body
+    # is rejected without reading business data or touching any state.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    resource = store.get(raw_id)
+    if resource is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Cascade: every per-resource record is removed and every dependency
+    # edge touching the resource disappears. Resolved remote resources,
+    # mirror sources and cache entries are deliberately left untouched.
+    content_store.remove_resource(raw_id)
+    lifecycle_store.remove_resource(raw_id)
+    vulnerability_store.remove_resource(raw_id)
+    vulnerability_exception_store.remove_resource(raw_id)
+    sbom_store.remove_resource(raw_id)
+    provenance_store.remove_resource(raw_id)
+    policy_store.remove_resource(raw_id)
+    notification_store.remove_resource(raw_id)
+    signature_store.remove_resource(raw_id)
+    cross_reference_store.remove_for(raw_id)
+    store.remove(raw_id)
+
+    return _resource_response(start_response, "200 OK", resource)
+
+
+def _handle_resource_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "DELETE":
+        return _handle_resource_item_delete(environ, raw_id, start_response)
     if method != "GET":
         return _error(
             start_response,
             "405 Method Not Allowed",
             "method_not_allowed",
             f"Method {method} is not allowed for this path.",
-            allowed="GET",
+            allowed="DELETE, GET",
         )
 
     if not raw_id:
@@ -4844,7 +4897,13 @@ def application(
         if path.startswith("/resources/"):
             suffix = path[len("/resources/"):]
             head, separator, tail = suffix.partition("/")
-            if separator and tail == "dependencies":
+            if not separator:
+                # The single resource item: GET (query) and DELETE
+                # (deregister); other methods answer 405 with Allow.
+                return _handle_resource_item(
+                    method, environ, head, start_response
+                )
+            if tail == "dependencies":
                 return _handle_dependencies(
                     method, environ, head, start_response
                 )
@@ -5200,9 +5259,10 @@ def application(
                     start_response,
                 )
             # Any other suffix keeps the baseline item semantics (embedded
-            # separators are rejected by the item handler).
+            # separators are rejected by the item handler). The environ is
+            # needed so DELETE also rejects query parameters and a body.
             return _handle_resource_item(
-                method, suffix, start_response
+                method, environ, suffix, start_response
             )
 
         # Unknown paths and undeclared methods on /health stay as before.

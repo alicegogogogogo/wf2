@@ -131,3 +131,8 @@ class NotificationStore:
         """Return a resource's notifications in submission order."""
 
         return list(self._records.get(resource_id, ()))
+
+    def remove_resource(self, resource_id: str) -> None:
+        """Drop every notification recorded against a deregistered resource."""
+
+        self._records.pop(resource_id, None)

@@ -248,6 +248,36 @@ class ResourceStore:
         self._dependencies.pop(resource_id, None)
         self._dependents.pop(resource_id, None)
 
+    def remove(self, resource_id: str) -> Resource | None:
+        """Deregister a resource and drop every edge touching it.
+
+        Both the edges the resource originated and the edges pointing at it
+        disappear, so topology and impact analysis no longer mention any of
+        them. Returns the removed record, or ``None`` when no resource with
+        that id exists (in which case nothing is mutated). The id is never
+        reused: later registrations always mint a fresh id.
+        """
+
+        resource = self._by_id.pop(resource_id, None)
+        if resource is None:
+            return None
+        self._resources = [r for r in self._resources if r.id != resource_id]
+        self._key_to_id.pop(
+            (resource.category, resource.name, resource.digest), None
+        )
+
+        outgoing = self._dependencies.pop(resource_id, set())
+        for dependency_id in outgoing:
+            dependents = self._dependents.get(dependency_id)
+            if dependents is not None:
+                dependents.discard(resource_id)
+        incoming = self._dependents.pop(resource_id, set())
+        for dependent_id in incoming:
+            dependencies = self._dependencies.get(dependent_id)
+            if dependencies is not None:
+                dependencies.discard(resource_id)
+        return resource
+
     # --- Dependencies ------------------------------------------------------
 
     def _reachable(self, start: str, graph: dict[str, set[str]]) -> set[str]:

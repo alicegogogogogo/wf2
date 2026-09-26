@@ -449,6 +449,23 @@ class VulnerabilityStore:
         ]
         return record
 
+    def remove_resource(self, resource_id: str) -> None:
+        """Drop every alert recorded against a deregistered resource.
+
+        The resource's records, its duplicate-key set and its entries in
+        the global submission sequence all disappear, so every view
+        computed from this store immediately stops counting them. Other
+        resources' alerts are untouched.
+        """
+
+        self._records.pop(resource_id, None)
+        self._keys.pop(resource_id, None)
+        self._sequence = [
+            (owner_id, alert)
+            for owner_id, alert in self._sequence
+            if owner_id != resource_id
+        ]
+
     def list_all(self) -> list[tuple[str, Vulnerability]]:
         """Return every alert across resources in global submission order.
 

@@ -221,3 +221,8 @@ class SignatureStore:
 
     def get(self, resource_id: str) -> SignatureRecord | None:
         return self._records.get(resource_id)
+
+    def remove_resource(self, resource_id: str) -> None:
+        """Drop the signature record of a deregistered resource."""
+
+        self._records.pop(resource_id, None)

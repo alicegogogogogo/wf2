@@ -250,6 +250,12 @@ class SbomStore:
     def get_sbom(self, resource_id: str) -> SbomDocument | None:
         return self._sboms.get(resource_id)
 
+    def remove_resource(self, resource_id: str) -> None:
+        """Drop the SBOM document and license of a deregistered resource."""
+
+        self._sboms.pop(resource_id, None)
+        self._licenses.pop(resource_id, None)
+
     # --- License -----------------------------------------------------------
 
     def add_license(

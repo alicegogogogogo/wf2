@@ -398,6 +398,31 @@ class CrossReferenceStore:
             if record.resource_id == resource_id
         ]
 
+    def remove_for(self, resource_id: str) -> None:
+        """Drop every reference registered by a deregistered resource.
+
+        The local resources resolved through those references are left
+        alone, as are the repository-to-upstream bindings (they are global
+        state, not per-resource records); only the removed records'
+        ``(repository, remote_id)`` pairs are released so the same remote
+        resource can be referenced again later.
+        """
+
+        removed = [
+            record
+            for record in self._records
+            if record.resource_id == resource_id
+        ]
+        if not removed:
+            return
+        self._records = [
+            record
+            for record in self._records
+            if record.resource_id != resource_id
+        ]
+        for record in removed:
+            self._pairs.discard((record.repository, record.remote_id))
+
     def check_prerequisites(
         self,
         repository: str,
