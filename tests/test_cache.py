@@ -698,6 +698,305 @@ class CacheClearHttpTests(unittest.TestCase):
         self.assertEqual(listed["mirrors"][0]["name"], "primary")
 
 
+class LayerPrecheckStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_state()
+
+    def test_writable_when_bytes_fit_and_digest_is_free(self) -> None:
+        self.assertEqual(cache_store.precheck(DIGEST_A, LAYER_A), "writable")
+
+    def test_already_cached_for_equal_bytes(self) -> None:
+        cache_store.put(DIGEST_A, LAYER_A)
+        self.assertEqual(
+            cache_store.precheck(DIGEST_A, LAYER_A), "already_cached"
+        )
+
+    def test_conflict_takes_precedence_over_quota(self) -> None:
+        cache_store.configure(len(LAYER_A))
+        cache_store.put(DIGEST_A, LAYER_A)
+        with mock.patch(
+            "provenance_api.cache.hashlib.sha256",
+            return_value=mock.Mock(hexdigest=lambda: DIGEST_A),
+        ):
+            decision = cache_store.precheck(DIGEST_A, LAYER_B)
+        self.assertEqual(decision, "cache_conflict")
+
+    def test_digest_mismatch_takes_precedence_over_conflict_and_quota(
+        self,
+    ) -> None:
+        cache_store.put(DIGEST_A, LAYER_A)
+        cache_store.configure(1)
+        # LAYER_B neither hashes to DIGEST_A nor fits the tiny quota and
+        # DIGEST_A is already cached with different bytes; the mismatch
+        # must win over both other conditions.
+        self.assertEqual(
+            cache_store.precheck(DIGEST_A, LAYER_B), "digest_mismatch"
+        )
+
+    def test_quota_exceeded_only_for_a_new_entry(self) -> None:
+        cache_store.configure(len(LAYER_A))
+        self.assertEqual(
+            cache_store.precheck(DIGEST_B, LAYER_B), "cache_quota_exceeded"
+        )
+        # An exact fit is still writable.
+        self.assertEqual(cache_store.precheck(DIGEST_A, LAYER_A), "writable")
+
+    def test_precheck_never_changes_the_cache(self) -> None:
+        cache_store.configure(len(LAYER_A))
+        cache_store.put(DIGEST_A, LAYER_A)
+        cache_store.get(DIGEST_A)
+        cache_store.get(DIGEST_C)
+        with mock.patch(
+            "provenance_api.cache.hashlib.sha256",
+            return_value=mock.Mock(hexdigest=lambda: DIGEST_A),
+        ):
+            cache_store.precheck(DIGEST_A, LAYER_B)
+        cache_store.precheck(DIGEST_A, LAYER_A)
+        cache_store.precheck(DIGEST_B, LAYER_B)
+        cache_store.precheck(DIGEST_C, LAYER_A)
+        status = cache_store.status()
+        self.assertEqual(status.entries, 1)
+        self.assertEqual(status.used_bytes, len(LAYER_A))
+        self.assertEqual(status.hits, 1)
+        self.assertEqual(status.misses, 1)
+
+
+def check_layer(
+    data: bytes, digest: str | None = None, **kwargs: object
+) -> tuple[str, list[tuple[str, str]], bytes]:
+    path = f"/cache/layers/{digest or hashlib.sha256(data).hexdigest()}/check"
+    return call("POST", path, data, headers=OCTET_HEADERS, **kwargs)  # type: ignore[arg-type]
+
+
+class LayerPrecheckHttpTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_state()
+
+    def test_writable_returns_200_with_ordered_compact_json(self) -> None:
+        status, headers, raw = check_layer(LAYER_A)
+        self.assertEqual(status, "200 OK")
+        self.assertIn(
+            ("Content-Type", "application/json; charset=utf-8"), headers
+        )
+        self.assertEqual(
+            raw,
+            json.dumps(
+                {
+                    "digest": DIGEST_A,
+                    "size": len(LAYER_A),
+                    "decision": "writable",
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n",
+        )
+        self.assertEqual(
+            list(json.loads(raw)), ["digest", "size", "decision"]
+        )
+
+    def test_already_cached_decision(self) -> None:
+        put_layer(LAYER_A)
+        status, _h, raw = check_layer(LAYER_A)
+        self.assertEqual(status, "200 OK")
+        body = json.loads(raw)
+        self.assertEqual(body["decision"], "already_cached")
+        self.assertEqual(body["digest"], DIGEST_A)
+        self.assertEqual(body["size"], len(LAYER_A))
+
+    def test_conflict_decision_keeps_original_entry(self) -> None:
+        put_layer(LAYER_A)
+        with mock.patch(
+            "provenance_api.cache.hashlib.sha256",
+            return_value=mock.Mock(hexdigest=lambda: DIGEST_A),
+        ):
+            status, _h, raw = check_layer(LAYER_B, digest=DIGEST_A)
+        self.assertEqual(status, "200 OK")
+        body = json.loads(raw)
+        self.assertEqual(body["decision"], "cache_conflict")
+        self.assertEqual(body["size"], len(LAYER_B))
+        _s, _h, layer_raw = call("GET", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(layer_raw, LAYER_A)
+
+    def test_quota_exceeded_decision_changes_nothing(self) -> None:
+        cache_store.configure(len(LAYER_A))
+        status, _h, raw = check_layer(LAYER_B)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(json.loads(raw)["decision"], "cache_quota_exceeded")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 0)
+        self.assertEqual(status_body["used_bytes"], 0)
+        self.assertEqual(status_body["quota"], len(LAYER_A))
+
+    def test_digest_mismatch_decision_is_based_on_submitted_bytes(self) -> None:
+        put_layer(LAYER_A)
+        status, _h, raw = check_layer(LAYER_B, digest=DIGEST_C)
+        self.assertEqual(status, "200 OK")
+        body = json.loads(raw)
+        self.assertEqual(body["decision"], "digest_mismatch")
+        self.assertEqual(body["digest"], DIGEST_C)
+        self.assertEqual(body["size"], len(LAYER_B))
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["used_bytes"], len(LAYER_A))
+
+    def test_mismatch_wins_over_quota(self) -> None:
+        cache_store.configure(1)
+        status, _h, raw = check_layer(LAYER_B, digest=DIGEST_C)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(json.loads(raw)["decision"], "digest_mismatch")
+
+    def test_conflict_wins_over_quota(self) -> None:
+        cache_store.configure(len(LAYER_A))
+        put_layer(LAYER_A)
+        with mock.patch(
+            "provenance_api.cache.hashlib.sha256",
+            return_value=mock.Mock(hexdigest=lambda: DIGEST_A),
+        ):
+            status, _h, raw = check_layer(LAYER_B, digest=DIGEST_A)
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(json.loads(raw)["decision"], "cache_conflict")
+
+    def test_writable_preview_creates_no_entry_or_counter_movement(self) -> None:
+        check_layer(LAYER_A)
+        check_layer(LAYER_B)
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 0)
+        self.assertEqual(status_body["used_bytes"], 0)
+        self.assertEqual(status_body["hits"], 0)
+        self.assertEqual(status_body["misses"], 0)
+        # The preview does not pre-empt a real write through the existing
+        # entry point.
+        status, _h, _raw = put_layer(LAYER_A)
+        self.assertEqual(status, "201 Created")
+
+    def test_prechecks_never_move_counters_or_usage(self) -> None:
+        put_layer(LAYER_A)
+        check_layer(LAYER_A)
+        check_layer(LAYER_B)
+        check_layer(LAYER_B, digest=DIGEST_C)
+        cache_store.configure(len(LAYER_A))
+        check_layer(LAYER_B)
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["used_bytes"], len(LAYER_A))
+        self.assertEqual(status_body["hits"], 0)
+        self.assertEqual(status_body["misses"], 0)
+
+    def test_uppercase_path_digest_is_echoed_lowercase(self) -> None:
+        put_layer(LAYER_A)
+        status, _h, raw = check_layer(LAYER_A, digest=DIGEST_A.upper())
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(json.loads(raw)["digest"], DIGEST_A)
+        self.assertEqual(json.loads(raw)["decision"], "already_cached")
+
+    def test_invalid_path_digest_returns_400_without_reading_body(self) -> None:
+        for digest in (
+            "abc",
+            "g" * 64,
+            "a" * 63,
+            "a" * 65,
+            "",
+            "a" * 32 + "/" + "a" * 32,
+        ):
+            status, _h, raw = call(
+                "POST",
+                f"/cache/layers/{digest}/check",
+                LAYER_A,
+                headers=OCTET_HEADERS,
+                stream=ExplodingStream(),
+            )
+            self.assertEqual(status, "400 Bad Request", digest)
+            self.assertEqual(json.loads(raw)["error"], "invalid_request")
+
+    def test_query_parameters_return_400_without_reading_body(self) -> None:
+        put_layer(LAYER_A)
+        status, _h, raw = call(
+            "POST",
+            f"/cache/layers/{DIGEST_B}/check",
+            LAYER_B,
+            headers=OCTET_HEADERS,
+            query_string="x=1",
+            stream=ExplodingStream(),
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(json.loads(raw)["error"], "invalid_request")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+
+    def test_non_octet_stream_content_type_returns_400(self) -> None:
+        for content_type in ("application/json", "text/plain", ""):
+            headers = {"CONTENT_TYPE": content_type} if content_type else {}
+            status, _h, raw = call(
+                "POST",
+                f"/cache/layers/{DIGEST_A}/check",
+                LAYER_A,
+                headers=headers,
+            )
+            self.assertEqual(status, "400 Bad Request", content_type)
+            self.assertEqual(json.loads(raw)["error"], "invalid_request")
+
+    def test_missing_content_length_returns_400(self) -> None:
+        status, _h, raw = call(
+            "POST",
+            f"/cache/layers/{DIGEST_A}/check",
+            LAYER_A,
+            headers=OCTET_HEADERS,
+            omit_content_length=True,
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(json.loads(raw)["error"], "invalid_request")
+
+    def test_malformed_content_length_returns_400(self) -> None:
+        for content_length in ("abc", "-1", "1.5", ""):
+            status, _h, raw = call(
+                "POST",
+                f"/cache/layers/{DIGEST_A}/check",
+                LAYER_A,
+                headers=OCTET_HEADERS,
+                content_length=content_length,
+            )
+            self.assertEqual(status, "400 Bad Request", content_length)
+            self.assertEqual(json.loads(raw)["error"], "invalid_request")
+
+    def test_incomplete_body_returns_400(self) -> None:
+        status, _h, raw = call(
+            "POST",
+            f"/cache/layers/{DIGEST_A}/check",
+            LAYER_A,
+            headers=OCTET_HEADERS,
+            content_length=len(LAYER_A) + 5,
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(json.loads(raw)["error"], "invalid_request")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 0)
+
+    def test_non_post_methods_return_405_with_post_only_allow(self) -> None:
+        put_layer(LAYER_A)
+        for method in ("GET", "PUT", "PATCH", "DELETE"):
+            status, headers, raw = call(
+                method, f"/cache/layers/{DIGEST_A}/check"
+            )
+            self.assertEqual(status, "405 Method Not Allowed", method)
+            self.assertEqual(
+                [header for header in headers if header[0] == "Allow"],
+                [("Allow", "POST")],
+                method,
+            )
+            self.assertEqual(json.loads(raw)["error"], "method_not_allowed")
+        _s, _h, status_body = call_json("GET", "/cache/status")
+        self.assertEqual(status_body["entries"], 1)
+        self.assertEqual(status_body["hits"], 0)
+        self.assertEqual(status_body["misses"], 0)
+
+    def test_existing_layer_path_is_unchanged(self) -> None:
+        # The /check suffix must not shadow or alter the plain layer path.
+        put_layer(LAYER_A)
+        status, _h, raw = call("GET", f"/cache/layers/{DIGEST_A}")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(raw, LAYER_A)
+
+
 class CacheQuotaArgumentTests(unittest.TestCase):
     def test_default_quota(self) -> None:
         args = build_parser().parse_args([])
