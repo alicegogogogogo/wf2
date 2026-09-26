@@ -970,6 +970,129 @@ def _handle_dependency_vulnerability_impact(
     )
 
 
+def _parse_graph_query(query_string: str) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``focus`` query parameter of ``GET /graph``.
+
+    Returns ``(focus, None)`` -- with ``None`` when the parameter is absent
+    -- or ``(None, message)`` for an unknown parameter, a repeated
+    ``focus``, an empty value or a value containing a path separator. The
+    focus value is matched verbatim against resource ids: no trimming, no
+    case folding.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    focus: str | None = None
+    for key, value in pairs:
+        if key != "focus":
+            return None, f"Unknown query parameter: {key!r}."
+        if focus is not None:
+            return None, "Query parameter 'focus' must not be repeated."
+        if value == "":
+            return None, "Focus must not be empty."
+        if "/" in value or "\\" in value:
+            return None, "Focus must not contain path separators."
+        focus = value
+    return focus, None
+
+
+def _graph_node(resource: Resource) -> dict[str, object]:
+    # The snapshot carries the four identity fields only, in this order.
+    return {
+        "id": resource.id,
+        "name": resource.name,
+        "category": resource.category,
+        "digest": resource.digest,
+    }
+
+
+def _handle_graph(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The snapshot is read-only: a declared non-empty (or malformed) body
+    # is a bad request without consulting any business data. An omitted
+    # header and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``focus`` parameter is accepted; unknown or
+    # repeated parameters, including a repeated ``focus``, are rejected.
+    focus, focus_error = _parse_graph_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if focus_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", focus_error
+        )
+
+    # Computed on the fly from the current registry: nodes in registration
+    # order, edges grouped by the start resource's registration order and,
+    # within one start, by the order the relations were established. Manual
+    # and cross-reference-resolved edges are reported alike.
+    edges = [
+        {"resource_id": resource_id, "dependency_id": dependency_id}
+        for resource_id, dependency_id in store.list_edges()
+    ]
+
+    if focus is None:
+        nodes = [_graph_node(resource) for resource in store.list_all()]
+        return _json_response(
+            start_response,
+            "200 OK",
+            {"nodes": nodes, "edges": edges},
+            trailing_newline=True,
+        )
+
+    focus_resource = store.get(focus)
+    if focus_resource is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # One-hop neighborhood only: the focus itself, its direct dependencies
+    # and its direct dependents; indirectly reachable resources and edges
+    # between them are never included. Edges keep the global ordering.
+    neighborhood = {
+        focus,
+        *store.list_direct_dependencies(focus),
+        *store.list_direct_dependents(focus),
+    }
+    nodes = [
+        _graph_node(resource)
+        for resource in store.list_all()
+        if resource.id in neighborhood
+    ]
+    edges = [
+        edge
+        for edge in edges
+        if edge["resource_id"] == focus or edge["dependency_id"] == focus
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"nodes": nodes, "edges": edges},
+        trailing_newline=True,
+    )
+
+
 def _read_declared_body(environ: dict[str, Any]) -> tuple[bytes | None, str | None]:
     """Read exactly the declared request body for content verification.
 
@@ -5319,6 +5442,9 @@ def application(
 
         if path == "/advisories":
             return _handle_advisories(method, environ, start_response)
+
+        if path == "/graph":
+            return _handle_graph(method, environ, start_response)
 
         if path.startswith("/advisories/"):
             # The identifier segment is validated by the handler; an

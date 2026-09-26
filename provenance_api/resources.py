@@ -120,8 +120,11 @@ class ResourceStore:
         self._by_id: dict[str, Resource] = {}
         self._key_to_id: dict[tuple[str, str, str], str] = {}
         # resource id -> ids it directly depends on, and the reverse view.
-        self._dependencies: dict[str, set[str]] = {}
-        self._dependents: dict[str, set[str]] = {}
+        # Insertion-ordered dicts stand in for ordered sets: membership stays
+        # O(1) while iteration remembers the order in which each relation was
+        # established, which the global graph snapshot reports.
+        self._dependencies: dict[str, dict[str, None]] = {}
+        self._dependents: dict[str, dict[str, None]] = {}
 
     def reset(self) -> None:
         self._resources.clear()
@@ -190,8 +193,8 @@ class ResourceStore:
         self._resources.append(resource)
         self._by_id[resource.id] = resource
         self._key_to_id[key] = resource.id
-        self._dependencies[resource.id] = set()
-        self._dependents[resource.id] = set()
+        self._dependencies[resource.id] = {}
+        self._dependents[resource.id] = {}
         return resource, None
 
     def add_remote(
@@ -227,8 +230,8 @@ class ResourceStore:
         self._resources.append(resource)
         self._by_id[resource.id] = resource
         self._key_to_id[key] = resource.id
-        self._dependencies[resource.id] = set()
-        self._dependents[resource.id] = set()
+        self._dependencies[resource.id] = {}
+        self._dependents[resource.id] = {}
         return resource
 
     def discard(self, resource_id: str) -> None:
@@ -267,16 +270,18 @@ class ResourceStore:
         for dependency_id in self._dependencies.pop(resource_id, ()):
             dependents = self._dependents.get(dependency_id)
             if dependents is not None:
-                dependents.discard(resource_id)
+                dependents.pop(resource_id, None)
         for dependent_id in self._dependents.pop(resource_id, ()):
             dependencies = self._dependencies.get(dependent_id)
             if dependencies is not None:
-                dependencies.discard(resource_id)
+                dependencies.pop(resource_id, None)
         return resource
 
     # --- Dependencies ------------------------------------------------------
 
-    def _reachable(self, start: str, graph: dict[str, set[str]]) -> set[str]:
+    def _reachable(
+        self, start: str, graph: dict[str, dict[str, None]]
+    ) -> set[str]:
         """Transitive closure of ``start`` through ``graph`` (start excluded)."""
 
         seen: set[str] = set()
@@ -332,8 +337,8 @@ class ResourceStore:
         """
 
         self.check_dependency(resource_id, dependency_id)
-        self._dependencies[resource_id].add(dependency_id)
-        self._dependents[dependency_id].add(resource_id)
+        self._dependencies[resource_id][dependency_id] = None
+        self._dependents[dependency_id][resource_id] = None
 
     def has_dependency(self, resource_id: str, dependency_id: str) -> bool:
         """Return whether the direct edge ``resource_id -> dependency_id`` exists."""
@@ -352,10 +357,10 @@ class ResourceStore:
         dependencies = self._dependencies.get(resource_id)
         if dependencies is None or dependency_id not in dependencies:
             return False
-        dependencies.discard(dependency_id)
+        del dependencies[dependency_id]
         dependents = self._dependents.get(dependency_id)
         if dependents is not None:
-            dependents.discard(resource_id)
+            dependents.pop(resource_id, None)
         return True
 
     def list_dependencies(self, resource_id: str) -> list[str]:
@@ -375,3 +380,40 @@ class ResourceStore:
         return self._registration_order(
             self._reachable(resource_id, self._dependents)
         )
+
+    # --- Graph snapshot ------------------------------------------------------
+
+    def list_direct_dependencies(self, resource_id: str) -> list[str]:
+        """Return the ids ``resource_id`` directly depends on.
+
+        Only direct outbound edges, in the order the relations were
+        established; the transitive closure is left to
+        :meth:`list_dependencies`.
+        """
+
+        return list(self._dependencies.get(resource_id, ()))
+
+    def list_direct_dependents(self, resource_id: str) -> list[str]:
+        """Return the ids that directly depend on ``resource_id``.
+
+        Only direct inbound edges, in the order the relations were
+        established; the transitive closure is left to :meth:`list_impact`.
+        """
+
+        return list(self._dependents.get(resource_id, ()))
+
+    def list_edges(self) -> list[tuple[str, str]]:
+        """Return every direct edge as ``(resource_id, dependency_id)``.
+
+        Edges are grouped by the start resource's registration order; within
+        one start resource they follow the order in which each relation was
+        established. Manually registered and cross-reference-resolved edges
+        are reported alike, since both flow through
+        :meth:`add_dependency`.
+        """
+
+        return [
+            (resource.id, dependency_id)
+            for resource in self._resources
+            for dependency_id in self._dependencies.get(resource.id, ())
+        ]
