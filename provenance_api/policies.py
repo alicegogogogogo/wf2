@@ -1,6 +1,8 @@
 """In-process admission policies for registered resources.
 
-Each resource keeps at most one policy. A policy names a non-empty
+Each resource keeps at most one policy, and the service additionally
+keeps at most one global default policy that applies to every resource
+without a policy of its own. A policy names a non-empty
 display name, the evidence it requires (``sbom``, ``license``,
 ``provenance`` and/or ``signature``), an allowlist of accepted SPDX
 license identifiers (which may be empty) and the maximum accepted
@@ -91,6 +93,17 @@ class PolicyRecord:
     def to_dict(self, resource_id: str) -> dict[str, object]:
         return {
             "id": resource_id,
+            "name": self.name,
+            "evidence_requirements": list(self.evidence_requirements),
+            "license_allowlist": list(self.license_allowlist),
+            "max_severity": self.max_severity,
+        }
+
+    def to_global_dict(self) -> dict[str, object]:
+        """The global default policy echo: the policy content itself,
+        without any resource identifier."""
+
+        return {
             "name": self.name,
             "evidence_requirements": list(self.evidence_requirements),
             "license_allowlist": list(self.license_allowlist),
@@ -239,6 +252,56 @@ class PolicyStore:
 
     def get(self, resource_id: str) -> PolicyRecord | None:
         return self._records.get(resource_id)
+
+
+class GlobalPolicyStore:
+    """Process-local storage of the single global default policy.
+
+    The global default applies to admission evaluation, admission
+    preview and risk scoring of every resource that has no policy of
+    its own; a resource's own policy always takes precedence. There is
+    no update or delete: the first registration wins, an identical
+    resubmission is idempotent and anything different conflicts.
+    """
+
+    def __init__(self) -> None:
+        self._record: PolicyRecord | None = None
+
+    def reset(self) -> None:
+        self._record = None
+
+    def add(self, payload: object) -> tuple[PolicyRecord, bool]:
+        """Validate and record the global default policy.
+
+        Returns ``(record, created)`` where ``created`` is ``True`` for
+        the first registration (HTTP 201) and ``False`` for an
+        idempotent resubmission of the exact same content (HTTP 200). A
+        different policy raises :class:`PolicyError` with code
+        ``policy_conflict`` and the stored record is never overwritten.
+        """
+
+        name, evidence, allowlist, max_severity = build_policy_fields(payload)
+        record = PolicyRecord(
+            name=name,
+            evidence_requirements=evidence,
+            license_allowlist=allowlist,
+            max_severity=max_severity,
+        )
+
+        existing = self._record
+        if existing is not None:
+            if existing == record:
+                return existing, False
+            raise PolicyError(
+                "policy_conflict",
+                "A different global default policy is already registered.",
+            )
+
+        self._record = record
+        return record, True
+
+    def get(self) -> PolicyRecord | None:
+        return self._record
 
 
 def evaluate_policy(
