@@ -4,7 +4,8 @@ A chunk session is opened implicitly by the first accepted chunk for a
 resource. The first chunk fixes the total chunk count and the target digest
 for the whole content; later chunks must repeat both. Assembling
 concatenates the chunks in index order, computes SHA-256 and, on success,
-marks the resource content complete.
+marks the resource content complete. An in-progress session can be reset
+back to the never-started state; a completed session cannot.
 
 Everything lives in the current process memory: sessions, chunks and
 completed content are lost on restart. There is intentionally no resume
@@ -188,6 +189,34 @@ class ContentStore:
         session.complete = True
         session.content = content
         return digest, len(content)
+
+    def reset_session(self, resource_id: str) -> tuple[str, int]:
+        """Discard an in-progress upload session and its received chunks.
+
+        Returns ``(digest, removed_chunks)`` for the session that was
+        dropped: the target digest the first chunk had fixed and the number
+        of distinct chunk indices that were held. The resource returns to
+        the never-started state, so a later upload may fix a different
+        total count and target digest and indices are collected from zero
+        again. Raises :class:`ContentError` with ``chunks_not_started``
+        when no chunk was ever accepted, or ``content_already_complete``
+        once the content has been assembled (finalized bytes are never
+        discarded here).
+        """
+
+        session = self._sessions.get(resource_id)
+        if session is None:
+            raise ContentError(
+                "chunks_not_started",
+                "No chunk upload has been started for this resource.",
+            )
+        if session.complete:
+            raise ContentError(
+                "content_already_complete",
+                "Content for this resource is already complete.",
+            )
+        del self._sessions[resource_id]
+        return session.digest, len(session.chunks)
 
     def get_content(self, resource_id: str) -> bytes:
         """Return the finalized raw bytes.

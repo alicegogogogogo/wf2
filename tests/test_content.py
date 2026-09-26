@@ -520,11 +520,15 @@ class ChunkFlowTests(unittest.TestCase):
         )
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
+        # The collection hosts the DELETE-based session reset: non-POST,
+        # non-DELETE methods are 405 with Allow listing only DELETE.
         status, headers, body = call_json(
             "GET", f"/resources/{resource_id}/chunks"
         )
         self.assertEqual(status, "405 Method Not Allowed")
-        self.assertIn(("Allow", "POST"), headers)
+        self.assertEqual(body["error"], "method_not_allowed")
+        self.assertIn(("Allow", "DELETE"), headers)
+        self.assertNotIn(("Allow", "POST"), headers)
 
     # --- Assembly ----------------------------------------------------------
 
