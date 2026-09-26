@@ -970,6 +970,134 @@ def _handle_dependency_vulnerability_impact(
     )
 
 
+def _graph_node(resource: Resource) -> dict[str, str]:
+    """Shape one graph node: the four fixed keys in documented order."""
+
+    return {
+        "id": resource.id,
+        "name": resource.name,
+        "category": resource.category,
+        "digest": resource.digest,
+    }
+
+
+def _parse_graph_query(query_string: str) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``focus`` query parameter.
+
+    Returns ``(focus, None)`` -- with ``None`` when the parameter is absent
+    -- or ``(None, message)`` for an unknown parameter, a repeated
+    ``focus`` or an empty value. Separator validation is left to the caller
+    so its stable wording stays next to the path-id rules.
+    """
+
+    pairs = parse_qsl(query_string, keep_blank_values=True, strict_parsing=False)
+    focus: str | None = None
+    for key, value in pairs:
+        if key != "focus":
+            return None, f"Unknown query parameter: {key!r}."
+        if focus is not None:
+            return None, "Query parameter 'focus' must not be repeated."
+        focus = value
+    if focus == "":
+        return None, "Focus must not be empty."
+    return focus, None
+
+
+def _handle_graph(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    focus, query_error = _parse_graph_query(str(environ.get("QUERY_STRING", "")))
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    if focus is not None and ("/" in focus or "\\" in focus):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Focus must not contain path separators.",
+        )
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # A syntactically valid focus must resolve before any graph data is
+    # gathered; a missing focus is a read-only 404 and changes nothing.
+    focused_resource = store.get(focus) if focus is not None else None
+    if focus is not None and focused_resource is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Read-only and computed on the fly from the remaining registry data:
+    # nodes follow resource registration order, edges follow start resource
+    # registration order and per-start relation establishment order. Both
+    # manually registered and cross-repository-resolved edges live in the
+    # same adjacency lists, so both kinds appear uniformly.
+    edges_in_order = list(store.iter_direct_edges())
+
+    if focus is None:
+        payload = {
+            "nodes": [_graph_node(resource) for resource in store.list_all()],
+            "edges": [
+                {"resource_id": resource_id, "dependency_id": dependency_id}
+                for resource_id, dependency_id in edges_in_order
+            ],
+        }
+        return _json_response(
+            start_response, "200 OK", payload, trailing_newline=True
+        )
+
+    assert focused_resource is not None
+    # One-hop neighborhood: the focus node itself plus its direct outgoing
+    # and incoming edges. Outgoing edges come first in their establishment
+    # order, followed by incoming edges in the same order they would appear
+    # in the full snapshot (start resource registration order, then edge
+    # establishment order). Indirectly reachable resources and edges between
+    # neighbors are deliberately excluded; each neighbor is referenced but
+    # its node record is not part of the view.
+    outgoing = store.direct_dependencies(focus)
+    incoming = [
+        resource_id
+        for resource_id, dependency_id in edges_in_order
+        if dependency_id == focus
+    ]
+    neighborhood_edges = [
+        {"resource_id": focus, "dependency_id": dependency_id}
+        for dependency_id in outgoing
+    ]
+    neighborhood_edges.extend(
+        {"resource_id": resource_id, "dependency_id": focus}
+        for resource_id in incoming
+    )
+    return _json_response(
+        start_response,
+        "200 OK",
+        {
+            "nodes": [_graph_node(focused_resource)],
+            "edges": neighborhood_edges,
+        },
+        trailing_newline=True,
+    )
+
+
 def _read_declared_body(environ: dict[str, Any]) -> tuple[bytes | None, str | None]:
     """Read exactly the declared request body for content verification.
 
@@ -5316,6 +5444,9 @@ def application(
         if method == "GET" and path == "/health":
             # Kept byte-for-byte compatible with the documented baseline.
             return _json_response(start_response, "200 OK", {"status": "ok"})
+
+        if path == "/graph":
+            return _handle_graph(method, environ, start_response)
 
         if path == "/advisories":
             return _handle_advisories(method, environ, start_response)

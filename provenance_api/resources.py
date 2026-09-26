@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 #: The four resource categories exposed by the service.
@@ -120,8 +121,10 @@ class ResourceStore:
         self._by_id: dict[str, Resource] = {}
         self._key_to_id: dict[tuple[str, str, str], str] = {}
         # resource id -> ids it directly depends on, and the reverse view.
-        self._dependencies: dict[str, set[str]] = {}
-        self._dependents: dict[str, set[str]] = {}
+        # Each list keeps the order in which the relations were established,
+        # which is the edge order used by the global graph snapshot.
+        self._dependencies: dict[str, list[str]] = {}
+        self._dependents: dict[str, list[str]] = {}
 
     def reset(self) -> None:
         self._resources.clear()
@@ -190,8 +193,8 @@ class ResourceStore:
         self._resources.append(resource)
         self._by_id[resource.id] = resource
         self._key_to_id[key] = resource.id
-        self._dependencies[resource.id] = set()
-        self._dependents[resource.id] = set()
+        self._dependencies[resource.id] = []
+        self._dependents[resource.id] = []
         return resource, None
 
     def add_remote(
@@ -227,8 +230,8 @@ class ResourceStore:
         self._resources.append(resource)
         self._by_id[resource.id] = resource
         self._key_to_id[key] = resource.id
-        self._dependencies[resource.id] = set()
-        self._dependents[resource.id] = set()
+        self._dependencies[resource.id] = []
+        self._dependents[resource.id] = []
         return resource
 
     def discard(self, resource_id: str) -> None:
@@ -267,16 +270,25 @@ class ResourceStore:
         for dependency_id in self._dependencies.pop(resource_id, ()):
             dependents = self._dependents.get(dependency_id)
             if dependents is not None:
-                dependents.discard(resource_id)
+                self._unlink(dependents, resource_id)
         for dependent_id in self._dependents.pop(resource_id, ()):
             dependencies = self._dependencies.get(dependent_id)
             if dependencies is not None:
-                dependencies.discard(resource_id)
+                self._unlink(dependencies, resource_id)
         return resource
+
+    @staticmethod
+    def _unlink(ordered: list[str], target: str) -> None:
+        """Remove ``target`` from an insertion-ordered adjacency list."""
+
+        try:
+            ordered.remove(target)
+        except ValueError:
+            pass
 
     # --- Dependencies ------------------------------------------------------
 
-    def _reachable(self, start: str, graph: dict[str, set[str]]) -> set[str]:
+    def _reachable(self, start: str, graph: dict[str, list[str]]) -> set[str]:
         """Transitive closure of ``start`` through ``graph`` (start excluded)."""
 
         seen: set[str] = set()
@@ -328,12 +340,13 @@ class ResourceStore:
         :class:`DependencyError` with code ``duplicate_dependency`` when the
         same-direction relation already exists, or ``dependency_cycle`` for a
         self loop or a relation that would introduce a cycle; in either case
-        the graph is left unchanged.
+        the graph is left unchanged. The edge is appended after the start
+        resource's existing edges, preserving establishment order.
         """
 
         self.check_dependency(resource_id, dependency_id)
-        self._dependencies[resource_id].add(dependency_id)
-        self._dependents[dependency_id].add(resource_id)
+        self._dependencies[resource_id].append(dependency_id)
+        self._dependents[dependency_id].append(resource_id)
 
     def has_dependency(self, resource_id: str, dependency_id: str) -> bool:
         """Return whether the direct edge ``resource_id -> dependency_id`` exists."""
@@ -346,17 +359,36 @@ class ResourceStore:
         Returns ``True`` when the edge existed and was removed, ``False``
         when there was no such direct edge. Neither resource record nor any
         other edge is touched; transitive relations that survive through
-        other paths are left to be recomputed by the read views.
+        other paths are left to be recomputed by the read views. The
+        relative establishment order of every remaining edge is preserved.
         """
 
         dependencies = self._dependencies.get(resource_id)
         if dependencies is None or dependency_id not in dependencies:
             return False
-        dependencies.discard(dependency_id)
+        dependencies.remove(dependency_id)
         dependents = self._dependents.get(dependency_id)
         if dependents is not None:
-            dependents.discard(resource_id)
+            self._unlink(dependents, resource_id)
         return True
+
+    def iter_direct_edges(self) -> Iterable[tuple[str, str]]:
+        """Yield every direct dependency edge as ``(resource_id, dependency_id)``.
+
+        Edges are grouped by the start resource in resource registration
+        order and, within each start, appear in the order the relations were
+        established. Both manually registered edges and edges produced by
+        cross-repository resolution are included uniformly.
+        """
+
+        for resource in self._resources:
+            for dependency_id in self._dependencies.get(resource.id, ()):
+                yield resource.id, dependency_id
+
+    def direct_dependencies(self, resource_id: str) -> list[str]:
+        """Return the ids the resource directly depends on, edge order."""
+
+        return list(self._dependencies.get(resource_id, ()))
 
     def list_dependencies(self, resource_id: str) -> list[str]:
         """Return every reachable dependency id in registration order."""
