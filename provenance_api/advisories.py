@@ -63,3 +63,44 @@ def summarize_advisories(
         }
         for advisory in advisory_order
     ]
+
+
+def advisory_detail(
+    resources: ResourceStore,
+    vulnerabilities: VulnerabilityStore,
+    advisory: str,
+    severity: str | None = None,
+) -> dict[str, object]:
+    """Return the alert detail for one verbatim advisory identifier.
+
+    ``advisory`` is matched verbatim, case-sensitively and without any
+    trimming. With ``severity`` set (already normalized to lowercase), only
+    alerts at that level participate.
+
+    The detail is expanded in resource registration order; within a single
+    resource the alerts keep their submission order, and each resource
+    appears at most once. ``affected_resources`` lists, in that same
+    registration order, only the resources that contribute at least one
+    matching alert. Every alert object starts with ``resource_id`` and then
+    echoes the single-alert registration key order. Nothing is recorded.
+    """
+
+    alerts: list[dict[str, object]] = []
+    affected: list[str] = []
+    for resource in resources.list_all():
+        matching = [
+            alert
+            for alert in vulnerabilities.list_for(resource.id, severity)
+            if alert.advisory == advisory
+        ]
+        if not matching:
+            continue
+        affected.append(resource.id)
+        for alert in matching:
+            alerts.append({"resource_id": resource.id, **alert.to_dict()})
+
+    return {
+        "advisory": advisory,
+        "affected_resources": affected,
+        "alerts": alerts,
+    }

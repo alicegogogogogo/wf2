@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
-from .advisories import summarize_advisories
+from .advisories import advisory_detail, summarize_advisories
 from .cache import CacheError, LayerCacheStore
 from .component_fixes import recommended_fix_version
 from .content import ContentError, ContentStore
@@ -4538,6 +4538,37 @@ def _handle_signature_verify(
     )
 
 
+def _parse_optional_severity(
+    query_string: str,
+) -> tuple[str | None, str | None]:
+    """Validate an advisory view query string.
+
+    Only the optional, single ``severity`` parameter is accepted; unknown or
+    repeated parameters (including a repeated ``severity``) and an empty or
+    unknown severity value are rejected. Returns ``(severity, None)`` with
+    severity normalized to lowercase, or ``(None, message)`` on error.
+    """
+
+    pairs = parse_qsl(
+        query_string,
+        keep_blank_values=True,
+        strict_parsing=False,
+    )
+    severity: str | None = None
+    for key, value in pairs:
+        if key != "severity":
+            return None, f"Unknown query parameter: {key!r}."
+        if severity is not None:
+            return None, "Query parameter 'severity' must not be repeated."
+        if value == "" or value.lower() not in SEVERITY_VALUES:
+            return None, (
+                "Severity must be one of: critical, high, medium, low "
+                "(case-insensitive)."
+            )
+        severity = value.lower()
+    return severity, None
+
+
 def _handle_advisories(
     method: str,
     environ: dict[str, Any],
@@ -4561,44 +4592,79 @@ def _handle_advisories(
             start_response, "400 Bad Request", "invalid_request", body_error
         )
 
-    # Only the optional ``severity`` parameter is accepted; unknown or
-    # repeated parameters, including a repeated ``severity``, are rejected.
-    pairs = parse_qsl(
-        str(environ.get("QUERY_STRING", "")),
-        keep_blank_values=True,
-        strict_parsing=False,
+    severity, query_error = _parse_optional_severity(
+        str(environ.get("QUERY_STRING", ""))
     )
-    severity: str | None = None
-    for key, value in pairs:
-        if key != "severity":
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                f"Unknown query parameter: {key!r}.",
-            )
-        if severity is not None:
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                "Query parameter 'severity' must not be repeated.",
-            )
-        if value == "" or value.lower() not in SEVERITY_VALUES:
-            return _error(
-                start_response,
-                "400 Bad Request",
-                "invalid_request",
-                "Severity must be one of: critical, high, medium, low "
-                "(case-insensitive).",
-            )
-        severity = value.lower()
+    if query_error is not None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            query_error,
+        )
 
     advisories = summarize_advisories(store, vulnerability_store, severity)
     return _json_response(
         start_response,
         "200 OK",
         advisories,
+        trailing_newline=True,
+    )
+
+
+def _handle_advisory_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_advisory: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The advisory identifier is a path segment: it must be present and must
+    # never embed a path separator. It is otherwise matched verbatim —
+    # case-sensitively and without any whitespace trimming — so validate it
+    # before reading any business data.
+    if not raw_advisory or "/" in raw_advisory or "\\" in raw_advisory:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Advisory must not be empty or contain path separators.",
+        )
+
+    # Read-only, like the summary: a declared non-empty (or malformed) body
+    # is rejected without consulting any business data.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    severity, query_error = _parse_optional_severity(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            query_error,
+        )
+
+    detail = advisory_detail(
+        store, vulnerability_store, raw_advisory, severity
+    )
+    return _json_response(
+        start_response,
+        "200 OK",
+        detail,
         trailing_newline=True,
     )
 
@@ -4616,6 +4682,17 @@ def application(
 
         if path == "/advisories":
             return _handle_advisories(method, environ, start_response)
+
+        if path.startswith("/advisories/"):
+            # A single advisory path segment; an empty segment or one that
+            # embeds a separator is rejected by the handler as a bad request
+            # without reading any business data.
+            return _handle_advisory_item(
+                method,
+                environ,
+                path[len("/advisories/"):],
+                start_response,
+            )
 
         if path == "/resources":
             if method == "GET":
