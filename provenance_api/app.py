@@ -5163,6 +5163,55 @@ def _handle_cross_references(
     )
 
 
+def _handle_cross_references_summary(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current records, in registration order
+    # and never reordered; nothing is recorded and no upstream is
+    # contacted. ``edge_present`` reflects the graph as it is right now: a
+    # removed edge or a deregistered resolved resource flips it to false
+    # while the record (and its historical local id) is kept.
+    summary = [
+        record.to_summary_dict(
+            store.has_dependency(record.resource_id, record.local_id)
+        )
+        for record in cross_reference_store.list_all()
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        summary,
+        trailing_newline=True,
+    )
+
+
 def _handle_signatures_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -5549,6 +5598,11 @@ def application(
 
         if path == "/promotion/blockers":
             return _handle_promotion_blockers(method, environ, start_response)
+
+        if path == "/cross-references":
+            return _handle_cross_references_summary(
+                method, environ, start_response
+            )
 
         if path.startswith("/advisories/"):
             # The identifier segment is validated by the handler; an

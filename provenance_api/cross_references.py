@@ -95,13 +95,20 @@ class CrossReferenceError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class CrossReference:
-    """A single registered cross-repository reference."""
+    """A single registered cross-repository reference.
+
+    ``local_id`` is the local resource identity the resolution created or
+    reused at registration time; it is kept verbatim even when that
+    resource is later deregistered, so historical references are never
+    rewritten.
+    """
 
     resource_id: str
     repository: str
     upstream: str
     remote_id: str
     digest: str
+    local_id: str
 
     def to_dict(self) -> dict[str, object]:
         # ``resource_id`` first, then the four registration keys in their
@@ -112,6 +119,20 @@ class CrossReference:
             "upstream": self.upstream,
             "remote_id": self.remote_id,
             "digest": self.digest,
+        }
+
+    def to_summary_dict(self, edge_present: bool) -> dict[str, object]:
+        # The global summary shape: the five per-resource keys, then the
+        # resolved local identity and whether the dependency edge the
+        # reference established is still on the graph.
+        return {
+            "resource_id": self.resource_id,
+            "repository": self.repository,
+            "upstream": self.upstream,
+            "remote_id": self.remote_id,
+            "digest": self.digest,
+            "local_id": self.local_id,
+            "edge_present": edge_present,
         }
 
 
@@ -420,6 +441,11 @@ class CrossReferenceStore:
             if record.resource_id == resource_id
         ]
 
+    def list_all(self) -> list[CrossReference]:
+        """Return every reference in registration order."""
+
+        return list(self._records)
+
     def check_prerequisites(
         self,
         repository: str,
@@ -561,6 +587,7 @@ class CrossReferenceStore:
             upstream=plan.upstream,
             remote_id=plan.remote_id,
             digest=plan.digest,
+            local_id=dependency.id,
         )
         self._records.append(record)
         self._repository_upstream.setdefault(plan.repository, plan.upstream)
