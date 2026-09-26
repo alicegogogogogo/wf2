@@ -56,6 +56,7 @@ from .notifications import (
 from .policies import (
     DefaultPolicyStore,
     PolicyError,
+    PolicyRecord,
     PolicyStore,
     PolicyValidationError,
     build_policy_fields,
@@ -3447,6 +3448,102 @@ def _handle_admission(
     )
 
 
+def _admission_preview_inputs(
+    resource_id: str,
+) -> tuple[PolicyRecord | None, list[str], int]:
+    """Resolve the preview policy and exempted alerts for one resource.
+
+    Shared by the per-resource preview and the global preview summary so
+    both answers always come from the very same rules. Returns
+    ``(policy, active_severities, exempted_count)``: ``policy`` is the
+    resource's own policy or, when it has none, the single global default
+    policy (``None`` when neither is registered); alerts verbatim matching
+    a registered exemption (advisory and component compared byte-for-byte,
+    case-sensitive) are counted in ``exempted_count`` and kept out of
+    ``active_severities``. The exemption count is always reported, even
+    when no policy applies.
+    """
+
+    exempted_keys = vulnerability_exception_store.exempted_keys(resource_id)
+    active_severities: list[str] = []
+    exempted_count = 0
+    for alert in vulnerability_store.list_for(resource_id):
+        if (alert.advisory, alert.component) in exempted_keys:
+            exempted_count += 1
+        else:
+            active_severities.append(alert.severity)
+
+    policy = policy_store.get(resource_id)
+    if policy is None:
+        # Same fallback as the admission evaluation: the global default
+        # policy applies when the resource has none of its own.
+        policy = default_policy_store.get()
+    return policy, active_severities, exempted_count
+
+
+def _build_admission_preview_report(
+    resource_id: str,
+    policy: PolicyRecord | None,
+    active_severities: list[str],
+    exempted_count: int,
+) -> dict[str, object]:
+    """Build one admission-preview record from resolved preview inputs.
+
+    The decision is identical to the admission evaluation except that
+    alerts verbatim matching a registered exemption do not count toward
+    the severity ceiling. When neither a resource policy nor the global
+    default policy exists, the record still uses the same key order with
+    ``allowed`` set to ``None`` and ``reasons`` holding only
+    ``policy_not_found``; ``exempted_count`` keeps counting exempted
+    alerts rather than being zeroed. Read-only and computed on the fly;
+    nothing is recorded.
+    """
+
+    if policy is None:
+        return {
+            "id": resource_id,
+            "allowed": None,
+            "reasons": ["policy_not_found"],
+            "exempted_count": exempted_count,
+        }
+
+    license_record = sbom_store.get_license(resource_id)
+    allowed, reasons = evaluate_policy(
+        policy,
+        lifecycle_state=lifecycle_store.get(resource_id).state,
+        has_sbom=sbom_store.get_sbom(resource_id) is not None,
+        has_license=license_record is not None,
+        has_provenance=provenance_store.get(resource_id) is not None,
+        has_signature=signature_store.get(resource_id) is not None,
+        license_spdx_id=(
+            license_record.spdx_id if license_record is not None else None
+        ),
+        severities=active_severities,
+    )
+    return {
+        "id": resource_id,
+        "allowed": allowed,
+        "reasons": reasons,
+        "exempted_count": exempted_count,
+    }
+
+
+def _admission_preview_report(resource_id: str) -> dict[str, object]:
+    """Resolve the preview inputs and build one record for ``resource_id``.
+
+    Shared by the per-resource preview and the global preview summary so
+    both answers always come from the very same rules. Read-only and
+    computed on the fly; nothing is recorded.
+    """
+
+    policy, active_severities, exempted_count = _admission_preview_inputs(
+        resource_id
+    )
+    return _build_admission_preview_report(
+        resource_id, policy, active_severities, exempted_count
+    )
+
+
 def _handle_admission_preview(
     method: str,
     environ: dict[str, Any],
@@ -3481,11 +3578,9 @@ def _handle_admission_preview(
             "No resource exists with the requested id.",
         )
 
-    policy = policy_store.get(raw_id)
-    if policy is None:
-        # Same fallback as the admission evaluation: the global default
-        # policy applies when the resource has none of its own.
-        policy = default_policy_store.get()
+    policy, active_severities, exempted_count = _admission_preview_inputs(
+        raw_id
+    )
     if policy is None:
         return _error(
             start_response,
@@ -3494,42 +3589,60 @@ def _handle_admission_preview(
             "No policy is registered for this resource.",
         )
 
-    # The decision is identical to the admission evaluation except that
-    # alerts verbatim matching a registered exemption do not count toward
-    # the severity ceiling. Matching follows the exemption rule exactly:
-    # advisory and component compared byte-for-byte, case-sensitive.
-    exempted_keys = vulnerability_exception_store.exempted_keys(raw_id)
-    active_severities: list[str] = []
-    exempted_count = 0
-    for alert in vulnerability_store.list_for(raw_id):
-        if (alert.advisory, alert.component) in exempted_keys:
-            exempted_count += 1
-        else:
-            active_severities.append(alert.severity)
-
-    license_record = sbom_store.get_license(raw_id)
-    allowed, reasons = evaluate_policy(
-        policy,
-        lifecycle_state=lifecycle_store.get(raw_id).state,
-        has_sbom=sbom_store.get_sbom(raw_id) is not None,
-        has_license=license_record is not None,
-        has_provenance=provenance_store.get(raw_id) is not None,
-        has_signature=signature_store.get(raw_id) is not None,
-        license_spdx_id=(
-            license_record.spdx_id if license_record is not None else None
-        ),
-        severities=active_severities,
-    )
-
     return _json_response(
         start_response,
         "200 OK",
-        {
-            "id": raw_id,
-            "allowed": allowed,
-            "reasons": reasons,
-            "exempted_count": exempted_count,
-        },
+        _build_admission_preview_report(
+            raw_id, policy, active_severities, exempted_count
+        ),
+        trailing_newline=True,
+    )
+
+
+def _handle_admission_preview_summary(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # One record per registered resource in registration order, never
+    # reordered, each decided independently against its own policy or the
+    # global default policy and carrying the same fields and key order as
+    # the per-resource admission preview. A resource without either policy
+    # is still an entry (allowed null, reasons [policy_not_found]) with a
+    # truthful exempted_count; nothing is recorded and no state is touched.
+    # An empty registry is a valid empty array.
+    reports = [
+        _admission_preview_report(resource.id) for resource in store.list_all()
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        reports,
         trailing_newline=True,
     )
 
@@ -5730,6 +5843,13 @@ def application(
             # Global risk summary; the handler answers the 405 (Allow: GET)
             # for every other method.
             return _handle_risk_summary(method, environ, start_response)
+
+        if path == "/admission-preview":
+            # Global admission-preview summary; the handler answers the 405
+            # (Allow: GET) for every other method.
+            return _handle_admission_preview_summary(
+                method, environ, start_response
+            )
 
         if path.startswith("/advisories/"):
             # The identifier segment is validated by the handler; an
