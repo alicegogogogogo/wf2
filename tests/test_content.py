@@ -688,6 +688,219 @@ class ChunkFlowTests(unittest.TestCase):
         self.assertEqual(status, "409 Conflict")
         self.assertEqual(body["error"], "content_not_complete")
 
+    # --- Byte-range reads --------------------------------------------------
+
+    def _completed(self, payload: bytes) -> str:
+        resource_id, _digest = self._chunks([payload])
+        call("POST", f"/resources/{resource_id}/assemble")
+        return resource_id
+
+    def test_range_closed_interval_is_206_with_exact_shape(self) -> None:
+        payload = b"0123456789"
+        resource_id = self._completed(payload)
+        status, headers, raw = call(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=2-5"},
+        )
+        self.assertEqual(status, "206 Partial Content")
+        self.assertIn(("Content-Type", "application/octet-stream"), headers)
+        self.assertIn(("Content-Length", "4"), headers)
+        self.assertIn(("Content-Range", "bytes 2-5/10"), headers)
+        self.assertEqual(raw, b"2345")
+        self.assertFalse(raw.endswith(b"\n"))
+
+    def test_range_open_end_runs_to_last_byte(self) -> None:
+        resource_id = self._completed(b"0123456789")
+        status, headers, raw = call(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=7-"},
+        )
+        self.assertEqual(status, "206 Partial Content")
+        self.assertIn(("Content-Length", "3"), headers)
+        self.assertIn(("Content-Range", "bytes 7-9/10"), headers)
+        self.assertEqual(raw, b"789")
+
+    def test_range_suffix_returns_last_n_bytes(self) -> None:
+        resource_id = self._completed(b"0123456789")
+        status, headers, raw = call(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=-4"},
+        )
+        self.assertEqual(status, "206 Partial Content")
+        self.assertIn(("Content-Length", "4"), headers)
+        self.assertIn(("Content-Range", "bytes 6-9/10"), headers)
+        self.assertEqual(raw, b"6789")
+
+    def test_range_end_beyond_length_is_clamped(self) -> None:
+        resource_id = self._completed(b"0123456789")
+        status, headers, raw = call(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=0-100"},
+        )
+        self.assertEqual(status, "206 Partial Content")
+        self.assertIn(("Content-Length", "10"), headers)
+        self.assertIn(("Content-Range", "bytes 0-9/10"), headers)
+        self.assertEqual(raw, b"0123456789")
+
+    def test_range_suffix_larger_than_content_returns_all(self) -> None:
+        resource_id = self._completed(b"0123456789")
+        status, headers, raw = call(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=-100"},
+        )
+        self.assertEqual(status, "206 Partial Content")
+        self.assertIn(("Content-Range", "bytes 0-9/10"), headers)
+        self.assertEqual(raw, b"0123456789")
+
+    def test_range_single_byte(self) -> None:
+        resource_id = self._completed(b"0123456789")
+        status, headers, raw = call(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=5-5"},
+        )
+        self.assertEqual(status, "206 Partial Content")
+        self.assertIn(("Content-Length", "1"), headers)
+        self.assertIn(("Content-Range", "bytes 5-5/10"), headers)
+        self.assertEqual(raw, b"5")
+
+    def test_range_start_at_or_past_length_is_416_with_total(self) -> None:
+        resource_id = self._completed(b"0123456789")
+        for value in ("bytes=10-10", "bytes=10-", "bytes=99-100"):
+            with self.subTest(value=value):
+                status, headers, body = call_json(
+                    "GET",
+                    f"/resources/{resource_id}/content",
+                    headers={"HTTP_RANGE": value},
+                )
+                self.assertEqual(status, "416 Range Not Satisfiable")
+                self.assertEqual(body["error"], "range_not_satisfiable")
+                self.assertIn(("Content-Range", "bytes */10"), headers)
+
+    def test_range_bad_syntax_is_400(self) -> None:
+        resource_id = self._completed(b"0123456789")
+        for value in (
+            "items=0-3",
+            "bytes=0",
+            "bytes=abc-def",
+            "bytes=0-0-0",
+            "bytes=0-3,5-6",
+            "bytes=-0",
+            "bytes=--1",
+            "bytes=3-2",
+            "Bytes=0-3",
+            "bytes=",
+            "bytes=0-3;x",
+        ):
+            with self.subTest(value=value):
+                status, _h, body = call_json(
+                    "GET",
+                    f"/resources/{resource_id}/content",
+                    headers={"HTTP_RANGE": value},
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+    def test_range_on_empty_completed_content_is_416(self) -> None:
+        empty_digest = hashlib.sha256(b"").hexdigest()
+        resource_id = self._create(empty_digest)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"",
+            headers=chunk_headers(1, empty_digest),
+        )
+        call("POST", f"/resources/{resource_id}/assemble")
+        for value in ("bytes=0-0", "bytes=0-", "bytes=-1"):
+            with self.subTest(value=value):
+                status, headers, body = call_json(
+                    "GET",
+                    f"/resources/{resource_id}/content",
+                    headers={"HTTP_RANGE": value},
+                )
+                self.assertEqual(status, "416 Range Not Satisfiable")
+                self.assertEqual(body["error"], "range_not_satisfiable")
+                self.assertIn(("Content-Range", "bytes */0"), headers)
+
+    def test_range_before_completion_is_content_not_complete(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, _h, body = call_json(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=0-3"},
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "content_not_complete")
+
+    def test_range_on_missing_resource_is_404(self) -> None:
+        status, _h, body = call_json(
+            "GET",
+            "/resources/missing/content",
+            headers={"HTTP_RANGE": "bytes=0-3"},
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "resource_not_found")
+
+    def test_range_bad_request_precedence(self) -> None:
+        # Malformed range is rejected before resource state is consulted.
+        status, _h, body = call_json(
+            "GET",
+            "/resources/missing/content",
+            headers={"HTTP_RANGE": "items=0-3"},
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+        # A syntactically valid range on a missing resource stays a 404.
+        status, _h, body = call_json(
+            "GET",
+            "/resources/missing/content",
+            headers={"HTTP_RANGE": "bytes=0-3"},
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "resource_not_found")
+
+    def test_range_with_query_parameters_is_400(self) -> None:
+        resource_id = self._completed(b"0123456789")
+        status, _h, body = call_json(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=0-3"},
+            query_string="x=1",
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_range_non_get_method_is_405_with_allow_get(self) -> None:
+        resource_id = self._completed(b"0123456789")
+        status, headers, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=0-3"},
+        )
+        self.assertEqual(status, "405 Method Not Allowed")
+        self.assertEqual(body["error"], "method_not_allowed")
+        self.assertIn(("Allow", "GET"), headers)
+
+    def test_range_read_is_read_only(self) -> None:
+        payload = b"0123456789"
+        resource_id = self._completed(payload)
+        before = content_store.session_status(resource_id)
+        for value in ("bytes=0-3", "bytes=7-", "bytes=-2", "bytes=0-100"):
+            call(
+                "GET",
+                f"/resources/{resource_id}/content",
+                headers={"HTTP_RANGE": value},
+            )
+        self.assertEqual(content_store.session_status(resource_id), before)
+        # The un-ranged read still returns every original byte.
+        _s, _h, raw = call("GET", f"/resources/{resource_id}/content")
+        self.assertEqual(raw, payload)
+
     # --- Session status ----------------------------------------------------
 
     def test_status_before_start_is_409_and_creates_nothing(self) -> None:

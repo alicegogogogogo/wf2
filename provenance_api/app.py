@@ -202,6 +202,7 @@ _SIGNED_DIGEST_HEADER = "HTTP_X_SIGNED_DIGEST"
 _KEY_ID_HEADER_NAME = "X-Key-Id"
 _SIGNATURE_HEADER_NAME = "X-Signature"
 _SIGNED_DIGEST_HEADER_NAME = "X-Signed-Digest"
+_RANGE_HEADER = "HTTP_RANGE"
 
 #: Random per-process key so cursors cannot be forged and never survive a
 #: restart; nothing here is persisted to disk.
@@ -1367,6 +1368,72 @@ def _handle_assemble(
     )
 
 
+def _parse_byte_range(raw: str) -> tuple[str, int, int | None] | None:
+    """Parse a single, syntactically valid byte range spec from ``Range``.
+
+    Accepts only the ``bytes`` unit with exactly one spec:
+    ``bytes=START-END``, ``bytes=START-`` (open end) or
+    ``bytes=-SUFFIX`` (last ``SUFFIX`` bytes, which must be at least 1).
+    Returns ``("range", start, end)`` with ``end`` ``None`` for an open
+    end, or ``("suffix", length, None)``. ``None`` means the condition is
+    not a byte unit, is malformed (including a zero or negative suffix
+    length) or carries more than one spec.
+    """
+
+    spec, separator, unit = raw.partition("=")
+    if not separator or spec != "bytes":
+        return None
+    if "," in unit:
+        # Only a single byte interval is supported.
+        return None
+
+    start_text, dash, end_text = unit.partition("-")
+    if not dash:
+        return None
+    if start_text == "":
+        # Suffix form: -SUFFIX, length at least 1; "-0" is invalid.
+        if _POSITIVE_INT_PATTERN.fullmatch(end_text) is None:
+            return None
+        return ("suffix", int(end_text), None)
+
+    if _NON_NEGATIVE_INT_PATTERN.fullmatch(start_text) is None:
+        return None
+    start = int(start_text)
+    if end_text == "":
+        return ("range", start, None)
+    if _NON_NEGATIVE_INT_PATTERN.fullmatch(end_text) is None:
+        return None
+    end = int(end_text)
+    if end < start:
+        # An interval whose end precedes its start is not a legal range.
+        return None
+    return ("range", start, end)
+
+
+def _resolve_byte_range(
+    spec: tuple[str, int, int | None], size: int
+) -> tuple[int, int] | None:
+    """Clamp a parsed spec to content of ``size`` bytes.
+
+    Returns ``(start, end)`` inclusive, or ``None`` when no byte can be
+    served (empty content, or a start at or past the end). An end past
+    the content is clamped to the final byte.
+    """
+
+    kind, first, end = spec
+    if kind == "suffix":
+        if size == 0:
+            return None
+        start = max(0, size - first)
+        return start, size - 1
+
+    if first >= size:
+        return None
+    if end is None:
+        return first, size - 1
+    return first, min(end, size - 1)
+
+
 def _handle_content(
     method: str,
     environ: dict[str, Any],
@@ -1393,6 +1460,24 @@ def _handle_content(
             start_response, "400 Bad Request", "invalid_request", query_error
         )
 
+    raw_range = environ.get(_RANGE_HEADER)
+    range_spec = None
+    if raw_range is not None:
+        # A range condition is request-shape validation: a non-byte unit,
+        # malformed syntax or a multi-range form is a bad request before
+        # the resource or its assembly state are consulted.
+        if not isinstance(raw_range, str):
+            raw_range = str(raw_range)
+        range_spec = _parse_byte_range(raw_range)
+        if range_spec is None:
+            return _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                "Range header must be a single byte range, e.g. "
+                "'bytes=START-END', 'bytes=START-' or 'bytes=-SUFFIX'.",
+            )
+
     if store.get(raw_id) is None:
         return _error(
             start_response,
@@ -1407,6 +1492,33 @@ def _handle_content(
         return _error(
             start_response, "409 Conflict", exc.code, exc.message
         )
+
+    if range_spec is not None:
+        resolved = _resolve_byte_range(range_spec, len(body))
+        if resolved is None:
+            # Empty content and a start at or past the total length are
+            # unsatisfiable; the response still states the total length.
+            return _json_response(
+                start_response,
+                "416 Range Not Satisfiable",
+                {
+                    "error": "range_not_satisfiable",
+                    "message": "The requested byte range is not satisfiable.",
+                },
+                extra_headers=[("Content-Range", f"bytes */{len(body)}")],
+                trailing_newline=True,
+            )
+        start, end = resolved
+        chunk = body[start : end + 1]
+        start_response(
+            "206 Partial Content",
+            [
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Length", str(len(chunk))),
+                ("Content-Range", f"bytes {start}-{end}/{len(body)}"),
+            ],
+        )
+        return [chunk]
 
     # The finalized artifact is returned as raw bytes only: no JSON wrapper
     # and no trailing newline.
