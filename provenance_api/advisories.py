@@ -9,6 +9,7 @@ the rest of the in-process state.
 
 from __future__ import annotations
 
+from .component_fixes import recommended_fix_version
 from .resources import ResourceStore
 from .vulnerabilities import VulnerabilityStore, max_severity
 
@@ -107,3 +108,69 @@ def advisory_detail(
         "affected_resources": affected,
         "alerts": alerts,
     }
+
+
+def advisory_fixes(
+    resources: ResourceStore,
+    vulnerabilities: VulnerabilityStore,
+    advisory: str,
+    severity: str | None = None,
+) -> dict[str, object]:
+    """Return the per-component fix recommendation view for one advisory.
+
+    The identifier is matched verbatim and echoed back unchanged. With
+    ``severity`` set (already normalized to lowercase), only alerts at that
+    level participate, so under the same filter the component counts add up
+    to the advisory's matching alert count in the summary and detail views.
+
+    Components are expanded in resource registration order, aggregating the
+    matching alerts inside each resource by that resource's submission
+    order; the same component therefore appears at most once even when it
+    hits on several resources. A component that contributes no matching
+    alert is never emitted. Each entry lists exactly the resources that
+    contribute a matching alert, in registration order and without
+    duplicates; the count is the raw number of matching alerts for the
+    component, neither deduplicated nor merged. The recommendation is the
+    greatest non-empty numeric ``fixed_version`` among the matching
+    alerts, using the same comparison rule as the per-resource component
+    fix view; ``None`` and non-numeric candidates are ignored, and an
+    empty candidate set leaves the recommendation empty. An unknown
+    advisory, or a filter that matches nothing, yields an empty
+    ``fixes`` array.
+    """
+
+    # component -> contributing resource ids, in first-encounter order.
+    component_resources: dict[str, list[str]] = {}
+    component_counts: dict[str, int] = {}
+    component_versions: dict[str, list[str | None]] = {}
+
+    for resource in resources.list_all():
+        # Keep submission order within the resource so aggregation follows
+        # the alert submission order documented for this view.
+        per_resource_components: set[str] = set()
+        for alert in vulnerabilities.list_for(resource.id, severity):
+            if alert.advisory != advisory:
+                continue
+            if alert.component not in component_resources:
+                component_resources[alert.component] = []
+                component_counts[alert.component] = 0
+                component_versions[alert.component] = []
+            if alert.component not in per_resource_components:
+                per_resource_components.add(alert.component)
+                component_resources[alert.component].append(resource.id)
+            component_counts[alert.component] += 1
+            component_versions[alert.component].append(alert.fixed_version)
+
+    fixes = [
+        {
+            "name": component,
+            "affected_resources": component_resources[component],
+            "advisory_count": component_counts[component],
+            "recommended_version": recommended_fix_version(
+                component_versions[component]
+            ),
+        }
+        for component in component_resources
+    ]
+
+    return {"advisory": advisory, "fixes": fixes}
