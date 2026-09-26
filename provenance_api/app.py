@@ -1206,6 +1206,139 @@ def _handle_chunk(
     )
 
 
+def _session_status_payload(raw_id: str, status: Any) -> dict[str, Any]:
+    return {
+        "id": raw_id,
+        "digest": status.digest,
+        "total_chunks": status.total,
+        "received_chunks": status.received_chunks,
+        "missing_chunks": list(status.missing_chunks),
+        "complete": status.complete,
+        "size": status.size,
+    }
+
+
+def _handle_chunks_start(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Validate the whole declaration before touching any store, so a bad
+    # request never creates a session or leaves half a record behind.
+    if not isinstance(payload, dict):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be a JSON object.",
+        )
+    unknown_fields = set(payload) - {"total_chunks", "digest"}
+    if unknown_fields:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            f"Unknown field: {sorted(unknown_fields)[0]!r}.",
+        )
+    if "total_chunks" not in payload:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Missing required field: 'total_chunks'.",
+        )
+    total = payload["total_chunks"]
+    if isinstance(total, bool) or not isinstance(total, int) or total < 1:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Field 'total_chunks' must be a positive integer.",
+        )
+    if "digest" not in payload:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Missing required field: 'digest'.",
+        )
+    raw_digest = payload["digest"]
+    if not isinstance(raw_digest, str) or _DIGEST_PATTERN.fullmatch(
+        raw_digest
+    ) is None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Field 'digest' must be a 64-character hexadecimal digest.",
+        )
+    digest = raw_digest.lower()
+
+    resource = store.get(raw_id)
+    if resource is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    try:
+        created, status = content_store.start_session(
+            raw_id, total, digest, resource.digest
+        )
+    except ContentError as exc:
+        return _error(
+            start_response, "409 Conflict", exc.code, exc.message
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created" if created else "200 OK",
+        _session_status_payload(raw_id, status),
+        trailing_newline=True,
+    )
+
+
 def _handle_chunks_status(
     method: str,
     environ: dict[str, Any],
@@ -1253,15 +1386,7 @@ def _handle_chunks_status(
     return _json_response(
         start_response,
         "200 OK",
-        {
-            "id": raw_id,
-            "digest": status.digest,
-            "total_chunks": status.total,
-            "received_chunks": status.received_chunks,
-            "missing_chunks": list(status.missing_chunks),
-            "complete": status.complete,
-            "size": status.size,
-        },
+        _session_status_payload(raw_id, status),
         trailing_newline=True,
     )
 
@@ -5378,6 +5503,10 @@ def application(
                 return _handle_chunks_status(
                     method, environ, head, start_response
                 )
+            if separator and tail == "chunks/start":
+                return _handle_chunks_start(
+                    method, environ, head, start_response
+                )
             if separator and tail.startswith("chunks/"):
                 return _handle_chunk(
                     method, environ, head, tail[len("chunks/"):],
@@ -5403,6 +5532,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/chunks/status")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/chunks/start"):
+                # Fallback for a separator inside the id segment so the
+                # start handler rejects it without opening any session.
+                return _handle_chunks_start(
+                    method,
+                    environ,
+                    suffix[: -len("/chunks/start")],
                     start_response,
                 )
             if separator and suffix.endswith("/chunks"):

@@ -1,7 +1,9 @@
 """Process-local, content-addressed chunk storage and assembly.
 
 A chunk session is opened implicitly by the first accepted chunk for a
-resource. The first chunk fixes the total chunk count and the target digest
+resource, or explicitly by a start declaration that fixes the same two
+values without storing any bytes. The first chunk (or the start
+declaration) fixes the total chunk count and the target digest
 for the whole content; later chunks must repeat both. Assembling
 concatenates the chunks in index order, computes SHA-256 and, on success,
 marks the resource content complete.
@@ -109,6 +111,61 @@ class ContentStore:
         removed = len(session.chunks)
         del self._sessions[resource_id]
         return digest, removed
+
+    def start_session(
+        self,
+        resource_id: str,
+        total: int,
+        digest: str,
+        registered_digest: str,
+    ) -> tuple[bool, "SessionStatus"]:
+        """Explicitly open an upload session without storing any chunk.
+
+        ``total`` is a positive integer and ``digest`` the 64-character
+        lowercase hex target digest declared for the whole content; both are
+        fixed for the session exactly as the first accepted chunk would fix
+        them, and later chunks must repeat them. Returns ``(created,
+        status)`` where ``created`` is ``True`` when a new session was
+        opened (HTTP 201) and ``False`` when the same declaration was
+        repeated (HTTP 200, idempotent); ``status`` is the current
+        read-only snapshot. Raises :class:`ContentError` for:
+
+        - ``content_already_complete`` after the content has been assembled;
+        - ``digest_conflict`` when no session exists yet and the declared
+          digest differs from the registered one (no session is created);
+        - ``chunk_conflict`` when an open session was declared with a
+          different total or digest (received chunks are kept as they are).
+        """
+
+        session = self._sessions.get(resource_id)
+        if session is not None and session.complete:
+            raise ContentError(
+                "content_already_complete",
+                "Content for this resource is already complete.",
+            )
+
+        created = False
+        if session is None:
+            if digest != registered_digest:
+                raise ContentError(
+                    "digest_conflict",
+                    "Target digest does not match the registered resource "
+                    "digest.",
+                )
+            session = _Session(total=total, digest=digest)
+            self._sessions[resource_id] = session
+            created = True
+        elif session.total != total or session.digest != digest:
+            # The established declaration wins, exactly as with chunk
+            # metadata: a differing repeat is a conflict, not a new target.
+            raise ContentError(
+                "chunk_conflict",
+                "Start declaration conflicts with the established session.",
+            )
+
+        status = self.session_status(resource_id)
+        assert status is not None
+        return created, status
 
     def add_chunk(
         self,
