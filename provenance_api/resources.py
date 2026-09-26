@@ -492,3 +492,70 @@ class ResourceStore:
             "in_degree": ranking(in_degree),
             "max_depth": max_depth,
         }
+
+    def shortest_dependency_path(
+        self, start: str, target: str
+    ) -> list[str] | None:
+        """Return the shortest dependency path from ``start`` to ``target``.
+
+        Edges are followed in their dependency direction (the start resource
+        depends on the next node). The graph is traversed breadth first, so
+        the result has the fewest edges; when several equally short paths
+        exist, the tie is broken lexicographically by the *registration
+        order* of the nodes -- first by the second node, then the third, and
+        so on. A node appears at most once. The path from an existing
+        resource to itself is the single-element ``[start]``. Returns
+        ``None`` when ``target`` is not reachable from ``start``.
+
+        The traversal is iterative, so a long chain cannot exhaust the
+        Python stack; everything is derived on the fly from the current
+        graph and nothing is recorded.
+        """
+
+        if start == target:
+            return [start]
+
+        # Breadth-first expansion: the first depth at which the target is
+        # discovered is the shortest path length. Within one depth, partial
+        # paths are kept in lexicographic order of the registration ranks of
+        # their nodes (start excluded), so the first partial path that
+        # reaches the target is the stipulated tie-break. Newly reached
+        # nodes for the next depth are de-duplicated by node, keeping the
+        # lexicographically smallest partial path for each one.
+        rank = {resource.id: index for index, resource in enumerate(self._resources)}
+        paths: list[list[str]] = [[start]]
+        reached: set[str] = {start}
+        while paths:
+            next_paths: list[list[str]] = []
+            best_by_node: dict[str, list[str]] = {}
+            for path in paths:
+                for successor in self._dependencies.get(path[-1], ()):
+                    if successor in reached:
+                        continue
+                    candidate = path + [successor]
+                    current = best_by_node.get(successor)
+                    if current is None or self._path_is_less(candidate, current, rank):
+                        best_by_node[successor] = candidate
+            # The target is reached at this (shortest) depth; the smallest
+            # candidate kept for it is the stipulated tie-break winner,
+            # independent of the order individual edges were established.
+            target_path = best_by_node.pop(target, None)
+            if target_path is not None:
+                return target_path
+            for node, path in best_by_node.items():
+                reached.add(node)
+                next_paths.append(path)
+            next_paths.sort(key=lambda path: [rank[node] for node in path[1:]])
+            paths = next_paths
+        return None
+
+    @staticmethod
+    def _path_is_less(
+        candidate: list[str], current: list[str], rank: dict[str, int]
+    ) -> bool:
+        """Compare two equal-length partial paths by registration order."""
+
+        for a, b in zip(candidate[1:], current[1:]):
+            if rank[a] != rank[b]:
+                return rank[a] < rank[b]
+        return False
