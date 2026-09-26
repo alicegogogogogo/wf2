@@ -199,6 +199,7 @@ _CONTENT_DIGEST_HEADER_NAME = "X-Content-Digest"
 _KEY_ID_HEADER = "HTTP_X_KEY_ID"
 _SIGNATURE_HEADER = "HTTP_X_SIGNATURE"
 _SIGNED_DIGEST_HEADER = "HTTP_X_SIGNED_DIGEST"
+_RANGE_HEADER = "HTTP_RANGE"
 _KEY_ID_HEADER_NAME = "X-Key-Id"
 _SIGNATURE_HEADER_NAME = "X-Signature"
 _SIGNED_DIGEST_HEADER_NAME = "X-Signed-Digest"
@@ -466,8 +467,9 @@ def _error(
     *,
     allowed: str | None = None,
     trailing_newline: bool = True,
+    extra_headers: list[tuple[str, str]] | None = None,
 ) -> Iterable[bytes]:
-    headers = []
+    headers = list(extra_headers) if extra_headers else []
     if allowed is not None:
         headers.append(("Allow", allowed))
     return _json_response(
@@ -1367,6 +1369,69 @@ def _handle_assemble(
     )
 
 
+class RangeNotSatisfiable(Exception):
+    """A syntactically valid byte range does not intersect the content."""
+
+    def __init__(self, size: int) -> None:
+        super().__init__(f"Requested range is not satisfiable for size {size}.")
+        self.size = size
+
+
+def _parse_byte_range(
+    raw: str, size: int
+) -> tuple[int, int] | None:
+    """Parse a single HTTP byte range against a known content length.
+
+    Returns the inclusive ``(start, end)`` interval, already clamped to the
+    available bytes, or ``None`` when the header is not a syntactically valid
+    single ``bytes=`` range (wrong unit, multiple ranges, non-decimal or
+    reversed positions, an empty suffix length). Callers distinguish that
+    case from :class:`RangeNotSatisfiable`, raised when a well-formed range
+    starts at or beyond ``size`` (which also covers every range on empty
+    content).
+    """
+
+    raw = raw.strip()
+    if raw[: len("bytes=")].lower() != "bytes=":
+        return None
+    spec = raw[len("bytes=") :]
+    if not spec or "," in spec:
+        return None
+
+    digits = "0123456789"
+    if spec.startswith("-"):
+        # Suffix range: last N bytes. A zero or negative suffix length is a
+        # syntax error rather than an unsatisfiable range.
+        suffix = spec[1:]
+        if not suffix or any(char not in digits for char in suffix):
+            return None
+        length = int(suffix)
+        if length == 0:
+            return None
+        if size == 0:
+            raise RangeNotSatisfiable(size)
+        start = max(0, size - length)
+        return start, size - 1
+
+    start_text, dash, end_text = spec.partition("-")
+    if not dash or not start_text:
+        return None
+    if any(char not in digits for char in start_text):
+        return None
+    start = int(start_text)
+    if start >= size:
+        raise RangeNotSatisfiable(size)
+    if end_text == "":
+        # Open-ended: from ``start`` through the final byte.
+        return start, size - 1
+    if any(char not in digits for char in end_text):
+        return None
+    end = int(end_text)
+    if end < start:
+        return None
+    return start, min(end, size - 1)
+
+
 def _handle_content(
     method: str,
     environ: dict[str, Any],
@@ -1408,16 +1473,52 @@ def _handle_content(
             start_response, "409 Conflict", exc.code, exc.message
         )
 
-    # The finalized artifact is returned as raw bytes only: no JSON wrapper
-    # and no trailing newline.
+    raw_range = environ.get(_RANGE_HEADER)
+    if raw_range is None:
+        # Without a range condition the finalized artifact is returned whole
+        # as raw bytes only: no JSON wrapper and no trailing newline.
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Length", str(len(body))),
+            ],
+        )
+        return [body]
+
+    if not isinstance(raw_range, str):
+        raw_range = str(raw_range)
+    try:
+        interval = _parse_byte_range(raw_range, len(body))
+    except RangeNotSatisfiable as exc:
+        return _error(
+            start_response,
+            "416 Range Not Satisfiable",
+            "range_not_satisfiable",
+            "Requested byte range is not satisfiable.",
+            extra_headers=[("Content-Range", f"bytes */{exc.size}")],
+        )
+    if interval is None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Range header must be a single byte range, e.g. 'bytes=0-99'.",
+        )
+
+    start, end = interval
+    partial = body[start : end + 1]
+    # Only the hit raw bytes are returned; the length header is the exact
+    # segment size and Content-Range names the positions and total length.
     start_response(
-        "200 OK",
+        "206 Partial Content",
         [
             ("Content-Type", "application/octet-stream"),
-            ("Content-Length", str(len(body))),
+            ("Content-Length", str(len(partial))),
+            ("Content-Range", f"bytes {start}-{end}/{len(body)}"),
         ],
     )
-    return [body]
+    return [partial]
 
 
 def _lifecycle_response(

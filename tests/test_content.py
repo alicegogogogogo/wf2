@@ -688,6 +688,199 @@ class ChunkFlowTests(unittest.TestCase):
         self.assertEqual(status, "409 Conflict")
         self.assertEqual(body["error"], "content_not_complete")
 
+    # --- Range reads -------------------------------------------------------
+
+    def _assembled(self, payload: bytes) -> str:
+        resource_id, _digest = self._chunks([payload[:5], payload[5:]])
+        call("POST", f"/resources/{resource_id}/assemble")
+        return resource_id
+
+    def test_range_closed_interval_returns_206(self) -> None:
+        payload = bytes(range(20))
+        resource_id = self._assembled(payload)
+        status, headers, raw = call(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=2-7"},
+        )
+        self.assertEqual(status, "206 Partial Content")
+        self.assertIn(("Content-Type", "application/octet-stream"), headers)
+        self.assertIn(("Content-Length", "6"), headers)
+        self.assertIn(("Content-Range", "bytes 2-7/20"), headers)
+        self.assertEqual(raw, payload[2:8])
+
+    def test_range_open_start_open_end_forms(self) -> None:
+        payload = b"abcdefghij"
+        resource_id = self._assembled(payload)
+        status, headers, raw = call(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=4-"},
+        )
+        self.assertEqual(status, "206 Partial Content")
+        self.assertIn(("Content-Range", "bytes 4-9/10"), headers)
+        self.assertEqual(raw, b"efghij")
+
+        status, headers, raw = call(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=-3"},
+        )
+        self.assertEqual(status, "206 Partial Content")
+        self.assertIn(("Content-Range", "bytes 7-9/10"), headers)
+        self.assertEqual(raw, b"hij")
+
+    def test_range_end_beyond_length_is_clamped(self) -> None:
+        payload = b"abcdefghij"
+        resource_id = self._assembled(payload)
+        status, headers, raw = call(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=8-9999"},
+        )
+        self.assertEqual(status, "206 Partial Content")
+        self.assertIn(("Content-Range", "bytes 8-9/10"), headers)
+        self.assertIn(("Content-Length", "2"), headers)
+        self.assertEqual(raw, b"ij")
+
+        # A suffix length larger than the content covers the whole body.
+        status, headers, raw = call(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=-100"},
+        )
+        self.assertEqual(status, "206 Partial Content")
+        self.assertIn(("Content-Range", "bytes 0-9/10"), headers)
+        self.assertEqual(raw, payload)
+
+    def test_range_single_last_byte(self) -> None:
+        payload = b"abcdefghij"
+        resource_id = self._assembled(payload)
+        status, headers, raw = call(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=9-9"},
+        )
+        self.assertEqual(status, "206 Partial Content")
+        self.assertIn(("Content-Range", "bytes 9-9/10"), headers)
+        self.assertEqual(raw, b"j")
+
+    def test_range_start_at_or_beyond_length_is_416(self) -> None:
+        payload = b"abcdefghij"
+        resource_id = self._assembled(payload)
+        for value in ("bytes=10-", "bytes=10-10", "bytes=99-"):
+            with self.subTest(value=value):
+                status, headers, body = call_json(
+                    "GET",
+                    f"/resources/{resource_id}/content",
+                    headers={"HTTP_RANGE": value},
+                )
+                self.assertEqual(status, "416 Range Not Satisfiable")
+                self.assertEqual(body["error"], "range_not_satisfiable")
+                self.assertIn(("Content-Range", "bytes */10"), headers)
+
+    def test_any_range_on_empty_completed_content_is_416(self) -> None:
+        empty_digest = hashlib.sha256(b"").hexdigest()
+        resource_id = self._create(empty_digest)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"",
+            headers=chunk_headers(1, empty_digest),
+        )
+        call("POST", f"/resources/{resource_id}/assemble")
+        # Whole-content read still answers 200 with an empty body.
+        status, headers, raw = call(
+            "GET", f"/resources/{resource_id}/content"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertIn(("Content-Length", "0"), headers)
+        self.assertEqual(raw, b"")
+        for value in ("bytes=0-", "bytes=0-0", "bytes=-1"):
+            with self.subTest(value=value):
+                status, headers, body = call_json(
+                    "GET",
+                    f"/resources/{resource_id}/content",
+                    headers={"HTTP_RANGE": value},
+                )
+                self.assertEqual(status, "416 Range Not Satisfiable")
+                self.assertEqual(body["error"], "range_not_satisfiable")
+                self.assertIn(("Content-Range", "bytes */0"), headers)
+
+    def test_malformed_range_is_400(self) -> None:
+        payload = b"abcdefghij"
+        resource_id = self._assembled(payload)
+        invalid = (
+            "items=0-9",
+            "bytes=0-9,10-19",
+            "bytes=5-2",
+            "bytes=abc-def",
+            "bytes=-",
+            "bytes=-0",
+            "bytes=--1",
+            "bytes=1.5-2",
+            "",
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                status, _h, body = call_json(
+                    "GET",
+                    f"/resources/{resource_id}/content",
+                    headers={"HTTP_RANGE": value},
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+
+    def test_range_on_missing_resource_is_404(self) -> None:
+        status, _h, body = call_json(
+            "GET",
+            "/resources/missing/content",
+            headers={"HTTP_RANGE": "bytes=0-9"},
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "resource_not_found")
+
+    def test_range_before_completion_is_409(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, _h, body = call_json(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=0-9"},
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "content_not_complete")
+
+    def test_range_with_query_parameter_is_400(self) -> None:
+        payload = b"abcdefghij"
+        resource_id = self._assembled(payload)
+        status, _h, body = call_json(
+            "GET",
+            f"/resources/{resource_id}/content",
+            headers={"HTTP_RANGE": "bytes=0-9"},
+            query_string="x=1",
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_range_read_is_read_only(self) -> None:
+        payload = bytes(range(40))
+        resource_id = self._assembled(payload)
+        for value in ("bytes=0-9", "bytes=999-", "bytes=-0"):
+            call(
+                "GET",
+                f"/resources/{resource_id}/content",
+                headers={"HTTP_RANGE": value},
+            )
+        # Bytes, completion state and counters are all untouched.
+        status, _h, raw = call("GET", f"/resources/{resource_id}/content")
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(raw, payload)
+        status, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertIs(body["complete"], True)
+        self.assertEqual(body["size"], 40)
+
     # --- Session status ----------------------------------------------------
 
     def test_status_before_start_is_409_and_creates_nothing(self) -> None:
