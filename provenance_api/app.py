@@ -1093,6 +1093,108 @@ def _handle_graph(
     )
 
 
+def _graph_stats(resources: list[Resource], edges: list[tuple[str, str]]) -> dict[str, object]:
+    """Compute the immediate whole-graph statistics from a snapshot.
+
+    Degree counts and the isolated set treat manually registered and
+    cross-reference-resolved edges alike, since both arrive through the
+    same edge list. The dependency graph is acyclic by construction, so
+    the longest dependency chain is a memoized longest path counted in
+    nodes; an isolated node contributes one.
+    """
+
+    out_counts: dict[str, int] = {resource.id: 0 for resource in resources}
+    in_counts: dict[str, int] = {resource.id: 0 for resource in resources}
+    neighbors: dict[str, list[str]] = {
+        resource.id: [] for resource in resources
+    }
+    for resource_id, dependency_id in edges:
+        out_counts[resource_id] += 1
+        in_counts[dependency_id] += 1
+        neighbors[resource_id].append(dependency_id)
+
+    isolated = [
+        resource.id
+        for resource in resources
+        if out_counts[resource.id] == 0 and in_counts[resource.id] == 0
+    ]
+
+    def ranking(counts: dict[str, int]) -> list[dict[str, object]]:
+        # Collected in registration order, then sorted stably on the
+        # degree alone, so equal degrees keep the registration order.
+        entries = [
+            (resource.id, counts[resource.id])
+            for resource in resources
+            if counts[resource.id] > 0
+        ]
+        entries.sort(key=lambda entry: -entry[1])
+        return [
+            {"resource_id": resource_id, "degree": degree}
+            for resource_id, degree in entries
+        ]
+
+    longest_memo: dict[str, int] = {}
+
+    def longest(resource_id: str) -> int:
+        cached = longest_memo.get(resource_id)
+        if cached is not None:
+            return cached
+        outgoing = neighbors[resource_id]
+        value = 1 if not outgoing else 1 + max(
+            longest(dependency_id) for dependency_id in outgoing
+        )
+        longest_memo[resource_id] = value
+        return value
+
+    max_depth = max(
+        (longest(resource.id) for resource in resources), default=0
+    )
+
+    return {
+        "nodes": len(resources),
+        "edges": len(edges),
+        "isolated": isolated,
+        "out_degree": ranking(out_counts),
+        "in_degree": ranking(in_counts),
+        "max_depth": max_depth,
+    }
+
+
+def _handle_graph_stats(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # Read-only and parameter-free: a declared non-empty (or malformed)
+    # body or any query string is a bad request without consulting any
+    # business data; an omitted length header or an explicit zero are an
+    # empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    stats = _graph_stats(store.list_all(), store.list_edges())
+    return _json_response(
+        start_response, "200 OK", stats, trailing_newline=True
+    )
+
+
 def _read_declared_body(environ: dict[str, Any]) -> tuple[bytes | None, str | None]:
     """Read exactly the declared request body for content verification.
 
@@ -5445,6 +5547,9 @@ def application(
 
         if path == "/graph":
             return _handle_graph(method, environ, start_response)
+
+        if path == "/graph/stats":
+            return _handle_graph_stats(method, environ, start_response)
 
         if path.startswith("/advisories/"):
             # The identifier segment is validated by the handler; an
