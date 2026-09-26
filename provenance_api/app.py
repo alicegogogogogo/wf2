@@ -2051,33 +2051,89 @@ def _handle_release_blockers(
             "No resource exists with the requested id.",
         )
 
-    # Read-only, computed on the fly from the very same promotion checks as
-    # the staged -> released transition, but never short-circuiting: both
-    # reason codes and every blocked dependency are reported. Nothing is
-    # recorded and no existing state is touched.
-    content_complete = content_store.is_complete(raw_id)
+    return _json_response(
+        start_response,
+        "200 OK",
+        _promotion_blocker_report(raw_id),
+        trailing_newline=True,
+    )
+
+
+def _promotion_blocker_report(resource_id: str) -> dict[str, object]:
+    """Build one promotion-blocker record for ``resource_id``.
+
+    Shared by the per-resource release-blocker view and the global
+    promotion/blockers summary so both answers always come from the very
+    same promotion checks as the staged -> released transition, without
+    short-circuiting: both reason codes and every blocked dependency are
+    reported. Read-only and computed on the fly; nothing is recorded.
+    """
+
+    content_complete = content_store.is_complete(resource_id)
     reasons: list[str] = []
     if not content_complete:
         reasons.append("content_not_complete")
 
     blockers: list[dict[str, str]] = []
-    for dependency_id in store.list_dependencies(raw_id):
+    for dependency_id in store.list_dependencies(resource_id):
         state = lifecycle_store.get(dependency_id).state
         if state in BLOCKING_STATES:
             blockers.append({"resource_id": dependency_id, "state": state})
     if blockers:
         reasons.append("dependency_blocked")
 
+    return {
+        "id": resource_id,
+        "blocked": bool(reasons),
+        "reasons": reasons,
+        "blockers": blockers,
+        "content_complete": content_complete,
+    }
+
+
+def _handle_promotion_blockers(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # One record per registered resource in registration order, each with
+    # the same fields and key order as the per-resource release-blocker
+    # view. The dependency closure is computed iteratively (it never grows
+    # the Python stack), so a long dependency chain cannot make the query
+    # fail. Nothing is recorded and no state is touched; an empty registry
+    # is a valid empty array.
+    reports = [
+        _promotion_blocker_report(resource.id) for resource in store.list_all()
+    ]
     return _json_response(
         start_response,
         "200 OK",
-        {
-            "id": raw_id,
-            "blocked": bool(reasons),
-            "reasons": reasons,
-            "blockers": blockers,
-            "content_complete": content_complete,
-        },
+        reports,
         trailing_newline=True,
     )
 
@@ -5490,6 +5546,9 @@ def application(
 
         if path == "/graph/stats":
             return _handle_graph_stats(method, environ, start_response)
+
+        if path == "/promotion/blockers":
+            return _handle_promotion_blockers(method, environ, start_response)
 
         if path.startswith("/advisories/"):
             # The identifier segment is validated by the handler; an
