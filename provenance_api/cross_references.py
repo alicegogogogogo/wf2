@@ -95,23 +95,50 @@ class CrossReferenceError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class CrossReference:
-    """A single registered cross-repository reference."""
+    """A single registered cross-repository reference.
+
+    Besides the five client-facing keys the record remembers ``local_id``:
+    the local resource the remote metadata was resolved to at registration
+    time (the target of the dependency edge). It is never sent back by the
+    per-resource listing; only the global summary view exposes it alongside
+    the record.
+    """
 
     resource_id: str
     repository: str
     upstream: str
     remote_id: str
     digest: str
+    local_id: str
 
     def to_dict(self) -> dict[str, object]:
         # ``resource_id`` first, then the four registration keys in their
-        # documented order.
+        # documented order. The per-resource listing keeps this five-field
+        # shape; ``local_id`` is only surfaced by the global summary view.
         return {
             "resource_id": self.resource_id,
             "repository": self.repository,
             "upstream": self.upstream,
             "remote_id": self.remote_id,
             "digest": self.digest,
+        }
+
+    def summary_dict(self, edge_present: bool) -> dict[str, object]:
+        """Shape used by the global ``GET /`` summary view.
+
+        The five listing fields in their fixed order, followed by the
+        resolved local resource id and whether the reference's dependency
+        edge is currently on the graph.
+        """
+
+        return {
+            "resource_id": self.resource_id,
+            "repository": self.repository,
+            "upstream": self.upstream,
+            "remote_id": self.remote_id,
+            "digest": self.digest,
+            "local_id": self.local_id,
+            "edge_present": edge_present,
         }
 
 
@@ -420,6 +447,16 @@ class CrossReferenceStore:
             if record.resource_id == resource_id
         ]
 
+    def list_all(self) -> list[CrossReference]:
+        """Return every reference in global registration order.
+
+        Records keep the order in which they were committed across all
+        resources: the multiple references one resource registered stay in
+        their own registration order and are never sorted or regrouped.
+        """
+
+        return list(self._records)
+
     def check_prerequisites(
         self,
         repository: str,
@@ -561,6 +598,7 @@ class CrossReferenceStore:
             upstream=plan.upstream,
             remote_id=plan.remote_id,
             digest=plan.digest,
+            local_id=dependency.id,
         )
         self._records.append(record)
         self._repository_upstream.setdefault(plan.repository, plan.upstream)
