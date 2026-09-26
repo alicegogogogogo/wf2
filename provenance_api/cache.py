@@ -7,6 +7,11 @@ idempotent no-op; different bytes under an already cached digest are a
 conflict. Reads bump the hit or miss counters; the status snapshot is
 read-only and never changes any counter.
 
+A write can be rehearsed with a read-only pre-check: the same digest,
+conflict and quota rules are evaluated against the submitted bytes and a
+single decision code is returned, but no entry is stored and no counter,
+usage figure or quota figure changes.
+
 A single layer can be removed by digest, or the whole cache cleared at
 once; either operation frees the entry bytes (so quota headroom returns)
 but never touches the hit/miss counters. Removing a digest that is not
@@ -133,6 +138,38 @@ class LayerCacheStore:
         self._layers[digest] = data
         self._used += len(data)
         return True, len(self._layers)
+
+    def check(self, digest: str, data: bytes) -> str:
+        """Rehearse a write without storing anything, returning a decision.
+
+        Applies the very same rules as :meth:`put` -- digest match first,
+        then the cached-entry comparison, then the quota -- and reports the
+        single outcome as a stable code:
+
+        - ``digest_mismatch`` when the bytes do not hash to ``digest``
+          (judged on the submitted bytes alone);
+        - ``already_cached`` when the same bytes are already cached for
+          ``digest`` (a rewrite would be an idempotent no-op);
+        - ``cache_conflict`` when ``digest`` is cached with different
+          bytes (a write would collide with the kept entry);
+        - ``cache_quota_exceeded`` when storing would push the used bytes
+          over the quota;
+        - ``writable`` when none of the above applies and a write would
+          be accepted.
+
+        When several conditions coincide, the first one in this order
+        wins. The check is strictly read-only: entries, hit/miss counters,
+        used bytes and quota headroom are all left untouched.
+        """
+
+        if hashlib.sha256(data).hexdigest() != digest:
+            return "digest_mismatch"
+        existing = self._layers.get(digest)
+        if existing is not None:
+            return "already_cached" if existing == data else "cache_conflict"
+        if self._used + len(data) > self._quota:
+            return "cache_quota_exceeded"
+        return "writable"
 
     def get(self, digest: str) -> bytes | None:
         """Return the cached bytes, counting a hit, or ``None`` on a miss."""

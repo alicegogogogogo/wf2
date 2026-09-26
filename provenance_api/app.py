@@ -3636,6 +3636,65 @@ def _handle_cache_layer_post(
     )
 
 
+def _handle_cache_layer_check(
+    method: str,
+    environ: dict[str, Any],
+    raw_digest: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
+        )
+
+    # Same ordering as a write: the path digest is rejected before the
+    # request body is ever considered.
+    if _DIGEST_PATTERN.fullmatch(raw_digest) is None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Layer digest must be a 64-character hexadecimal string.",
+        )
+    digest = raw_digest.lower()
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    content_type = str(environ.get("CONTENT_TYPE", ""))
+    if content_type.lower() != _OCTET_STREAM_CONTENT_TYPE:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Content-Type must be application/octet-stream.",
+        )
+
+    body, body_error = _read_declared_body(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+    assert body is not None
+
+    # Read-only rehearsal of a write: the decision is reported but no entry
+    # is stored and no counter, usage figure or quota figure changes.
+    decision = cache_store.check(digest, body)
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"digest": digest, "size": len(body), "decision": decision},
+        trailing_newline=True,
+    )
+
+
 def _handle_cache_layer_get(
     environ: dict[str, Any], raw_digest: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -5298,8 +5357,19 @@ def application(
             return _handle_cache_status(method, environ, start_response)
 
         if path.startswith("/cache/layers/"):
+            tail = path[len("/cache/layers/"):]
+            if tail.endswith("/check"):
+                # Read-only write pre-check for the layer path; the digest
+                # segment is validated by the handler, so an embedded
+                # separator is rejected there as a bad request.
+                return _handle_cache_layer_check(
+                    method,
+                    environ,
+                    tail[: -len("/check")],
+                    start_response,
+                )
             return _handle_cache_layer(
-                method, environ, path[len("/cache/layers/"):], start_response
+                method, environ, tail, start_response
             )
 
         if path == "/mirrors":
