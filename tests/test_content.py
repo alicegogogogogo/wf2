@@ -1418,5 +1418,318 @@ class ChunkFlowTests(unittest.TestCase):
         self.assertEqual(content_store._sessions, {})
 
 
+class ChunkStartTests(unittest.TestCase):
+    """Explicit session start (precheck) before any chunk bytes arrive."""
+
+    def setUp(self) -> None:
+        reset_state()
+
+    def _create(self, digest: str) -> str:
+        body = json.dumps(
+            {"name": "r", "category": "code", "digest": digest}
+        ).encode("utf-8")
+        _s, _h, raw = call(
+            "POST",
+            "/resources",
+            body,
+            headers={"CONTENT_TYPE": "application/json"},
+        )
+        return str(json.loads(raw)["id"])
+
+    def _start(
+        self, resource_id: str, total: object, digest: object
+    ) -> tuple[str, list[tuple[str, str]], bytes]:
+        body = json.dumps(
+            {"total_chunks": total, "digest": digest}
+        ).encode("utf-8")
+        return call(
+            "POST",
+            f"/resources/{resource_id}/chunks/start",
+            body,
+            headers={"CONTENT_TYPE": "application/json"},
+        )
+
+    def test_start_returns_201_with_fixed_shape(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, headers, raw = self._start(resource_id, 3, DIGEST_A)
+        self.assertEqual(status, "201 Created")
+        self.assertIn(
+            ("Content-Type", "application/json; charset=utf-8"), headers
+        )
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertFalse(raw.endswith(b"\n\n"))
+        text = raw.decode("utf-8").rstrip("\n")
+        self.assertNotIn(" ", text)  # compact JSON
+        body = json.loads(text)
+        self.assertEqual(
+            list(body),
+            [
+                "id",
+                "digest",
+                "total_chunks",
+                "received_chunks",
+                "missing_chunks",
+                "complete",
+                "size",
+            ],
+        )
+        self.assertEqual(body["id"], resource_id)
+        self.assertEqual(body["digest"], DIGEST_A)
+        self.assertEqual(body["total_chunks"], 3)
+        self.assertEqual(body["received_chunks"], 0)
+        self.assertEqual(body["missing_chunks"], [0, 1, 2])
+        self.assertIs(body["complete"], False)
+        self.assertIsNone(body["size"])
+
+    def test_start_makes_status_report_started(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        self._start(resource_id, 2, DIGEST_A)
+        status, _h, body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["total_chunks"], 2)
+        self.assertEqual(body["received_chunks"], 0)
+        self.assertEqual(body["missing_chunks"], [0, 1])
+        self.assertIs(body["complete"], False)
+        self.assertIsNone(body["size"])
+
+    def test_start_normalizes_mixed_case_digest(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, _h, raw = self._start(resource_id, 1, DIGEST_A.upper())
+        self.assertEqual(status, "201 Created")
+        self.assertEqual(json.loads(raw)["digest"], DIGEST_A)
+
+    def test_repeat_start_same_declaration_is_200_and_keeps_chunks(
+        self,
+    ) -> None:
+        resource_id = self._create(DIGEST_A)
+        self._start(resource_id, 2, DIGEST_A)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(2, DIGEST_A),
+        )
+        status, _h, raw = self._start(resource_id, 2, DIGEST_A)
+        self.assertEqual(status, "200 OK")
+        body = json.loads(raw)
+        self.assertEqual(body["received_chunks"], 1)
+        self.assertEqual(body["missing_chunks"], [1])
+        # The received chunk survived the idempotent repeat.
+        status, _h, status_body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(status_body["received_chunks"], 1)
+
+    def test_repeat_start_different_total_conflicts_and_keeps_chunks(
+        self,
+    ) -> None:
+        resource_id = self._create(DIGEST_A)
+        self._start(resource_id, 2, DIGEST_A)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(2, DIGEST_A),
+        )
+        status, _h, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/chunks/start",
+            json.dumps({"total_chunks": 3, "digest": DIGEST_A}).encode(),
+            headers={"CONTENT_TYPE": "application/json"},
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "chunk_conflict")
+        _s, _h, status_body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status_body["total_chunks"], 2)
+        self.assertEqual(status_body["received_chunks"], 1)
+
+    def test_start_digest_mismatch_creates_no_session(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        status, _h, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/chunks/start",
+            json.dumps({"total_chunks": 2, "digest": DIGEST_B}).encode(),
+            headers={"CONTENT_TYPE": "application/json"},
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "digest_conflict")
+        _s, _h, status_body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status_body["error"], "chunks_not_started")
+
+    def test_start_after_complete_is_content_already_complete(self) -> None:
+        digest = hashlib.sha256(b"a").hexdigest()
+        resource_id = self._create(digest)
+        call(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(1, digest),
+        )
+        call("POST", f"/resources/{resource_id}/assemble")
+        status, _h, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/chunks/start",
+            json.dumps({"total_chunks": 1, "digest": digest}).encode(),
+            headers={"CONTENT_TYPE": "application/json"},
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "content_already_complete")
+
+    def test_start_then_reset_clears_zero_chunks(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        self._start(resource_id, 4, DIGEST_A)
+        status, _h, body = call_json(
+            "DELETE", f"/resources/{resource_id}/chunks"
+        )
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(body["digest"], DIGEST_A)
+        self.assertEqual(body["removed_chunks"], 0)
+        _s, _h, status_body = call_json(
+            "GET", f"/resources/{resource_id}/chunks/status"
+        )
+        self.assertEqual(status_body["error"], "chunks_not_started")
+
+    def test_chunks_after_start_must_match_declaration(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        self._start(resource_id, 2, DIGEST_A)
+        # A chunk whose headers deviate from the declaration conflicts.
+        status, _h, body = call_json(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(3, DIGEST_A),
+        )
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "chunk_conflict")
+        # A chunk repeating the declared values is accepted.
+        status, _h, chunk_body = call_json(
+            "POST",
+            f"/resources/{resource_id}/chunks/0",
+            b"a",
+            headers=chunk_headers(2, DIGEST_A),
+        )
+        self.assertEqual(status, "201 Created")
+        self.assertEqual(chunk_body["total_chunks"], 2)
+
+    def test_start_validation_errors_create_no_session(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        path = f"/resources/{resource_id}/chunks/start"
+        json_headers = {"CONTENT_TYPE": "application/json"}
+        cases: list[tuple[bytes, dict[str, str]]] = [
+            (b"", json_headers),  # missing body
+            (b"{not json", json_headers),  # undecodable
+            (b"[1,2]", json_headers),  # top level not an object
+            (b'{"total_chunks":2}', json_headers),  # missing digest
+            (
+                b'{"digest":"' + DIGEST_A.encode() + b'"}',
+                json_headers,
+            ),  # missing total_chunks
+            (
+                json.dumps(
+                    {"total_chunks": 2, "digest": DIGEST_A, "extra": 1}
+                ).encode(),
+                json_headers,
+            ),  # unknown field
+            (
+                json.dumps({"total_chunks": "2", "digest": DIGEST_A}).encode(),
+                json_headers,
+            ),  # total_chunks wrong type
+            (
+                json.dumps({"total_chunks": 2.0, "digest": DIGEST_A}).encode(),
+                json_headers,
+            ),  # total_chunks not an integer
+            (
+                json.dumps({"total_chunks": True, "digest": DIGEST_A}).encode(),
+                json_headers,
+            ),  # total_chunks boolean
+            (
+                json.dumps({"total_chunks": 0, "digest": DIGEST_A}).encode(),
+                json_headers,
+            ),  # total_chunks zero
+            (
+                json.dumps({"total_chunks": -1, "digest": DIGEST_A}).encode(),
+                json_headers,
+            ),  # total_chunks negative
+            (
+                json.dumps({"total_chunks": 2, "digest": "abc"}).encode(),
+                json_headers,
+            ),  # digest too short
+            (
+                json.dumps({"total_chunks": 2, "digest": "g" * 64}).encode(),
+                json_headers,
+            ),  # digest not hexadecimal
+            (
+                json.dumps({"total_chunks": 2, "digest": 3}).encode(),
+                json_headers,
+            ),  # digest wrong type
+        ]
+        for raw, headers in cases:
+            with self.subTest(raw=raw):
+                status, _h, body = call_json(
+                    "POST", path, raw, headers=headers
+                )
+                self.assertEqual(status, "400 Bad Request")
+                self.assertEqual(body["error"], "invalid_request")
+                _s, _h, status_body = call_json(
+                    "GET", f"/resources/{resource_id}/chunks/status"
+                )
+                self.assertEqual(status_body["error"], "chunks_not_started")
+
+    def test_start_bad_id_and_query_parameters(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        body = json.dumps(
+            {"total_chunks": 1, "digest": DIGEST_A}
+        ).encode()
+        json_headers = {"CONTENT_TYPE": "application/json"}
+        status, _h, payload = call_json(
+            "POST",
+            f"/resources/{resource_id}/chunks/start",
+            body,
+            headers=json_headers,
+            query_string="x=1",
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(payload["error"], "invalid_request")
+        # A separator inside the id segment is a bad request, not a new
+        # route.
+        status, _h, payload = call_json(
+            "POST",
+            "/resources/a/b/chunks/start",
+            body,
+            headers=json_headers,
+        )
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(payload["error"], "invalid_request")
+
+    def test_start_resource_not_found(self) -> None:
+        status, _h, body = call_json(
+            "POST",
+            "/resources/nope/chunks/start",
+            json.dumps({"total_chunks": 1, "digest": DIGEST_A}).encode(),
+            headers={"CONTENT_TYPE": "application/json"},
+        )
+        self.assertEqual(status, "404 Not Found")
+        self.assertEqual(body["error"], "resource_not_found")
+
+    def test_start_non_post_methods_405_with_allow_post(self) -> None:
+        resource_id = self._create(DIGEST_A)
+        for method in ("GET", "PUT", "DELETE", "PATCH"):
+            with self.subTest(method=method):
+                status, headers, body = call_json(
+                    method,
+                    f"/resources/{resource_id}/chunks/start",
+                )
+                self.assertEqual(status, "405 Method Not Allowed")
+                self.assertEqual(body["error"], "method_not_allowed")
+                self.assertIn(("Allow", "POST"), headers)
+
+
 if __name__ == "__main__":
     unittest.main()

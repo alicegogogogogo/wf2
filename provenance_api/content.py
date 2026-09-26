@@ -79,6 +79,75 @@ class ContentStore:
         session = self._sessions.get(resource_id)
         return session is not None and session.complete
 
+    @staticmethod
+    def _status_of(session: _Session) -> SessionStatus:
+        """Snapshot one session without mutating it."""
+
+        missing = tuple(
+            index
+            for index in range(session.total)
+            if index not in session.chunks
+        )
+        return SessionStatus(
+            total=session.total,
+            digest=session.digest,
+            received_chunks=len(session.chunks),
+            missing_chunks=missing,
+            complete=session.complete,
+            size=len(session.content) if session.complete else None,
+        )
+
+    def start_session(
+        self,
+        resource_id: str,
+        total: int,
+        digest: str,
+        registered_digest: str,
+    ) -> tuple[bool, "SessionStatus"]:
+        """Open an upload session explicitly, before any chunk bytes arrive.
+
+        ``total`` is a positive integer and ``digest`` the lowercase
+        64-character hex target digest, both already validated by the
+        caller; ``registered_digest`` is the resource's registered digest.
+        No chunk bytes are written; the session simply fixes the total
+        chunk count and target digest exactly as the first accepted chunk
+        would.
+
+        Returns ``(created, status)`` where ``created`` is ``True`` when a
+        new session was opened (HTTP 201) and ``False`` when the same
+        declaration was repeated (HTTP 200, idempotent; already received
+        chunks are kept). Raises :class:`ContentError` with
+        ``content_already_complete`` after assembly, ``digest_conflict``
+        when the declared digest differs from the registered one (no
+        session is created), or ``chunk_conflict`` when an existing session
+        was opened with a different total or digest (its chunks stay
+        untouched).
+        """
+
+        session = self._sessions.get(resource_id)
+        if session is not None and session.complete:
+            raise ContentError(
+                "content_already_complete",
+                "Content for this resource is already complete.",
+            )
+        if digest != registered_digest:
+            raise ContentError(
+                "digest_conflict",
+                "Target digest does not match the registered resource "
+                "digest.",
+            )
+        if session is None:
+            session = _Session(total=total, digest=digest)
+            self._sessions[resource_id] = session
+            return True, self._status_of(session)
+        if session.total != total or session.digest != digest:
+            raise ContentError(
+                "chunk_conflict",
+                "Start declaration conflicts with the existing upload "
+                "session.",
+            )
+        return False, self._status_of(session)
+
     def reset_session(self, resource_id: str) -> tuple[str, int]:
         """Tear an in-progress upload session back to the unstarted state.
 
@@ -247,16 +316,4 @@ class ContentStore:
         session = self._sessions.get(resource_id)
         if session is None:
             return None
-        missing = tuple(
-            index
-            for index in range(session.total)
-            if index not in session.chunks
-        )
-        return SessionStatus(
-            total=session.total,
-            digest=session.digest,
-            received_chunks=len(session.chunks),
-            missing_chunks=missing,
-            complete=session.complete,
-            size=len(session.content) if session.complete else None,
-        )
+        return self._status_of(session)
