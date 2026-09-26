@@ -389,6 +389,28 @@ class CrossReferenceStore:
         self._repository_upstream = {}
         self._pairs = set()
 
+    def remove_resource(self, resource_id: str) -> None:
+        """Remove every reference registered by a resource.
+
+        The derived indexes (repository bindings and uniqueness pairs) are
+        rebuilt from the remaining records, so constraints implied by other
+        resources' references are preserved. Local resources created while
+        resolving the removed references are deliberately kept.
+        """
+
+        self._records = [
+            record
+            for record in self._records
+            if record.resource_id != resource_id
+        ]
+        self._repository_upstream = {}
+        self._pairs = set()
+        for record in self._records:
+            self._repository_upstream.setdefault(
+                record.repository, record.upstream
+            )
+            self._pairs.add((record.repository, record.remote_id))
+
     def list_for(self, resource_id: str) -> list[CrossReference]:
         """Return a resource's references in registration order."""
 

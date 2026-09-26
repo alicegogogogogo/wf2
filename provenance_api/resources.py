@@ -248,6 +248,32 @@ class ResourceStore:
         self._dependencies.pop(resource_id, None)
         self._dependents.pop(resource_id, None)
 
+    def remove(self, resource_id: str) -> Resource | None:
+        """Remove a resource and every dependency edge touching it.
+
+        Returns the removed record, or ``None`` when the id is unknown.
+        Edges the resource started and edges pointing at it disappear
+        from both graph views; every other resource and edge is left
+        untouched. The id is never reused by later registrations.
+        """
+
+        resource = self._by_id.pop(resource_id, None)
+        if resource is None:
+            return None
+        self._resources = [r for r in self._resources if r.id != resource_id]
+        self._key_to_id.pop(
+            (resource.category, resource.name, resource.digest), None
+        )
+        for dependency_id in self._dependencies.pop(resource_id, ()):
+            dependents = self._dependents.get(dependency_id)
+            if dependents is not None:
+                dependents.discard(resource_id)
+        for dependent_id in self._dependents.pop(resource_id, ()):
+            dependencies = self._dependencies.get(dependent_id)
+            if dependencies is not None:
+                dependencies.discard(resource_id)
+        return resource
+
     # --- Dependencies ------------------------------------------------------
 
     def _reachable(self, start: str, graph: dict[str, set[str]]) -> set[str]:

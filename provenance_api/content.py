@@ -66,6 +66,15 @@ class ContentStore:
     def reset(self) -> None:
         self._sessions = {}
 
+    def remove(self, resource_id: str) -> None:
+        """Discard any upload session and assembled content for a resource.
+
+        Received chunks, the session itself and finalized bytes all become
+        unqueryable; a missing session is a no-op.
+        """
+
+        self._sessions.pop(resource_id, None)
+
     def is_complete(self, resource_id: str) -> bool:
         session = self._sessions.get(resource_id)
         return session is not None and session.complete

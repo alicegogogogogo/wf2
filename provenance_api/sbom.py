@@ -201,6 +201,15 @@ class SbomStore:
         self._sboms = {}
         self._licenses = {}
 
+    def remove_resource(self, resource_id: str) -> None:
+        """Remove any SBOM document and license declaration for a resource.
+
+        An unknown id is a no-op.
+        """
+
+        self._sboms.pop(resource_id, None)
+        self._licenses.pop(resource_id, None)
+
     # --- SBOM --------------------------------------------------------------
 
     def add_sbom(

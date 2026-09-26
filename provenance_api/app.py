@@ -538,31 +538,74 @@ def _handle_resources_post(
     return _resource_response(start_response, "201 Created", created)
 
 
+def _remove_resource_cascade(resource_id: str) -> None:
+    """Remove every record keyed by ``resource_id`` across all stores.
+
+    Alerts, exemptions, SBOM and license data, provenance, policies,
+    signatures, notifications, lifecycle state, chunk sessions with their
+    assembled bytes, cross-repository references and dependency edges all
+    disappear with the resource; derived read-only views (advisory
+    summaries, component views, admission previews, risk scores) are
+    computed on the fly and therefore reflect the removal immediately.
+    Mirror sources, cache entries and other resources are never touched.
+    """
+
+    vulnerability_store.remove_resource(resource_id)
+    vulnerability_exception_store.remove_resource(resource_id)
+    sbom_store.remove_resource(resource_id)
+    provenance_store.remove_resource(resource_id)
+    policy_store.remove_resource(resource_id)
+    signature_store.remove_resource(resource_id)
+    notification_store.remove_resource(resource_id)
+    lifecycle_store.remove(resource_id)
+    content_store.remove(resource_id)
+    cross_reference_store.remove_resource(resource_id)
+    store.remove(resource_id)
+
+
 def _handle_resource_item(
-    method: str, raw_id: str, start_response: StartResponse
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
 ) -> Iterable[bytes]:
-    if method != "GET":
+    if method not in ("GET", "DELETE"):
         return _error(
             start_response,
             "405 Method Not Allowed",
             "method_not_allowed",
             f"Method {method} is not allowed for this path.",
-            allowed="GET",
+            allowed="DELETE, GET",
         )
 
-    if not raw_id:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
         return _error(
-            start_response,
-            "400 Bad Request",
-            "invalid_request",
-            "Resource id must not be empty.",
+            start_response, "400 Bad Request", "invalid_request", id_error
         )
-    if "/" in raw_id or "\\" in raw_id:
+
+    if method == "GET":
+        resource = store.get(raw_id)
+        if resource is None:
+            return _error(
+                start_response,
+                "404 Not Found",
+                "resource_not_found",
+                "No resource exists with the requested id.",
+            )
+        return _resource_response(start_response, "200 OK", resource)
+
+    # DELETE: a bodyless, parameterless request that unregisters the
+    # resource and cascades to every record stored under its id.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
         return _error(
-            start_response,
-            "400 Bad Request",
-            "invalid_request",
-            "Resource id must not contain path separators.",
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
         )
 
     resource = store.get(raw_id)
@@ -574,6 +617,7 @@ def _handle_resource_item(
             "No resource exists with the requested id.",
         )
 
+    _remove_resource_cascade(raw_id)
     return _resource_response(start_response, "200 OK", resource)
 
 
@@ -5202,7 +5246,7 @@ def application(
             # Any other suffix keeps the baseline item semantics (embedded
             # separators are rejected by the item handler).
             return _handle_resource_item(
-                method, suffix, start_response
+                method, environ, suffix, start_response
             )
 
         # Unknown paths and undeclared methods on /health stay as before.

@@ -347,11 +347,11 @@ class ApplicationTests(unittest.TestCase):
 
     def test_item_unsupported_method(self) -> None:
         status, headers, body = call_json(
-            "DELETE", "/resources/anything"
+            "PUT", "/resources/anything"
         )
         self.assertEqual(status, "405 Method Not Allowed")
         self.assertEqual(body["error"], "method_not_allowed")
-        self.assertIn(("Allow", "GET"), headers)
+        self.assertIn(("Allow", "DELETE, GET"), headers)
 
     # --- Collection --------------------------------------------------------
 

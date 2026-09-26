@@ -197,6 +197,14 @@ class PolicyStore:
     def reset(self) -> None:
         self._records = {}
 
+    def remove_resource(self, resource_id: str) -> None:
+        """Remove any admission policy registered for a resource.
+
+        An unknown id is a no-op.
+        """
+
+        self._records.pop(resource_id, None)
+
     def add(
         self, resource_id: str, payload: object
     ) -> tuple[PolicyRecord, bool]:

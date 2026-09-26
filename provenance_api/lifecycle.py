@@ -67,6 +67,15 @@ class LifecycleStore:
     def reset(self) -> None:
         self._records = {}
 
+    def remove(self, resource_id: str) -> None:
+        """Drop any recorded state for a resource.
+
+        Afterwards the resource id reads as the default ``staged`` state
+        again; an unknown id is a no-op.
+        """
+
+        self._records.pop(resource_id, None)
+
     def get(self, resource_id: str) -> LifecycleRecord:
         """Return the current record; resources default to ``staged``."""
 

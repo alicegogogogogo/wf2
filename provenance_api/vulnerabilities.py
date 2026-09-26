@@ -249,6 +249,21 @@ class VulnerabilityStore:
         self._keys = {}
         self._sequence = []
 
+    def remove_resource(self, resource_id: str) -> None:
+        """Remove every alert recorded for a resource.
+
+        Global aggregation views stop counting the resource's alerts
+        immediately; an unknown id is a no-op.
+        """
+
+        self._records.pop(resource_id, None)
+        self._keys.pop(resource_id, None)
+        self._sequence = [
+            (owner_id, alert)
+            for owner_id, alert in self._sequence
+            if owner_id != resource_id
+        ]
+
     def add(self, resource_id: str, payload: object) -> Vulnerability:
         """Validate and append a vulnerability alert for ``resource_id``.
 
