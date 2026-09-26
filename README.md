@@ -681,6 +681,36 @@ curl -s "http://127.0.0.1:8000/resources/$ID/release-blockers"
 - `GET` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET`）。
 - 该视图即时计算且只读：任何情况下都不落记录，也不改变生命周期、依赖关系、告警等既有状态；数据仍只存进程内存，重启清空。
 
+## 全局晋级阻塞汇总
+
+### 查询汇总：`GET /promotion/blockers`
+
+入口挂在 HTTP 服务根路径上的 `promotion/blockers`，只接受 `GET`。调用方不带任何参数即可取得覆盖当前全部资源的晋级判定汇总：不提供筛选与分页，**不接受请求体或查询参数**。该视图即时计算且只读，不落任何记录，也不改变生命周期、依赖、告警、分块或其他既有状态；生命周期提交、成品组装、依赖增删与资源注销后立即按剩余数据重算。
+
+成功返回 HTTP 200，响应体为紧凑 UTF-8 JSON 数组并以单个换行结束。数组按资源登记顺序逐个给出每条资源的晋级阻塞明细，每条记录的字段与键序同单资源视图一致，顶层五项依次是 `id`、`blocked`、`reasons`、`blockers`、`content_complete`：
+
+```bash
+curl -s http://127.0.0.1:8000/promotion/blockers
+```
+
+```json
+[{"id":"<资源 id>","blocked":true,"reasons":["content_not_complete","dependency_blocked"],"blockers":[{"resource_id":"<依赖 id>","state":"quarantined"}],"content_complete":false},{"id":"<另一资源 id>","blocked":false,"reasons":[],"blockers":[],"content_complete":true}]
+```
+
+各字段语义与单资源晋级阻塞明细完全相同：`blocked` 反映当前能否晋级；`reasons` 按既有晋级检查的先后顺序给出命中的稳定原因代码（`content_not_complete` 在前、`dependency_blocked` 在后，两类同命中时都给出）；`blockers` 按该资源依赖登记的顺序逐条列出被隔离或撤回的可达依赖（每项含 `resource_id` 与 `state`，状态正常的依赖不收）；`content_complete` 直接以布尔值说明成品是否已组装完成。
+
+没有任何资源时返回空数组：
+
+```json
+[]
+```
+
+错误与边界：
+
+- 请求声明非空请求体，或携带任意查询参数，返回 HTTP 400（错误码 `invalid_request`），且不读取业务数据；省略请求体或显式声明零长度（`Content-Length: 0`）的请求视为空体，按正常请求返回汇总结果。
+- `GET` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET`）。
+- 长依赖链上的资源同样给出稳定结果，不因链长而查询失败；数据仍只存进程内存，停止或重启即清空，不写文件。
+
 ## 安全告警（漏洞）
 
 可以对已登记的资源逐条登记安全告警，也可以通过批量入口一次提交一组，还可以按告警标识就地更新单条告警，以及按告警标识删除单条告警。告警只保存在当前进程内存中，服务停止或重启后随资源一起清空，不会写入任何文件，也不承诺跨进程同步。告警按提交顺序保存；更新不改变告警标识与提交顺序，并发处理不在当前范围内。
