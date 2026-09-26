@@ -335,6 +335,29 @@ class ResourceStore:
         self._dependencies[resource_id].add(dependency_id)
         self._dependents[dependency_id].add(resource_id)
 
+    def has_dependency(self, resource_id: str, dependency_id: str) -> bool:
+        """Return whether the direct edge ``resource_id -> dependency_id`` exists."""
+
+        return dependency_id in self._dependencies.get(resource_id, ())
+
+    def remove_dependency(self, resource_id: str, dependency_id: str) -> bool:
+        """Remove only the direct edge from ``resource_id`` to ``dependency_id``.
+
+        Returns ``True`` when the edge existed and was removed, ``False``
+        when there was no such direct edge. Neither resource record nor any
+        other edge is touched; transitive relations that survive through
+        other paths are left to be recomputed by the read views.
+        """
+
+        dependencies = self._dependencies.get(resource_id)
+        if dependencies is None or dependency_id not in dependencies:
+            return False
+        dependencies.discard(dependency_id)
+        dependents = self._dependents.get(dependency_id)
+        if dependents is not None:
+            dependents.discard(resource_id)
+        return True
+
     def list_dependencies(self, resource_id: str) -> list[str]:
         """Return every reachable dependency id in registration order."""
 

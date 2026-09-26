@@ -798,6 +798,78 @@ def _handle_dependencies(
     )
 
 
+def _handle_dependency_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_dependency_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "DELETE":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="DELETE",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    dependency_id_error = _validate_path_id(raw_dependency_id)
+    if dependency_id_error is not None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            dependency_id_error,
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # The start resource must exist; a missing start is reported before the
+    # relation is looked up and never changes any state.
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Only the single direct edge is addressed: a relation that was never
+    # registered and one whose target resource was deregistered (which
+    # cascades its edges away) are both "no such dependency".
+    if not store.has_dependency(raw_id, raw_dependency_id):
+        return _error(
+            start_response,
+            "404 Not Found",
+            "dependency_not_found",
+            "No direct dependency relation exists from this resource to the "
+            "requested dependency.",
+        )
+
+    store.remove_dependency(raw_id, raw_dependency_id)
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"resource_id": raw_id, "dependency_id": raw_dependency_id},
+        trailing_newline=True,
+    )
+
+
 def _handle_impact(
     method: str,
     environ: dict[str, Any],
@@ -5017,6 +5089,27 @@ def application(
             if separator and tail == "dependencies":
                 return _handle_dependencies(
                     method, environ, head, start_response
+                )
+            if separator and tail.startswith("dependencies/"):
+                return _handle_dependency_item(
+                    method,
+                    environ,
+                    head,
+                    tail[len("dependencies/"):],
+                    start_response,
+                )
+            if separator and "/dependencies/" in suffix:
+                # Fallback for a separator inside the start id segment so
+                # the item handler rejects it without removing any edge.
+                malformed_id, _, raw_dependency_id = suffix.rpartition(
+                    "/dependencies/"
+                )
+                return _handle_dependency_item(
+                    method,
+                    environ,
+                    malformed_id,
+                    raw_dependency_id,
+                    start_response,
                 )
             if separator and tail == "impact":
                 return _handle_impact(
