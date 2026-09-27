@@ -4296,6 +4296,121 @@ def _handle_component_risks(
     )
 
 
+def _component_risk_fields(
+    component: SbomComponent, alerts: Iterable[Vulnerability]
+) -> dict[str, object]:
+    """Build one component risk record (without the owning resource id).
+
+    An alert hits a component only when the names are byte-for-byte
+    identical (case-sensitive, no trimming); versions and digests never
+    take part. Hits keep the resource's alert registration order, with no
+    deduplication or merging. The record's keys (and key order) are shared
+    by the per-resource and the global component risk views.
+    """
+
+    return {
+        "name": component.name,
+        "version": component.version,
+        "digest": component.digest,
+        "advisories": [
+            {"id": alert.id, "severity": alert.severity}
+            for alert in alerts
+            if alert.component == component.name
+        ],
+    }
+
+
+def _handle_global_component_risks(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``name`` filter is accepted; unknown or repeated
+    # parameters and an empty value are rejected before any data is read.
+    name, query_error = _parse_component_risks_summary_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current stores: entries unfold in
+    # resource registration order, and within one resource the components
+    # keep their SBOM submission order. Resources without an SBOM document
+    # are skipped silently, and a document with an empty component list
+    # contributes no entries; a component with no alerts still contributes
+    # its entry with an empty advisories array. Each record puts the owning
+    # resource id first, followed by the same fields in the same order as
+    # the per-resource component risk view. Nothing is recorded and no
+    # state is touched.
+    risks: list[dict[str, object]] = []
+    for resource in store.list_all():
+        document = sbom_store.get_sbom(resource.id)
+        if document is None:
+            continue
+        alerts = vulnerability_store.list_for(resource.id)
+        for component in document.components:
+            if name is not None and component.name != name:
+                continue
+            risks.append(
+                {
+                    "resource_id": resource.id,
+                    **_component_risk_fields(component, alerts),
+                }
+            )
+    return _json_response(
+        start_response,
+        "200 OK",
+        risks,
+        trailing_newline=True,
+    )
+
+
+def _parse_component_risks_summary_query(
+    query_string: str,
+) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``name`` query parameter.
+
+    Returns ``(name, None)`` -- with ``None`` when the parameter is
+    absent -- or ``(None, message)`` for an unknown parameter, a repeated
+    ``name`` or an empty value. The name is matched verbatim against
+    component names: case-sensitive, no trimming.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    name: str | None = None
+    for key, value in pairs:
+        if key != "name":
+            return None, f"Unknown query parameter: {key!r}."
+        if name is not None:
+            return None, "Query parameter 'name' must not be repeated."
+        if value == "":
+            return None, "Component name must not be empty."
+        name = value
+    return name, None
+
+
 def _component_fix_fields(
     component: SbomComponent, alerts: Iterable[Vulnerability]
 ) -> dict[str, object]:
@@ -6605,6 +6720,13 @@ def application(
             # Global admission-preview summary; the handler answers the
             # 405 (Allow: GET) for every other method.
             return _handle_admission_preview_summary(
+                method, environ, start_response
+            )
+
+        if path == "/component-risks":
+            # Global component risk summary; the handler answers the 405
+            # (Allow: GET) for every other method.
+            return _handle_global_component_risks(
                 method, environ, start_response
             )
 
