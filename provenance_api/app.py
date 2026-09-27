@@ -3501,6 +3501,90 @@ def _handle_provenance(
     )
 
 
+def _parse_provenance_summary_query(
+    query_string: str,
+) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``builder`` query parameter.
+
+    Returns ``(builder, None)`` -- with ``None`` when the parameter is
+    absent -- or ``(None, message)`` for an unknown parameter, a repeated
+    ``builder`` or an empty value. The value is matched verbatim against
+    the registered builder: case-sensitive, no trimming, no folding.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    builder: str | None = None
+    for key, value in pairs:
+        if key != "builder":
+            return None, f"Unknown query parameter: {key!r}."
+        if builder is not None:
+            return None, "Query parameter 'builder' must not be repeated."
+        if value == "":
+            return None, "Builder must not be empty."
+        builder = value
+    return builder, None
+
+
+def _handle_provenance_summary(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``builder`` filter is accepted; unknown or repeated
+    # parameters (and an empty value) are rejected before any data is read.
+    builder, query_error = _parse_provenance_summary_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current stores: entries unfold in
+    # resource registration order and are never reordered; resources
+    # without a provenance record are skipped silently and each resource
+    # appears at most once. Each entry reuses the per-resource shape, so
+    # the owning resource id comes first, followed by the builder, build
+    # number, lowercase source digest and materials (each material keeps
+    # its registered name and lowercase digest and order). Whether a
+    # resource still exists is never an error condition; nothing is
+    # recorded and no state is touched.
+    records: list[dict[str, object]] = []
+    for resource in store.list_all():
+        record = provenance_store.get(resource.id)
+        if record is None:
+            continue
+        if builder is not None and record.builder != builder:
+            continue
+        records.append(record.to_dict(resource.id))
+    return _json_response(
+        start_response,
+        "200 OK",
+        records,
+        trailing_newline=True,
+    )
+
+
 def _handle_policies_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -6297,6 +6381,11 @@ def application(
             # Global license summary; the handler answers the 405
             # (Allow: GET) for every other method.
             return _handle_licenses_summary(method, environ, start_response)
+
+        if path == "/provenance":
+            # Global build provenance summary; the handler answers the 405
+            # (Allow: GET) for every other method.
+            return _handle_provenance_summary(method, environ, start_response)
 
         if path == "/risk":
             # Global risk summary; the handler answers the 405 (Allow: GET)
