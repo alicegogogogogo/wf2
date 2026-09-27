@@ -317,3 +317,19 @@ class ContentStore:
         if session is None:
             return None
         return self._status_of(session)
+
+    def all_sessions(self) -> list[tuple[str, SessionStatus]]:
+        """Snapshot every current session in resource registration order.
+
+        The order is the order sessions first appeared (explicit start or
+        first accepted chunk); it is never reordered by chunk uploads,
+        assembly, resets or removals. Sessions that were reset or removed
+        are absent, so they leave no residue. Like
+        :meth:`session_status`, this is read-only: it snapshots state
+        without mutating anything.
+        """
+
+        return [
+            (resource_id, self._status_of(session))
+            for resource_id, session in self._sessions.items()
+        ]

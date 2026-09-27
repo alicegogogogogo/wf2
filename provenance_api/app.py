@@ -1795,6 +1795,66 @@ def _session_status_payload(resource_id: str, status: SessionStatus) -> dict[str
     }
 
 
+def _handle_upload_sessions_summary(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly in each session's registration order, which is the
+    # order chunks were first accepted (or the session was explicitly
+    # started). Each record starts with the owning resource id under the
+    # same ``resource_id`` key the other global summaries use, followed by
+    # the single-resource status fields in their exact order; the status
+    # view's own ``id`` key is omitted because the resource identifier
+    # already comes first. Resources whose upload never started, whose
+    # session was reset or that were deregistered no longer have a session
+    # and are therefore skipped entirely; an empty set of sessions is a
+    # valid empty array.
+    records = [
+        {
+            "resource_id": resource_id,
+            "digest": status.digest,
+            "total_chunks": status.total,
+            "received_chunks": status.received_chunks,
+            "missing_chunks": list(status.missing_chunks),
+            "complete": status.complete,
+            "size": status.size,
+        }
+        for resource_id, status in content_store.all_sessions()
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        records,
+        trailing_newline=True,
+    )
+
+
 def _handle_chunks_start(
     method: str,
     environ: dict[str, Any],
@@ -6815,6 +6875,13 @@ def application(
             # Global lifecycle summary; the handler answers the 405
             # (Allow: GET) for every other method.
             return _handle_lifecycle_summary(method, environ, start_response)
+
+        if path == "/upload-sessions":
+            # Global chunk upload session summary; the handler answers the
+            # 405 (Allow: GET) for every other method.
+            return _handle_upload_sessions_summary(
+                method, environ, start_response
+            )
 
         if path == "/dependency-vulnerability-impact":
             # Global dependency vulnerability impact summary; the handler
