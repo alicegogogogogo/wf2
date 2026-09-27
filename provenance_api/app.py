@@ -6850,6 +6850,90 @@ def _handle_signature_verification(
     )
 
 
+def _handle_signature_keys(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current stores: signatures are visited
+    # in resource registration order (resources without one are skipped),
+    # and entries unfold in the order a key id first appears in that
+    # traversal. The algorithm and signer lists keep the first-occurrence
+    # order with duplicates removed, values are echoed verbatim, each
+    # signature is counted once, and the resource ids keep their traversal
+    # order with each resource appearing at most once. Nothing is recorded
+    # and no state is touched.
+    key_order: list[str] = []
+    algorithms_by_key: dict[str, list[str]] = {}
+    signers_by_key: dict[str, list[str]] = {}
+    resources_by_key: dict[str, list[str]] = {}
+    counts_by_key: dict[str, int] = {}
+
+    for resource in store.list_all():
+        record = signature_store.get(resource.id)
+        if record is None:
+            continue
+        algorithms = algorithms_by_key.get(record.key_id)
+        if algorithms is None:
+            key_order.append(record.key_id)
+            algorithms_by_key[record.key_id] = [record.algorithm]
+            signers_by_key[record.key_id] = [record.signer]
+            resources_by_key[record.key_id] = [resource.id]
+            counts_by_key[record.key_id] = 1
+            continue
+        if record.algorithm not in algorithms:
+            algorithms.append(record.algorithm)
+        signers = signers_by_key[record.key_id]
+        if record.signer not in signers:
+            signers.append(record.signer)
+        # Each resource carries at most one signature, so its id reaches
+        # this list at most once over the traversal.
+        resources_by_key[record.key_id].append(resource.id)
+        counts_by_key[record.key_id] += 1
+
+    results = [
+        {
+            "key_id": key_id,
+            "algorithms": algorithms_by_key[key_id],
+            "signers": signers_by_key[key_id],
+            "signature_count": counts_by_key[key_id],
+            "resources": resources_by_key[key_id],
+        }
+        for key_id in key_order
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        results,
+        trailing_newline=True,
+    )
+
+
 def _handle_advisories(
     method: str,
     environ: dict[str, Any],
@@ -7117,6 +7201,11 @@ def application(
             return _handle_signature_verification(
                 method, environ, start_response
             )
+
+        if path == "/signature-keys":
+            # Global per-key signature usage summary; the handler answers
+            # the 405 (Allow: GET) for every other method.
+            return _handle_signature_keys(method, environ, start_response)
 
         if path == "/risk":
             # Global risk summary; the handler answers the 405 (Allow: GET)
