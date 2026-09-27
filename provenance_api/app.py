@@ -914,6 +914,35 @@ def _handle_impact(
     )
 
 
+def _dependency_vulnerability_impact_fields(
+    resource_ids: Iterable[str],
+) -> list[dict[str, object]]:
+    """Build the closure summary for the given resources, in order.
+
+    Each record carries the same three fields in the same key order the
+    per-resource dependency vulnerability impact view reports: the owning
+    resource id first, then the alert total (counted without
+    deduplication or merging) and the highest alert severity. Severity
+    comparison ignores case and the result is lowercase; a resource
+    without alerts contributes ``0`` and ``None``. The closure is
+    computed on the fly and recorded nowhere.
+    """
+
+    impacts: list[dict[str, object]] = []
+    for resource_id in resource_ids:
+        alerts = vulnerability_store.list_for(resource_id)
+        impacts.append(
+            {
+                "resource_id": resource_id,
+                "advisory_count": len(alerts),
+                "max_severity": max_severity(
+                    alert.severity for alert in alerts
+                ),
+            }
+        )
+    return impacts
+
+
 def _handle_dependency_vulnerability_impact(
     method: str,
     environ: dict[str, Any],
@@ -951,23 +980,69 @@ def _handle_dependency_vulnerability_impact(
     # every reachable dependency in the same registration order the
     # dependency query uses; each resource appears exactly once and nothing
     # is recorded.
-    impacts: list[dict[str, object]] = []
-    for resource_id in [raw_id, *store.list_dependencies(raw_id)]:
-        alerts = vulnerability_store.list_for(resource_id)
-        impacts.append(
-            {
-                "resource_id": resource_id,
-                "advisory_count": len(alerts),
-                "max_severity": max_severity(
-                    alert.severity for alert in alerts
-                ),
-            }
-        )
+    impacts = _dependency_vulnerability_impact_fields(
+        [raw_id, *store.list_dependencies(raw_id)]
+    )
 
     return _json_response(
         start_response,
         "200 OK",
         {"impacts": impacts},
+        trailing_newline=True,
+    )
+
+
+def _handle_global_dependency_vulnerability_impact(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current registry: one record per
+    # registered resource in resource registration order. Each record's
+    # closure summary starts with the resource itself and then follows the
+    # reachable dependencies in dependency-query registration order; every
+    # resource appears exactly once within a closure and nothing is
+    # reordered. A resource with no alerts still contributes its record,
+    # with a zero count and an empty highest severity.
+    results: list[dict[str, object]] = []
+    for resource in store.list_all():
+        results.append(
+            {
+                "resource_id": resource.id,
+                "impacts": _dependency_vulnerability_impact_fields(
+                    [resource.id, *store.list_dependencies(resource.id)]
+                ),
+            }
+        )
+    return _json_response(
+        start_response,
+        "200 OK",
+        results,
         trailing_newline=True,
     )
 
@@ -6683,6 +6758,13 @@ def application(
 
         if path == "/promotion/blockers":
             return _handle_promotion_blockers(method, environ, start_response)
+
+        if path == "/dependency-vulnerability-impact":
+            # Global dependency vulnerability impact summary; the handler
+            # answers the 405 (Allow: GET) for every other method.
+            return _handle_global_dependency_vulnerability_impact(
+                method, environ, start_response
+            )
 
         if path == "/vulnerability-exceptions":
             # Global exemption summary; the handler answers the 405
