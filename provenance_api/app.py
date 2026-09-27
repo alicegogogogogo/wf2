@@ -914,6 +914,37 @@ def _handle_impact(
     )
 
 
+def _dependency_vulnerability_impact_records(
+    start_id: str,
+) -> list[dict[str, object]]:
+    """Build the closure records for one start resource.
+
+    Shared by the per-resource view and the global summary so both always
+    use the very same fields, key order and closure rules: the start
+    resource comes first, then every reachable dependency in the same
+    registration order the dependency query uses; each resource appears
+    exactly once. Counts are raw alert totals, neither deduplicated nor
+    merged, and the highest severity is compared case-insensitively and
+    emitted lowercase; a resource without alerts gets a count of zero and
+    an empty highest severity. Read-only and computed on the fly; nothing
+    is recorded.
+    """
+
+    impacts: list[dict[str, object]] = []
+    for resource_id in [start_id, *store.list_dependencies(start_id)]:
+        alerts = vulnerability_store.list_for(resource_id)
+        impacts.append(
+            {
+                "resource_id": resource_id,
+                "advisory_count": len(alerts),
+                "max_severity": max_severity(
+                    alert.severity for alert in alerts
+                ),
+            }
+        )
+    return impacts
+
+
 def _handle_dependency_vulnerability_impact(
     method: str,
     environ: dict[str, Any],
@@ -947,27 +978,71 @@ def _handle_dependency_vulnerability_impact(
             "No resource exists with the requested id.",
         )
 
-    # Read-only, computed on the fly: the start resource comes first, then
-    # every reachable dependency in the same registration order the
-    # dependency query uses; each resource appears exactly once and nothing
-    # is recorded.
-    impacts: list[dict[str, object]] = []
-    for resource_id in [raw_id, *store.list_dependencies(raw_id)]:
-        alerts = vulnerability_store.list_for(resource_id)
-        impacts.append(
-            {
-                "resource_id": resource_id,
-                "advisory_count": len(alerts),
-                "max_severity": max_severity(
-                    alert.severity for alert in alerts
-                ),
-            }
-        )
-
     return _json_response(
         start_response,
         "200 OK",
-        {"impacts": impacts},
+        {
+            "impacts": _dependency_vulnerability_impact_records(raw_id)
+        },
+        trailing_newline=True,
+    )
+
+
+def _handle_dependency_vulnerability_impact_summary(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Global read-only impact summary at ``GET /dependency-vulnerability-impact``.
+
+    One element per registered resource in registration order; each
+    element names the start resource first and then the same closure
+    summary the per-resource view reports under ``impacts``. Computed on
+    the fly and recorded nowhere.
+    """
+
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # One element per registered resource in registration order; each
+    # element's closure keeps the per-resource view's start-first order and
+    # reports every reachable resource once. A resource without alerts
+    # still gets its own entry with a zero count and an empty highest
+    # severity; an empty registry is a valid empty array. Nothing is
+    # recorded and no state is touched.
+    summaries = [
+        {
+            "resource_id": resource.id,
+            "impacts": _dependency_vulnerability_impact_records(resource.id),
+        }
+        for resource in store.list_all()
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        summaries,
         trailing_newline=True,
     )
 
@@ -6715,6 +6790,13 @@ def application(
             # Global risk summary; the handler answers the 405 (Allow: GET)
             # for every other method.
             return _handle_risk_summary(method, environ, start_response)
+
+        if path == "/dependency-vulnerability-impact":
+            # Global dependency vulnerability impact summary; the handler
+            # answers the 405 (Allow: GET) for every other method.
+            return _handle_dependency_vulnerability_impact_summary(
+                method, environ, start_response
+            )
 
         if path == "/admission-preview":
             # Global admission-preview summary; the handler answers the
