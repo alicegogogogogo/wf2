@@ -72,6 +72,20 @@ class ContentStatus:
     size: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class ContentIntegrity:
+    """Read-only digest-consistency snapshot for one registered resource.
+
+    ``actual`` is the SHA-256 hex digest recomputed afresh from the
+    finalized bytes, or ``None`` when no finalized bytes exist (upload
+    never started, chunks still missing, assembly failed on a digest
+    mismatch or the session was reset); the caller renders ``None`` as
+    an empty string.
+    """
+
+    actual: str | None
+
+
 class ContentStore:
     """In-process chunk sessions keyed by resource id."""
 
@@ -347,3 +361,22 @@ class ContentStore:
         if session is None or not session.complete:
             return ContentStatus(complete=False, size=None)
         return ContentStatus(complete=True, size=len(session.content))
+
+    def content_integrity(self, resource_id: str) -> ContentIntegrity:
+        """Recompute the finalized content digest for one registered resource.
+
+        The SHA-256 of the finalized bytes is recalculated on every call
+        rather than reusing the assembly-time result. A resource that
+        never started an upload, still misses chunks, failed assembly on a
+        digest mismatch or had its session reset yields ``actual=None``;
+        the caller renders that as an empty string alongside a failed
+        comparison. Nothing is recorded and sessions, chunks and
+        finalized bytes are never mutated.
+        """
+
+        session = self._sessions.get(resource_id)
+        if session is None or not session.complete:
+            return ContentIntegrity(actual=None)
+        return ContentIntegrity(
+            actual=hashlib.sha256(session.content).hexdigest()
+        )

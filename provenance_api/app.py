@@ -1898,6 +1898,66 @@ def _handle_content_status(
     )
 
 
+def _content_integrity_payload(resource: Resource) -> dict[str, Any]:
+    integrity = content_store.content_integrity(resource.id)
+    actual = integrity.actual if integrity.actual is not None else ""
+    return {
+        "id": resource.id,
+        "digest": resource.digest,
+        "actual": actual,
+        "valid": actual == resource.digest,
+    }
+
+
+def _handle_content_integrity(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The inspection is read-only: a declared non-empty (or malformed)
+    # body is a bad request before any business data is consulted. An
+    # omitted header and an explicit zero length are accepted as empty.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly in resource registration order: one record per
+    # registered resource, including resources that never started an
+    # upload; deregistered resources disappear. The finalized bytes are
+    # rehashed on every request and compared verbatim with the registered
+    # digest. Resources without finalized bytes report an empty recomputed
+    # digest and ``valid`` false, which is a normal result, not an error.
+    # Nothing is recorded and sessions or finalized bytes are never
+    # touched.
+    results = [
+        _content_integrity_payload(resource) for resource in store.list_all()
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        results,
+        trailing_newline=True,
+    )
+
+
 def _handle_chunks_start(
     method: str,
     environ: dict[str, Any],
@@ -6935,6 +6995,11 @@ def application(
             # Global finished-content readiness summary; the handler
             # answers the 405 (Allow: GET) for every other method.
             return _handle_content_status(method, environ, start_response)
+
+        if path == "/content-integrity":
+            # Global assembled-content digest consistency inspection; the
+            # handler answers the 405 (Allow: GET) for every other method.
+            return _handle_content_integrity(method, environ, start_response)
 
         if path == "/vulnerability-exceptions":
             # Global exemption summary; the handler answers the 405
