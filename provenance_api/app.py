@@ -6762,6 +6762,87 @@ def _handle_signature_verify(
     )
 
 
+def _handle_signature_verification(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current stores: one entry per registered
+    # resource in resource registration order, never reordered, and nothing
+    # is recorded. A resource without a signature still contributes its
+    # entry with null signature fields, valid false and reason
+    # signature_not_found; a signed digest that disagrees with the
+    # registered resource digest is a per-entry false verdict with reason
+    # signed_digest_mismatch, never a summary-level error. Otherwise the
+    # HMAC is recomputed with the per-resource verification convention and
+    # compared against the registered signature value.
+    results: list[dict[str, object]] = []
+    for resource in store.list_all():
+        record = signature_store.get(resource.id)
+        if record is None:
+            results.append(
+                {
+                    "id": resource.id,
+                    "signer": None,
+                    "algorithm": None,
+                    "key_id": None,
+                    "valid": False,
+                    "reason": "signature_not_found",
+                }
+            )
+            continue
+        if record.digest != resource.digest:
+            valid = False
+            reason: str | None = "signed_digest_mismatch"
+        else:
+            expected = compute_signature(
+                record.algorithm, record.key_id, record.digest
+            )
+            valid = hmac.compare_digest(expected, record.signature)
+            reason = None
+        results.append(
+            {
+                "id": resource.id,
+                "signer": record.signer,
+                "algorithm": record.algorithm,
+                "key_id": record.key_id,
+                "valid": valid,
+                "reason": reason,
+            }
+        )
+    return _json_response(
+        start_response,
+        "200 OK",
+        results,
+        trailing_newline=True,
+    )
+
+
 def _handle_advisories(
     method: str,
     environ: dict[str, Any],
@@ -7022,6 +7103,13 @@ def application(
             # Global content signature summary; the handler answers the 405
             # (Allow: GET) for every other method.
             return _handle_signatures_summary(method, environ, start_response)
+
+        if path == "/signature-verification":
+            # Global signature verification summary; the handler answers
+            # the 405 (Allow: GET) for every other method.
+            return _handle_signature_verification(
+                method, environ, start_response
+            )
 
         if path == "/risk":
             # Global risk summary; the handler answers the 405 (Allow: GET)
