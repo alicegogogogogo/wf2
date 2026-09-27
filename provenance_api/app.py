@@ -1842,6 +1842,58 @@ def _handle_upload_sessions(
     )
 
 
+def _handle_content_status(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly in resource registration order: one record per
+    # registered resource, including resources that never started an
+    # upload. Only the completion flag and the finalized size are reported.
+    results: list[dict[str, Any]] = []
+    for resource in store.list_all():
+        status = content_store.session_status(resource.id)
+        complete = status is not None and status.complete
+        results.append(
+            {
+                "id": resource.id,
+                "complete": complete,
+                "size": status.size if complete else None,
+            }
+        )
+    return _json_response(
+        start_response,
+        "200 OK",
+        results,
+        trailing_newline=True,
+    )
+
+
 def _handle_chunks_start(
     method: str,
     environ: dict[str, Any],
@@ -6874,6 +6926,11 @@ def application(
             # Global chunk upload session summary; the handler answers the
             # 405 (Allow: GET) for every other method.
             return _handle_upload_sessions(method, environ, start_response)
+
+        if path == "/content-status":
+            # Global content readiness summary; the handler answers the
+            # 405 (Allow: GET) for every other method.
+            return _handle_content_status(method, environ, start_response)
 
         if path == "/vulnerability-exceptions":
             # Global exemption summary; the handler answers the 405
