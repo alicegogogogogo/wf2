@@ -419,6 +419,84 @@ class ResourceStore:
             path.append(current)
         return path
 
+    def all_shortest_paths(
+        self, start: str, end: str, *, limit: int | None = None
+    ) -> list[list[str]]:
+        """Return every shortest directed path from ``start`` to ``end``.
+
+        Mirrors :meth:`shortest_path` -- paths follow dependency edges in
+        their direction (the start resource depends on the end resource),
+        each path lists node ids with ``start`` first and ``end`` last and
+        no repeated nodes, and ``start == end`` yields the single-node
+        path. The difference is that *all* paths of the minimum length are
+        enumerated; longer detours are never included. An unreachable
+        ``end`` yields an empty list.
+
+        Paths are ordered lexicographically by the registration order of
+        their nodes, compared from the second node onward (the first node
+        is always ``start``). When ``limit`` is given, at most that many
+        paths are returned; truncation happens after sorting, so the
+        result is always the first ``limit`` paths of the full ordering.
+        """
+
+        if start == end:
+            return [[start]]
+
+        # Hops from every node to ``end`` along the edge direction,
+        # computed as a breadth-first walk over the reverse graph.
+        dist: dict[str, int] = {end: 0}
+        queue = [end]
+        for node in queue:
+            for predecessor in self._dependents.get(node, ()):
+                if predecessor not in dist:
+                    dist[predecessor] = dist[node] + 1
+                    queue.append(predecessor)
+        if start not in dist:
+            return []
+
+        order = {
+            resource.id: index
+            for index, resource in enumerate(self._resources)
+        }
+
+        def successors_on_level(node: str) -> list[str]:
+            # Every successor one hop closer to ``end`` continues some
+            # shortest path; registration order makes the enumeration
+            # stable.
+            remaining = dist[node]
+            return sorted(
+                (
+                    successor
+                    for successor in self._dependencies.get(node, ())
+                    if dist.get(successor) == remaining - 1
+                ),
+                key=order.__getitem__,
+            )
+
+        # Depth-first enumeration of the shortest-path tree: with every
+        # node's children visited in registration order, paths come out in
+        # the required lexicographic order, so the limit can cut the walk
+        # short without a separate sort.
+        paths: list[list[str]] = []
+        path = [start]
+        stack = [iter(successors_on_level(start))]
+        while stack:
+            try:
+                node = next(stack[-1])
+            except StopIteration:
+                stack.pop()
+                path.pop()
+                continue
+            path.append(node)
+            if node == end:
+                paths.append(list(path))
+                path.pop()
+                if limit is not None and len(paths) >= limit:
+                    return paths
+            else:
+                stack.append(iter(successors_on_level(node)))
+        return paths
+
     def list_impact(self, resource_id: str) -> list[str]:
         """Return ids that directly or transitively depend on ``resource_id``.
 

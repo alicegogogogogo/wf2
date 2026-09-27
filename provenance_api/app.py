@@ -1234,6 +1234,125 @@ def _handle_graph_path(
     )
 
 
+def _parse_graph_path_all_query(
+    query_string: str,
+) -> tuple[str | None, str | None, int | None, str | None]:
+    """Parse the query parameters of ``GET /graph/path/all``.
+
+    ``from`` and ``to`` are required exactly once; the optional ``limit``
+    may appear at most once and must be a decimal positive integer no
+    greater than 100. Returns ``(from_id, to_id, limit, None)`` on success
+    -- with ``limit`` ``None`` when the parameter is absent -- or
+    ``(None, None, None, message)`` for an unknown parameter, a repeated
+    parameter, a missing ``from``/``to``, an empty value, a value
+    containing a path separator, or an illegal ``limit``. Values are
+    matched verbatim against resource ids: no trimming, no case folding.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    values: dict[str, str] = {}
+    for key, value in pairs:
+        if key not in ("from", "to", "limit"):
+            return None, None, None, f"Unknown query parameter: {key!r}."
+        if key in values:
+            return None, None, None, (
+                f"Query parameter {key!r} must not be repeated."
+            )
+        if value == "":
+            return None, None, None, (
+                f"Query parameter {key!r} must not be empty."
+            )
+        if key != "limit" and ("/" in value or "\\" in value):
+            return None, None, None, (
+                f"Query parameter {key!r} must not contain path separators."
+            )
+        values[key] = value
+    for name in ("from", "to"):
+        if name not in values:
+            return None, None, None, (
+                f"Missing required query parameter: {name!r}."
+            )
+
+    limit: int | None = None
+    if "limit" in values:
+        raw_limit = values["limit"]
+        if _POSITIVE_INT_PATTERN.fullmatch(raw_limit) is None:
+            return None, None, None, (
+                f"Limit must be a positive integer no greater than "
+                f"{MAX_LIMIT}."
+            )
+        limit = int(raw_limit)
+        if limit > MAX_LIMIT:
+            return None, None, None, (
+                f"Limit must be a positive integer no greater than "
+                f"{MAX_LIMIT}."
+            )
+    return values["from"], values["to"], limit, None
+
+
+def _handle_graph_path_all(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # Like the single-path view, the enumeration is read-only: a declared
+    # non-empty (or malformed) body is a bad request without consulting any
+    # business data. An omitted header and an explicit zero length count as
+    # an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # ``from`` and ``to`` are required exactly once and the optional
+    # ``limit`` bounds the result; anything else is rejected before any
+    # business data is read.
+    from_id, to_id, limit, query_error = _parse_graph_path_all_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    assert from_id is not None and to_id is not None
+
+    if store.get(from_id) is None or store.get(to_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # Enumerated on the fly from the current registry; nothing is recorded
+    # and the limit only truncates the stable ordering.
+    paths = store.all_shortest_paths(from_id, to_id, limit=limit)
+    return _json_response(
+        start_response,
+        "200 OK",
+        {
+            "from": from_id,
+            "to": to_id,
+            "found": bool(paths),
+            "paths": paths,
+            "count": len(paths),
+        },
+        trailing_newline=True,
+    )
+
+
 def _read_declared_body(environ: dict[str, Any]) -> tuple[bytes | None, str | None]:
     """Read exactly the declared request body for content verification.
 
@@ -5896,6 +6015,9 @@ def application(
 
         if path == "/graph/path":
             return _handle_graph_path(method, environ, start_response)
+
+        if path == "/graph/path/all":
+            return _handle_graph_path_all(method, environ, start_response)
 
         if path == "/promotion/blockers":
             return _handle_promotion_blockers(method, environ, start_response)
