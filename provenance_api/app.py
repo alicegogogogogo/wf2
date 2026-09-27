@@ -4213,6 +4213,89 @@ def _handle_notifications(
     )
 
 
+def _parse_notification_channel_query(
+    query_string: str,
+) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``channel`` query parameter.
+
+    Returns ``(channel, None)`` -- with ``None`` when the parameter is
+    absent -- or ``(None, message)`` for an unknown parameter, a repeated
+    ``channel`` or an empty value. The channel value is matched verbatim:
+    no trimming, no case folding.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    channel: str | None = None
+    for key, value in pairs:
+        if key != "channel":
+            return None, f"Unknown query parameter: {key!r}."
+        if channel is not None:
+            return None, "Query parameter 'channel' must not be repeated."
+        if value == "":
+            return None, "Channel must not be empty."
+        channel = value
+    return channel, None
+
+
+def _handle_global_notifications(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``channel`` parameter is accepted; an unknown or
+    # repeated parameter, including a repeated ``channel`` or an empty
+    # channel value, is rejected before any business data is read.
+    channel, channel_error = _parse_notification_channel_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if channel_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", channel_error
+        )
+
+    # Computed on the fly from the current stores: groups unfold in resource
+    # registration order, and within one resource the notifications keep
+    # their submission order. Each record puts the owning resource id first,
+    # followed by the same fields (and key order) as a single-resource entry.
+    # A resource without any notification is skipped; nothing is recorded and
+    # no state is touched.
+    notifications: list[dict[str, object]] = []
+    for resource in store.list_all():
+        for record in notification_store.list_for(resource.id):
+            if channel is not None and record.channel != channel:
+                # Exact, case-sensitive comparison; no trimming or folding.
+                continue
+            notifications.append(
+                {"resource_id": resource.id, **record.to_dict()}
+            )
+    return _json_response(
+        start_response,
+        "200 OK",
+        notifications,
+        trailing_newline=True,
+    )
+
+
 def _handle_cache_layer_post(
     environ: dict[str, Any], raw_digest: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -6031,6 +6114,11 @@ def application(
             return _handle_global_vulnerability_exceptions(
                 method, environ, start_response
             )
+
+        if path == "/notifications":
+            # Global notification summary; the handler answers the 405
+            # (Allow: GET) for every other method.
+            return _handle_global_notifications(method, environ, start_response)
 
         if path == "/risk":
             # Global risk summary; the handler answers the 405 (Allow: GET)
