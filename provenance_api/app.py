@@ -3078,6 +3078,94 @@ def _handle_sbom(
     )
 
 
+def _parse_sboms_summary_query(
+    query_string: str,
+) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``format`` query parameter.
+
+    Returns ``(format, None)`` -- with ``None`` when the parameter is
+    absent -- or ``(None, message)`` for an unknown parameter, a repeated
+    ``format`` or an empty value. The format value is matched verbatim
+    against document formats: case-sensitive, no trimming.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    format_value: str | None = None
+    for key, value in pairs:
+        if key != "format":
+            return None, f"Unknown query parameter: {key!r}."
+        if format_value is not None:
+            return None, "Query parameter 'format' must not be repeated."
+        if value == "":
+            return None, "Format must not be empty."
+        format_value = value
+    return format_value, None
+
+
+def _handle_sboms_summary(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``format`` filter is accepted; unknown or repeated
+    # parameters and an empty value are rejected before any data is read.
+    format_value, query_error = _parse_sboms_summary_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current stores: entries unfold in
+    # resource registration order, and resources without an SBOM document
+    # are skipped silently. Each entry puts the owning resource id first,
+    # followed by the document format and its components in submission
+    # order. Nothing is recorded and no state is touched.
+    documents: list[dict[str, object]] = []
+    for resource in store.list_all():
+        document = sbom_store.get_sbom(resource.id)
+        if document is None:
+            continue
+        if format_value is not None and document.format != format_value:
+            continue
+        documents.append(
+            {
+                "resource_id": resource.id,
+                "format": document.format,
+                "components": [
+                    component.to_dict() for component in document.components
+                ],
+            }
+        )
+    return _json_response(
+        start_response,
+        "200 OK",
+        documents,
+        trailing_newline=True,
+    )
+
+
 def _handle_license_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -6145,6 +6233,11 @@ def application(
             return _handle_notifications_summary(
                 method, environ, start_response
             )
+
+        if path == "/sboms":
+            # Global SBOM summary; the handler answers the 405 (Allow: GET)
+            # for every other method.
+            return _handle_sboms_summary(method, environ, start_response)
 
         if path == "/resources":
             if method == "GET":
