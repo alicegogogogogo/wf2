@@ -2316,6 +2316,51 @@ def _handle_lifecycle(
     )
 
 
+def _handle_lifecycle_summary(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current registry: one record per
+    # registered resource in resource registration order, each with the
+    # same three keys in the same order as the per-resource lifecycle
+    # view. Resources that have never left the default state contribute a
+    # ``staged``/``null`` record; nothing is recorded and no state is
+    # touched. An empty registry is a valid empty array.
+    records: list[dict[str, object]] = []
+    for resource in store.list_all():
+        record = lifecycle_store.get(resource.id)
+        records.append(
+            {"id": resource.id, "state": record.state, "reason": record.reason}
+        )
+    return _json_response(start_response, "200 OK", records, trailing_newline=True)
+
+
 def _handle_release_blockers(
     method: str,
     environ: dict[str, Any],
@@ -6758,6 +6803,11 @@ def application(
 
         if path == "/promotion/blockers":
             return _handle_promotion_blockers(method, environ, start_response)
+
+        if path == "/lifecycle":
+            # Global lifecycle state summary; the handler answers the 405
+            # (Allow: GET) for every other method.
+            return _handle_lifecycle_summary(method, environ, start_response)
 
         if path == "/dependency-vulnerability-impact":
             # Global dependency vulnerability impact summary; the handler
