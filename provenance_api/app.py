@@ -85,10 +85,12 @@ from .sbom import (
 )
 from .signatures import (
     SignatureError,
+    SignatureRecord,
     SignatureStore,
     SignatureValidationError,
     build_signature_fields,
     compute_signature,
+    summarize_key_usage,
 )
 from .vulnerabilities import (
     SEVERITY_VALUES,
@@ -6850,6 +6852,58 @@ def _handle_signature_verification(
     )
 
 
+def _handle_signature_keys(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current stores: signatures are visited
+    # in resource registration order, so a key entry appears at the first
+    # signature carrying it and each key's resources follow that order.
+    # The per-key algorithms and signers are deduplicated by the order
+    # their signatures are visited, echoed verbatim, and the count counts
+    # every signature using the key exactly once. Nothing is recorded and
+    # no state is touched; deregistering a resource removes its signature
+    # and the next query is recomputed from the remaining data.
+    entries: list[tuple[str, SignatureRecord]] = []
+    for resource in store.list_all():
+        record = signature_store.get(resource.id)
+        if record is None:
+            continue
+        entries.append((resource.id, record))
+    return _json_response(
+        start_response,
+        "200 OK",
+        summarize_key_usage(entries),
+        trailing_newline=True,
+    )
+
+
 def _handle_advisories(
     method: str,
     environ: dict[str, Any],
@@ -7117,6 +7171,11 @@ def application(
             return _handle_signature_verification(
                 method, environ, start_response
             )
+
+        if path == "/signature-keys":
+            # Global key-usage summary; the handler answers the 405
+            # (Allow: GET) for every other method.
+            return _handle_signature_keys(method, environ, start_response)
 
         if path == "/risk":
             # Global risk summary; the handler answers the 405 (Allow: GET)

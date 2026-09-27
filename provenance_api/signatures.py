@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 #: A digest is exactly 64 hexadecimal characters; mixed case is accepted
@@ -229,3 +230,68 @@ class SignatureStore:
 
     def get(self, resource_id: str) -> SignatureRecord | None:
         return self._records.get(resource_id)
+
+
+def summarize_key_usage(
+    entries: Iterable[tuple[str, SignatureRecord]],
+) -> list[dict[str, object]]:
+    """Aggregate signature records by key id into a key-usage summary.
+
+    ``entries`` are ``(resource_id, record)`` pairs already ordered by the
+    caller, and are consumed in that order. Each key id produces one entry,
+    emitted in the order the key id is first encountered. Within a key, the
+    ``algorithms`` and ``signers`` lists keep the distinct values in the
+    order they first appear, echoed verbatim; ``resources`` keeps the
+    distinct resource ids in input order; and ``signature_count`` is the
+    number of records using the key, each record counted exactly once.
+
+    Each entry puts ``key_id`` first, followed by ``algorithms`` and
+    ``signers``, and finishes with ``signature_count`` and ``resources``;
+    the key order is fixed and never changes.
+    """
+
+    order: list[str] = []
+    algorithms: dict[str, list[str]] = {}
+    signers: dict[str, list[str]] = {}
+    resources: dict[str, list[str]] = {}
+    counts: dict[str, int] = {}
+    seen_algorithms: dict[str, set[str]] = {}
+    seen_signers: dict[str, set[str]] = {}
+    seen_resources: dict[str, set[str]] = {}
+
+    for resource_id, record in entries:
+        key_id = record.key_id
+        if key_id not in counts:
+            order.append(key_id)
+            algorithms[key_id] = []
+            signers[key_id] = []
+            resources[key_id] = []
+            counts[key_id] = 0
+            seen_algorithms[key_id] = set()
+            seen_signers[key_id] = set()
+            seen_resources[key_id] = set()
+
+        counts[key_id] += 1
+
+        if record.algorithm not in seen_algorithms[key_id]:
+            seen_algorithms[key_id].add(record.algorithm)
+            algorithms[key_id].append(record.algorithm)
+
+        if record.signer not in seen_signers[key_id]:
+            seen_signers[key_id].add(record.signer)
+            signers[key_id].append(record.signer)
+
+        if resource_id not in seen_resources[key_id]:
+            seen_resources[key_id].add(resource_id)
+            resources[key_id].append(resource_id)
+
+    return [
+        {
+            "key_id": key_id,
+            "algorithms": algorithms[key_id],
+            "signers": signers[key_id],
+            "signature_count": counts[key_id],
+            "resources": resources[key_id],
+        }
+        for key_id in order
+    ]
