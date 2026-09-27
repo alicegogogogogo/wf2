@@ -419,6 +419,59 @@ class ResourceStore:
             path.append(current)
         return path
 
+    def all_shortest_paths(
+        self, start: str, end: str
+    ) -> list[list[str]] | None:
+        """Return every shortest directed path from ``start`` to ``end``.
+
+        Each path follows dependency edges in their direction (the start
+        resource depends on the end resource) and is reported as the list
+        of node ids, ``start`` first and ``end`` last, with no repeated
+        nodes. ``start == end`` yields the single single-node path.
+        Returns ``None`` when ``end`` is not reachable from ``start``.
+        The paths are ordered stably: by the second node's registration
+        order first, then by each subsequent node's registration order.
+        """
+
+        if start == end:
+            return [[start]]
+
+        # Hops from every node to ``end`` along the edge direction,
+        # computed as a breadth-first walk over the reverse graph.
+        dist: dict[str, int] = {end: 0}
+        queue = [end]
+        for node in queue:
+            for predecessor in self._dependents.get(node, ()):
+                if predecessor not in dist:
+                    dist[predecessor] = dist[node] + 1
+                    queue.append(predecessor)
+        if start not in dist:
+            return None
+
+        # Enumerate every shortest path: from each node only the successors
+        # exactly one hop closer to ``end`` can continue a shortest path.
+        # The graph is a DAG, so the walk always terminates.
+        paths: list[list[str]] = []
+        stack: list[tuple[str, list[str]]] = [(start, [start])]
+        while stack:
+            node, path = stack.pop()
+            if node == end:
+                paths.append(path)
+                continue
+            remaining = dist[node]
+            for successor in self._dependencies.get(node, ()):
+                if dist.get(successor) == remaining - 1:
+                    stack.append((successor, [*path, successor]))
+
+        order = {
+            resource.id: index
+            for index, resource in enumerate(self._resources)
+        }
+        paths.sort(
+            key=lambda path: tuple(order[node] for node in path[1:])
+        )
+        return paths
+
     def list_impact(self, resource_id: str) -> list[str]:
         """Return ids that directly or transitively depend on ``resource_id``.
 
