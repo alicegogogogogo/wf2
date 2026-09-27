@@ -347,3 +347,19 @@ class ContentStore:
         if session is None or not session.complete:
             return ContentStatus(complete=False, size=None)
         return ContentStatus(complete=True, size=len(session.content))
+
+    def recomputed_digest(self, resource_id: str) -> str | None:
+        """Recompute the SHA-256 of the finalized bytes for one resource.
+
+        Returns the lowercase hex digest of the stored assembled content,
+        or ``None`` when the resource has no assembled artifact (upload
+        never started, chunks still missing, assembly failed on a digest
+        mismatch or the session was reset). The digest is computed on the
+        fly from the stored bytes; nothing is recorded and the finalized
+        bytes, chunks and sessions are never touched.
+        """
+
+        session = self._sessions.get(resource_id)
+        if session is None or not session.complete:
+            return None
+        return hashlib.sha256(session.content).hexdigest()
