@@ -76,6 +76,7 @@ from .resources import (
 )
 from .risk import compute_risk_score, risk_level
 from .sbom import (
+    SbomComponent,
     SbomError,
     SbomStore,
     SbomValidationError,
@@ -91,6 +92,7 @@ from .signatures import (
 )
 from .vulnerabilities import (
     SEVERITY_VALUES,
+    Vulnerability,
     VulnerabilityError,
     VulnerabilityStore,
     VulnerabilityValidationError,
@@ -4294,6 +4296,30 @@ def _handle_component_risks(
     )
 
 
+def _component_fix_fields(
+    component: SbomComponent, alerts: Iterable[Vulnerability]
+) -> dict[str, object]:
+    """Build one component fix recommendation record.
+
+    An alert hits a component only when the names are byte-for-byte
+    identical (case-sensitive, no trimming); versions and summaries never
+    take part. The recommendation is the greatest numeric fixed version
+    among the hits; non-numeric candidates and missing ones are ignored.
+    The record's keys (and key order) are shared by the per-resource and
+    the global component fix views.
+    """
+
+    hits = [alert for alert in alerts if alert.component == component.name]
+    return {
+        "name": component.name,
+        "version": component.version,
+        "recommended_version": recommended_fix_version(
+            alert.fixed_version for alert in hits
+        ),
+        "advisory_count": len(hits),
+    }
+
+
 def _handle_component_fixes(
     method: str,
     environ: dict[str, Any],
@@ -4337,35 +4363,113 @@ def _handle_component_fixes(
             "No SBOM document is recorded for this resource.",
         )
 
-    # Read-only, computed on the fly: like component-risks, an alert hits a
-    # component only when the names are byte-for-byte identical
-    # (case-sensitive, no trimming); versions and summaries never take part.
-    # The recommendation is the greatest numeric fixed version among the
-    # hits; non-numeric candidates and missing ones are ignored, and nothing
-    # is ever recorded.
+    # Read-only, computed on the fly: nothing is ever recorded.
     alerts = vulnerability_store.list_for(raw_id)
-    fixes: list[dict[str, object]] = []
-    for component in document.components:
-        hits = [
-            alert
-            for alert in alerts
-            if alert.component == component.name
-        ]
-        fixes.append(
-            {
-                "name": component.name,
-                "version": component.version,
-                "recommended_version": recommended_fix_version(
-                    alert.fixed_version for alert in hits
-                ),
-                "advisory_count": len(hits),
-            }
-        )
+    fixes = [
+        _component_fix_fields(component, alerts)
+        for component in document.components
+    ]
 
     return _json_response(
         start_response,
         "200 OK",
         {"fixes": fixes},
+        trailing_newline=True,
+    )
+
+
+def _parse_component_fixes_summary_query(
+    query_string: str,
+) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``name`` query parameter.
+
+    Returns ``(name, None)`` -- with ``None`` when the parameter is
+    absent -- or ``(None, message)`` for an unknown parameter, a repeated
+    ``name`` or an empty value. The name is matched verbatim against
+    component names: case-sensitive, no trimming.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    name: str | None = None
+    for key, value in pairs:
+        if key != "name":
+            return None, f"Unknown query parameter: {key!r}."
+        if name is not None:
+            return None, "Query parameter 'name' must not be repeated."
+        if value == "":
+            return None, "Component name must not be empty."
+        name = value
+    return name, None
+
+
+def _handle_component_fixes_summary(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``name`` filter is accepted; unknown or repeated
+    # parameters and an empty value are rejected before any data is read.
+    name, query_error = _parse_component_fixes_summary_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current stores: entries unfold in
+    # resource registration order, and within one resource the components
+    # keep their SBOM submission order. Resources without an SBOM document
+    # are skipped silently; a document with an empty component list, or one
+    # whose components have no alerts, still contributes its entries (with
+    # zero counts). Each record puts the owning resource id first, followed
+    # by the component digest (lowercase) and the same fields in the same
+    # order as the per-resource component fix view. Nothing is recorded and
+    # no state is touched.
+    fixes: list[dict[str, object]] = []
+    for resource in store.list_all():
+        document = sbom_store.get_sbom(resource.id)
+        if document is None:
+            continue
+        alerts = vulnerability_store.list_for(resource.id)
+        for component in document.components:
+            if name is not None and component.name != name:
+                continue
+            fields = _component_fix_fields(component, alerts)
+            fixes.append(
+                {
+                    "resource_id": resource.id,
+                    "name": fields["name"],
+                    "version": fields["version"],
+                    "digest": component.digest,
+                    "recommended_version": fields["recommended_version"],
+                    "advisory_count": fields["advisory_count"],
+                }
+            )
+    return _json_response(
+        start_response,
+        "200 OK",
+        fixes,
         trailing_newline=True,
     )
 
@@ -6501,6 +6605,13 @@ def application(
             # Global admission-preview summary; the handler answers the
             # 405 (Allow: GET) for every other method.
             return _handle_admission_preview_summary(
+                method, environ, start_response
+            )
+
+        if path == "/component-fixes":
+            # Global component fix summary; the handler answers the 405
+            # (Allow: GET) for every other method.
+            return _handle_component_fixes_summary(
                 method, environ, start_response
             )
 
