@@ -1842,6 +1842,62 @@ def _handle_upload_sessions(
     )
 
 
+def _content_status_payload(resource_id: str) -> dict[str, Any]:
+    status = content_store.content_status(resource_id)
+    return {
+        "id": resource_id,
+        "complete": status.complete,
+        "size": status.size,
+    }
+
+
+def _handle_content_status(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly in resource registration order: one record per
+    # registered resource, including resources that never started an
+    # upload; deregistered resources disappear. The record reports only
+    # finished-artifact readiness: id, complete and size in that fixed key
+    # order. Nothing is recorded and sessions or finalized bytes are never
+    # touched.
+    results = [
+        _content_status_payload(resource.id) for resource in store.list_all()
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        results,
+        trailing_newline=True,
+    )
+
+
 def _handle_chunks_start(
     method: str,
     environ: dict[str, Any],
@@ -6874,6 +6930,11 @@ def application(
             # Global chunk upload session summary; the handler answers the
             # 405 (Allow: GET) for every other method.
             return _handle_upload_sessions(method, environ, start_response)
+
+        if path == "/content-status":
+            # Global finished-content readiness summary; the handler
+            # answers the 405 (Allow: GET) for every other method.
+            return _handle_content_status(method, environ, start_response)
 
         if path == "/vulnerability-exceptions":
             # Global exemption summary; the handler answers the 405

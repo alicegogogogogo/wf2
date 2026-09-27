@@ -57,6 +57,21 @@ class SessionStatus:
     size: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class ContentStatus:
+    """Read-only readiness snapshot for one registered resource.
+
+    ``complete`` is ``True`` only after assembly has produced finalized
+    bytes; ``size`` is then the actual content length (``0`` for empty
+    content), and ``None`` while upload has not started, chunks are still
+    missing, assembly failed on a digest mismatch or the session was
+    reset.
+    """
+
+    complete: bool
+    size: int | None
+
+
 class ContentStore:
     """In-process chunk sessions keyed by resource id."""
 
@@ -317,3 +332,18 @@ class ContentStore:
         if session is None:
             return None
         return self._status_of(session)
+
+    def content_status(self, resource_id: str) -> ContentStatus:
+        """Return the content readiness snapshot for one registered resource.
+
+        Unlike :meth:`session_status`, a resource that never started an
+        upload, had its session reset or was never chunked still gets an
+        answer: ``complete`` is ``False`` and ``size`` is ``None``. The
+        snapshot is computed on the fly, records nothing and never mutates
+        sessions or finalized bytes.
+        """
+
+        session = self._sessions.get(resource_id)
+        if session is None or not session.complete:
+            return ContentStatus(complete=False, size=None)
+        return ContentStatus(complete=True, size=len(session.content))
