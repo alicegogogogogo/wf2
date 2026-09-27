@@ -3167,6 +3167,92 @@ def _handle_sboms_summary(
     )
 
 
+def _parse_licenses_query(
+    query_string: str,
+) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``spdx_id`` query parameter.
+
+    Returns ``(spdx_id, None)`` -- with ``None`` when the parameter is
+    absent -- or ``(None, message)`` for an unknown parameter or a
+    repeated ``spdx_id``. The value is matched verbatim against declared
+    SPDX identifiers: case-sensitive, no trimming, no fuzzy matching.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    spdx_id: str | None = None
+    for key, value in pairs:
+        if key != "spdx_id":
+            return None, f"Unknown query parameter: {key!r}."
+        if spdx_id is not None:
+            return None, "Query parameter 'spdx_id' must not be repeated."
+        spdx_id = value
+    return spdx_id, None
+
+
+def _handle_licenses_summary(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``spdx_id`` filter is accepted; unknown or repeated
+    # parameters are rejected before any data is read.
+    spdx_id, query_error = _parse_licenses_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current stores: entries unfold in
+    # resource registration order and are never reordered; resources without
+    # a license declaration are skipped silently and each resource appears
+    # at most once. Each entry puts the owning resource id first, followed
+    # by the SPDX identifier and the source description exactly as
+    # registered (null when omitted). Nothing is recorded and no state is
+    # touched.
+    declarations: list[dict[str, object]] = []
+    for resource in store.list_all():
+        record = sbom_store.get_license(resource.id)
+        if record is None:
+            continue
+        if spdx_id is not None and record.spdx_id != spdx_id:
+            continue
+        declarations.append(
+            {
+                "resource_id": resource.id,
+                "spdx_id": record.spdx_id,
+                "source": record.source,
+            }
+        )
+    return _json_response(
+        start_response,
+        "200 OK",
+        declarations,
+        trailing_newline=True,
+    )
+
+
 def _handle_license_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -6206,6 +6292,11 @@ def application(
             # Global SBOM summary; the handler answers the 405 (Allow: GET)
             # for every other method.
             return _handle_sboms_summary(method, environ, start_response)
+
+        if path == "/licenses":
+            # Global license summary; the handler answers the 405
+            # (Allow: GET) for every other method.
+            return _handle_licenses_summary(method, environ, start_response)
 
         if path == "/risk":
             # Global risk summary; the handler answers the 405 (Allow: GET)
