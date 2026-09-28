@@ -635,9 +635,12 @@ class CrossReferenceStore:
         registration order -- no deduplication or merging.
         ``reference_count`` counts the records one by one. ``resources``
         lists the start resources of the references, deduplicated and
-        ordered by resource registration order, with ids whose resource
-        has since been deregistered trailing in their first-reference
-        appearance order. Everything is derived from the current records.
+        ordered by resource registration order; a deregistered start
+        resource takes its records with it, so every listed id is always
+        live (the ranking keeps a trailing slot for deregistered ids
+        defensively, for parity with the repository usage view, where
+        deregistered resolved locals can linger). Everything is derived
+        from the current records.
         """
 
         order: list[str] = []
