@@ -649,3 +649,83 @@ class ResourceStore:
             }
             for resource_id in ids
         ]
+
+    def dependency_usage(self) -> list[dict[str, object]]:
+        """Summarize usage grouped by the depended-on resource.
+
+        One entry per resource that is depended on at least once (directly
+        or transitively), in registration order, with the fixed key order
+        ``id``, ``dependents``, ``dependent_count`` and
+        ``max_dependent_chain``. ``dependents`` lists every resource that
+        can reach the entry along dependency edges -- direct dependents and
+        transitive ones alike -- deduplicated and in registration order, and
+        ``dependent_count`` is its length. ``max_dependent_chain`` is the
+        longest path from any such dependent to the entry, counted in nodes
+        with both ends included; when several paths start at the same
+        dependent the longest one wins, so a resource that is only a direct
+        dependent scores two. Manually registered and
+        cross-reference-resolved edges are treated alike, since both flow
+        through :meth:`add_dependency`. Everything is derived on the fly.
+        """
+
+        ids = [resource.id for resource in self._resources]
+
+        usage: list[dict[str, object]] = []
+        for target in ids:
+            # Every node that reaches ``target`` through reverse edges is a
+            # direct or transitive dependent; together with ``target`` they
+            # are exactly the reverse subgraph the chain is measured on.
+            dependents = self._registration_order(
+                self._reachable(target, self._dependents)
+            )
+            if not dependents:
+                continue
+            subgraph = set(dependents)
+            subgraph.add(target)
+
+            # Longest path from each subgraph node to ``target``, followed
+            # along dependency edges that stay inside the subgraph (a
+            # dependent's unrelated dependencies must not contribute). The
+            # graph is a DAG (cycles are rejected at registration time), so
+            # an iterative postorder walk suffices and avoids any recursion
+            # limit on long chains. ``depth`` counts nodes with both ends
+            # included: the target scores one and a direct dependent two.
+            depth: dict[str, int] = {}
+            roots = [resource_id for resource_id in ids if resource_id in subgraph]
+            for root in roots:
+                stack: list[tuple[str, bool]] = [(root, False)]
+                while stack:
+                    node, expanded = stack.pop()
+                    if node in depth:
+                        continue
+                    successors = [
+                        dependency_id
+                        for dependency_id in self._dependencies.get(node, ())
+                        if dependency_id in subgraph
+                    ]
+                    if not expanded:
+                        stack.append((node, True))
+                        for successor in successors:
+                            if successor not in depth:
+                                stack.append((successor, False))
+                        continue
+                    depth[node] = (
+                        1
+                        if not successors
+                        else 1
+                        + max(
+                            depth[successor] for successor in successors
+                        )
+                    )
+
+            usage.append(
+                {
+                    "id": target,
+                    "dependents": dependents,
+                    "dependent_count": len(dependents),
+                    "max_dependent_chain": max(
+                        depth[dependent] for dependent in dependents
+                    ),
+                }
+            )
+        return usage

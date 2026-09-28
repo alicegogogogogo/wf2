@@ -1253,6 +1253,48 @@ def _handle_dependency_closure_summary(
     )
 
 
+def _handle_dependency_usage(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The view is read-only: a declared non-empty (or malformed) body is a
+    # bad request without consulting any business data. An omitted header
+    # and an explicit zero length count as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current registry; entries unfold in
+    # resource registration order and are never reordered; manual and
+    # cross-reference-resolved edges are treated alike, and nothing is
+    # recorded or cached.
+    return _json_response(
+        start_response,
+        "200 OK",
+        store.dependency_usage(),
+        trailing_newline=True,
+    )
+
+
 def _parse_graph_path_query(
     query_string: str,
 ) -> tuple[str | None, str | None, str | None]:
@@ -8083,6 +8125,13 @@ def application(
             # Per-resource dependency closure size summary; the handler
             # answers the 405 (Allow: GET) for every other method.
             return _handle_dependency_closure_summary(
+                method, environ, start_response
+            )
+
+        if path == "/dependency-usage":
+            # Per-depended-resource usage view; the handler answers the 405
+            # (Allow: GET) for every other method.
+            return _handle_dependency_usage(
                 method, environ, start_response
             )
 
