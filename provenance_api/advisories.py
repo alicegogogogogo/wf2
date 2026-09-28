@@ -110,6 +110,77 @@ def advisory_detail(
     }
 
 
+def advisory_fix_gaps(
+    resources: ResourceStore,
+    vulnerabilities: VulnerabilityStore,
+) -> list[dict[str, object]]:
+    """Aggregate every alert by the (advisory, component) pair.
+
+    Unlike the advisory-only summary, traversal is fixed to resource
+    registration order and, inside each resource, alert submission order;
+    nothing is ever reordered. Each advisory identifier and component name
+    pair yields a single entry, taking the position of its earliest alert
+    under that traversal, and the pair's values are echoed verbatim
+    (case-sensitive, no trimming).
+
+    ``alert_count`` is the raw number of alerts for the pair across every
+    resource: duplicates are neither removed nor merged. ``fixed_count``
+    tallies alerts with a non-empty fixed version and ``unfixed_count``
+    alerts without one, alert by alert, so the two always sum to
+    ``alert_count``. ``fixed_versions`` collects the non-empty fixed
+    versions verbatim, deduplicated at first occurrence and never sorted.
+    ``resources`` lists the resources that contribute an alert for the
+    pair, each appearing once in resource registration order.
+    """
+
+    order: list[tuple[str, str]] = []
+    fixed_counts: dict[tuple[str, str], int] = {}
+    unfixed_counts: dict[tuple[str, str], int] = {}
+    fixed_versions_by_pair: dict[tuple[str, str], list[str]] = {}
+    seen_fixed_versions: dict[tuple[str, str], set[str]] = {}
+    resources_by_pair: dict[tuple[str, str], list[str]] = {}
+    seen_resources: dict[tuple[str, str], set[str]] = {}
+
+    for resource in resources.list_all():
+        for alert in vulnerabilities.list_for(resource.id):
+            key = (alert.advisory, alert.component)
+            if key not in fixed_counts:
+                order.append(key)
+                fixed_counts[key] = 0
+                unfixed_counts[key] = 0
+                fixed_versions_by_pair[key] = []
+                seen_fixed_versions[key] = set()
+                resources_by_pair[key] = []
+                seen_resources[key] = set()
+            if alert.fixed_version is not None:
+                version = alert.fixed_version
+                if version not in seen_fixed_versions[key]:
+                    seen_fixed_versions[key].add(version)
+                    fixed_versions_by_pair[key].append(version)
+                fixed_counts[key] += 1
+            else:
+                unfixed_counts[key] += 1
+            if resource.id not in seen_resources[key]:
+                seen_resources[key].add(resource.id)
+                resources_by_pair[key].append(resource.id)
+
+    results: list[dict[str, object]] = []
+    for advisory, component in order:
+        key = (advisory, component)
+        results.append(
+            {
+                "advisory": advisory,
+                "component": component,
+                "alert_count": fixed_counts[key] + unfixed_counts[key],
+                "fixed_count": fixed_counts[key],
+                "unfixed_count": unfixed_counts[key],
+                "fixed_versions": fixed_versions_by_pair[key],
+                "resources": resources_by_pair[key],
+            }
+        )
+    return results
+
+
 def advisory_fixes(
     resources: ResourceStore,
     vulnerabilities: VulnerabilityStore,

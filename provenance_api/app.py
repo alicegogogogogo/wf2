@@ -12,7 +12,12 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
-from .advisories import advisory_detail, advisory_fixes, summarize_advisories
+from .advisories import (
+    advisory_detail,
+    advisory_fix_gaps,
+    advisory_fixes,
+    summarize_advisories,
+)
 from .cache import CacheError, LayerCacheStore
 from .component_fixes import recommended_fix_version
 from .content import ContentError, ContentStore, SessionStatus
@@ -5582,6 +5587,61 @@ def _handle_severity_coverage(
     )
 
 
+def _handle_advisory_fix_gaps(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The view is read-only: a declared non-empty (or malformed) body is a
+    # bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted; a
+    # repeated parameter is rejected just like any other parameter.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the alert records alone -- the SBOM is never
+    # consulted. Resources are visited in registration order and each
+    # resource's alerts in submission order, and entries are never
+    # reordered, so an (advisory, component) pair takes the position of its
+    # earliest alert in that fixed traversal. Advisory and component values
+    # are echoed verbatim with no case folding or trimming. Fixed versions
+    # are collected verbatim -- no dotted comparison, case folding or
+    # whitespace trimming, and no sorting -- with first-occurring
+    # duplicates removed. The two counts are tallied alert by alert,
+    # neither deduplicated nor merged, so they always sum to the raw number
+    # of alerts for the pair. Resources are deduplicated in resource
+    # registration order so a resource with several alerts for the pair
+    # counts once. Nothing is recorded and no state is touched, so alert
+    # changes and resource deregistration show up on the next request with
+    # no stale residue.
+    gaps = advisory_fix_gaps(store, vulnerability_store)
+    return _json_response(
+        start_response,
+        "200 OK",
+        gaps,
+        trailing_newline=True,
+    )
+
+
 def _handle_notifications_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -7989,6 +8049,14 @@ def application(
             # level; the handler answers the 405 (Allow: GET) for every
             # other method.
             return _handle_severity_coverage(
+                method, environ, start_response
+            )
+
+        if path == "/advisory-fix-gaps":
+            # Global fix gap summary aggregated by (advisory, component)
+            # pair; the handler answers the 405 (Allow: GET) for every
+            # other method.
+            return _handle_advisory_fix_gaps(
                 method, environ, start_response
             )
 
