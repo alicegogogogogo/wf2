@@ -611,6 +611,94 @@ class CrossReferenceStore:
             )
         return usage
 
+    def usage_by_local_id(
+        self, resource_store: ResourceStore
+    ) -> list[dict[str, object]]:
+        """Summarize the references grouped by resolved local id.
+
+        One entry per local id, ordered by the id's first appearance in
+        reference registration order. The order is re-derived from the
+        remaining records on every call -- after a single-reference
+        deletion an id with surviving references keeps its entry but its
+        first-appearance position is redetermined, and an id left without
+        references drops out entirely; groups are never reordered by any
+        other rule. Each entry carries the five keys ``local_id``,
+        ``repositories``, ``remote_ids``, ``reference_count`` and
+        ``resources`` in that fixed order. ``local_id`` is the id resolved
+        or reused at registration time, echoed verbatim -- later
+        deregistration of that resource or removal of the dependency edge
+        never rewrites historical references. ``repositories`` lists the
+        repository names pointing at the id, deduplicated in reference
+        registration order and echoed verbatim. ``remote_ids`` lists one
+        remote id per record, in reference registration order, with no
+        deduplication or merging. ``reference_count`` counts the records
+        one by one. ``resources`` lists the start resources of the
+        references, deduplicated in resource registration order.
+        Everything is derived from the current records.
+        """
+
+        order: list[str] = []
+        counts: dict[str, int] = {}
+        repositories_by_local: dict[str, list[str]] = {}
+        seen_repositories: dict[str, set[str]] = {}
+        remote_ids_by_local: dict[str, list[str]] = {}
+        resources_by_local: dict[str, list[str]] = {}
+        seen_resources: dict[str, set[str]] = {}
+
+        for record in self._records:
+            local_id = record.local_id
+            if local_id not in counts:
+                order.append(local_id)
+                counts[local_id] = 0
+                repositories_by_local[local_id] = []
+                seen_repositories[local_id] = set()
+                remote_ids_by_local[local_id] = []
+                resources_by_local[local_id] = []
+                seen_resources[local_id] = set()
+            counts[local_id] += 1
+            # One entry per record: remote ids are never deduplicated or
+            # merged, even when the very same remote id arrives via
+            # several repositories.
+            remote_ids_by_local[local_id].append(record.remote_id)
+            if record.repository not in seen_repositories[local_id]:
+                seen_repositories[local_id].add(record.repository)
+                repositories_by_local[local_id].append(record.repository)
+            if record.resource_id not in seen_resources[local_id]:
+                seen_resources[local_id].add(record.resource_id)
+                resources_by_local[local_id].append(record.resource_id)
+
+        # Start resources follow the live resource registry. A start
+        # resource takes its records with it on deregistration, so every
+        # surviving record's start is still registered; the trailing
+        # branch mirrors the repository usage view's handling.
+        rank = {
+            resource.id: position
+            for position, resource in enumerate(resource_store.list_all())
+        }
+
+        def registration_ordered(ids: list[str]) -> list[str]:
+            ranked = [identifier for identifier in ids if identifier in rank]
+            ranked.sort(key=rank.__getitem__)
+            ranked.extend(
+                identifier for identifier in ids if identifier not in rank
+            )
+            return ranked
+
+        usage: list[dict[str, object]] = []
+        for local_id in order:
+            usage.append(
+                {
+                    "local_id": local_id,
+                    "repositories": repositories_by_local[local_id],
+                    "remote_ids": remote_ids_by_local[local_id],
+                    "reference_count": counts[local_id],
+                    "resources": registration_ordered(
+                        resources_by_local[local_id]
+                    ),
+                }
+            )
+        return usage
+
     def check_prerequisites(
         self,
         repository: str,
