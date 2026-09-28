@@ -352,6 +352,60 @@ class DependencyBatchTests(unittest.TestCase):
         self.assertEqual(status, "409 Conflict")
         self.assertEqual(body["error"], "dependency_cycle")
 
+    def test_self_loop_anywhere_outranks_earlier_existing_edge(self) -> None:
+        # Fixed rule order, not submission position: an existing edge at
+        # position 0 must not mask the self loop at position 2.
+        a = self._create("a")
+        b = self._create("b")
+        c = self._create("c")
+        self.assertEqual(self._batch(a, [b])[0], "201 Created")
+        status, _h, body = self._batch(a, [b, c, a])
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "dependency_cycle")
+        self.assertEqual(store.list_direct_dependencies(a), [b])
+
+    def test_self_loop_after_an_in_batch_repeat_still_reports_cycle(self) -> None:
+        # The repeat at position 1 used to fail first; the fixed rule
+        # order reports the self loop found later in the batch.
+        a = self._create("a")
+        b = self._create("b")
+        status, _h, body = self._batch(a, [b, b, a])
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "dependency_cycle")
+        self.assertEqual(store.list_direct_dependencies(a), [])
+
+    def test_in_batch_duplicate_outranks_earlier_existing_edge(self) -> None:
+        # Rule order puts repeats (400) before same-direction duplicates
+        # (409), regardless of which position hits first.
+        a = self._create("a")
+        b = self._create("b")
+        c = self._create("c")
+        self.assertEqual(self._batch(a, [b])[0], "201 Created")
+        status, _h, body = self._batch(a, [b, c, b])
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+        self.assertEqual(store.list_direct_dependencies(a), [b])
+
+    def test_existing_edge_outranks_later_cycle_introduction(self) -> None:
+        # Same-direction duplication (rule 3) precedes cycle introduction
+        # (rule 4) even though the cycle-closing entry comes later.
+        a = self._create("a")
+        b = self._create("b")
+        c = self._create("c")
+        d = self._create("d")
+        self.assertEqual(self._batch(a, [b])[0], "201 Created")
+        # d -> a means adding a -> d would close a cycle.
+        self.assertEqual(
+            call_json(
+                "POST", f"/resources/{d}/dependencies", {"dependency_id": a}
+            )[0],
+            "201 Created",
+        )
+        status, _h, body = self._batch(a, [b, d])
+        self.assertEqual(status, "409 Conflict")
+        self.assertEqual(body["error"], "duplicate_dependency")
+        self.assertEqual(store.list_direct_dependencies(a), [b])
+
     def test_existing_same_direction_edge_is_duplicate_dependency(self) -> None:
         a = self._create("a")
         b = self._create("b")
@@ -431,9 +485,9 @@ class DependencyBatchTests(unittest.TestCase):
 
     # --- Method handling ---------------------------------------------------
 
-    def test_non_post_methods_return_405_with_post_only_allow(self) -> None:
+    def test_other_methods_return_405_with_post_delete_allow(self) -> None:
         a = self._create("a")
-        for method in ("GET", "DELETE", "PUT", "PATCH"):
+        for method in ("GET", "PUT", "PATCH"):
             with self.subTest(method=method):
                 status, headers, body = call_json(
                     method, f"/resources/{a}/dependencies/batch"
@@ -441,7 +495,8 @@ class DependencyBatchTests(unittest.TestCase):
                 self.assertEqual(status, "405 Method Not Allowed")
                 self.assertEqual(body["error"], "method_not_allowed")
                 self.assertEqual(
-                    [h for h in headers if h[0] == "Allow"], [("Allow", "POST")]
+                    [h for h in headers if h[0] == "Allow"],
+                    [("Allow", "POST, DELETE")],
                 )
 
     # --- Views and cursors -------------------------------------------------

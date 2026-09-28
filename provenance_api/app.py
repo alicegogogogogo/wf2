@@ -809,13 +809,13 @@ def _handle_dependencies_batch(
     raw_id: str,
     start_response: StartResponse,
 ) -> Iterable[bytes]:
-    if method != "POST":
+    if method not in ("POST", "DELETE"):
         return _error(
             start_response,
             "405 Method Not Allowed",
             "method_not_allowed",
             f"Method {method} is not allowed for this path.",
-            allowed="POST",
+            allowed="POST, DELETE",
         )
 
     id_error = _validate_path_id(raw_id)
@@ -848,9 +848,14 @@ def _handle_dependencies_batch(
         )
 
     # Element-level validation happens entirely in the builder so a bad
-    # batch is rejected before any business data is read.
+    # batch is rejected before any business data is read. Registration
+    # defers the in-batch repeat check to the store, where the self-loop
+    # rule takes precedence; removal rejects repeats here like every other
+    # shape violation.
     try:
-        dependency_ids = build_dependency_batch_fields(payload)
+        dependency_ids = build_dependency_batch_fields(
+            payload, check_duplicates=(method == "DELETE")
+        )
     except ResourceValidationError as exc:
         return _error(
             start_response,
@@ -860,7 +865,10 @@ def _handle_dependencies_batch(
         )
 
     # Existence checks follow the fixed order: start first, then each
-    # depended-upon id in submission order.
+    # depended-upon id in submission order. Removal never reaches the
+    # per-id check: once the start exists every missing edge reports
+    # dependency_not_found, even when the target resource itself was
+    # deregistered (its edges cascade away with it).
     if store.get(raw_id) is None:
         return _error(
             start_response,
@@ -868,6 +876,29 @@ def _handle_dependencies_batch(
             "resource_not_found",
             "No resource exists with the requested id.",
         )
+
+    if method == "DELETE":
+        try:
+            store.remove_dependencies(raw_id, dependency_ids)
+        except DependencyError as exc:
+            return _error(
+                start_response,
+                "404 Not Found",
+                exc.code,
+                exc.message,
+            )
+        return _json_response(
+            start_response,
+            "200 OK",
+            {
+                "dependencies": [
+                    {"resource_id": raw_id, "dependency_id": dependency_id}
+                    for dependency_id in dependency_ids
+                ]
+            },
+            trailing_newline=True,
+        )
+
     for dependency_id in dependency_ids:
         if store.get(dependency_id) is None:
             return _error(
@@ -877,11 +908,12 @@ def _handle_dependencies_batch(
                 "No resource exists with dependency_id.",
             )
 
-    # The store judges self loops, in-batch repeats, existing same-direction
-    # edges and introduced cycles per entry in that precedence, and either
-    # commits every edge or none. Cycles and existing edges are 409; an
-    # in-batch repeat is still a 400 invalid_request (checked after self
-    # loops, so a self-referential entry wins as a cycle).
+    # The store judges conflicts by fixed rule class rather than by
+    # submission position: self loops, then in-batch repeats, then existing
+    # same-direction edges, then introduced cycles; within one class the
+    # earliest offending position wins. Cycles and existing edges are 409;
+    # an in-batch repeat is a 400 invalid_request, but a self loop anywhere
+    # in the batch takes precedence over it.
     try:
         store.add_dependencies(raw_id, dependency_ids)
     except ResourceValidationError as exc:
