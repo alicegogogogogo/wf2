@@ -14,6 +14,9 @@ _DIGEST_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 _ALLOWED_FIELDS = frozenset({"name", "category", "digest", "source"})
 _REQUIRED_FIELDS = ("name", "category", "digest")
 
+#: Maximum number of dependency edges accepted in one batch registration.
+MAX_DEPENDENCY_BATCH_SIZE = 100
+
 
 class ResourceValidationError(ValueError):
     """A registration payload failed field-level validation."""
@@ -110,6 +113,65 @@ def build_resource_fields(
         source = _require_non_empty_string(payload["source"], "Source")
 
     return name, category, digest, source
+
+
+def build_dependency_batch_fields(payload: object) -> list[str]:
+    """Validate a decoded dependency batch payload, returning the id list.
+
+    The top level must be a JSON object carrying exactly one field,
+    ``dependencies``: a non-empty array of at most
+    :data:`MAX_DEPENDENCY_BATCH_SIZE` non-empty strings, none containing a
+    path separator (``/`` or ``\\``). The ids are returned in their
+    submitted order. Duplicates within the array are deliberately not
+    screened here: their check is ordered after self loops (but before
+    existing-edge and cycle checks) in :meth:`ResourceStore.add_dependencies`
+    so that, e.g., a self-referential first entry reports the cycle rather
+    than the repeat. Existence and graph conflicts are likewise checked
+    later so their error codes keep precedence.
+    """
+
+    if not isinstance(payload, dict):
+        raise ResourceValidationError("Request body must be a JSON object.")
+
+    unknown_fields = set(payload) - {"dependencies"}
+    if unknown_fields:
+        raise ResourceValidationError(
+            f"Unknown field: {sorted(unknown_fields)[0]!r}."
+        )
+    if "dependencies" not in payload:
+        raise ResourceValidationError(
+            "Missing required field: 'dependencies'."
+        )
+
+    items = payload["dependencies"]
+    if not isinstance(items, list):
+        raise ResourceValidationError(
+            "Field 'dependencies' must be an array."
+        )
+    if not items:
+        raise ResourceValidationError(
+            "Field 'dependencies' must not be empty."
+        )
+    if len(items) > MAX_DEPENDENCY_BATCH_SIZE:
+        raise ResourceValidationError(
+            f"Field 'dependencies' must not exceed "
+            f"{MAX_DEPENDENCY_BATCH_SIZE} entries."
+        )
+
+    dependency_ids: list[str] = []
+    for position, item in enumerate(items):
+        if not isinstance(item, str) or not item:
+            raise ResourceValidationError(
+                f"Dependency at index {position} must be a non-empty string."
+            )
+        if "/" in item or "\\" in item:
+            raise ResourceValidationError(
+                f"Dependency at index {position} must not contain path "
+                "separators."
+            )
+        dependency_ids.append(item)
+
+    return dependency_ids
 
 
 class ResourceStore:
@@ -339,6 +401,67 @@ class ResourceStore:
         self.check_dependency(resource_id, dependency_id)
         self._dependencies[resource_id][dependency_id] = None
         self._dependents[dependency_id][resource_id] = None
+
+    def add_dependencies(
+        self, resource_id: str, dependency_ids: list[str]
+    ) -> None:
+        """Atomically record several edges out of ``resource_id``.
+
+        Both the start and every depended-upon resource must already be
+        registered (the caller checks existence); ``dependency_ids`` must
+        come from :func:`build_dependency_batch_fields`, so it is a
+        non-empty list of non-empty, separator-free strings in submission
+        order. Conflicts are judged per entry in submission order, and
+        within one entry in the order self loop, in-batch repeat, existing
+        same-direction edge, introduced cycle -- the first failure wins.
+        A self loop or an introduced cycle raises :class:`DependencyError`
+        with code ``dependency_cycle`` and an existing edge raises one with
+        code ``duplicate_dependency`` (both 409); an id repeated inside the
+        batch raises :class:`ResourceValidationError` (400
+        ``invalid_request``), matching the request-level rule -- but only
+        once the entry is not itself a self loop, which is checked first.
+        Every edge in the batch shares the same origin, so an earlier
+        accepted edge can never feed a path back to the start that did not
+        already exist; cycle detection therefore uses the committed graph
+        exactly like :meth:`check_dependency`. The whole batch is atomic: a
+        failure leaves the graph exactly as it was; on success every edge is
+        established in submission order.
+        """
+
+        existing = self._dependencies.get(resource_id, ())
+        accepted: list[str] = []
+        accepted_set: set[str] = set()
+        for dependency_id in dependency_ids:
+            if dependency_id == resource_id:
+                raise DependencyError(
+                    "dependency_cycle",
+                    "A resource must not depend on itself.",
+                )
+            if dependency_id in accepted_set:
+                raise ResourceValidationError(
+                    "A dependency must not be listed more than once in the "
+                    "same batch."
+                )
+            if dependency_id in existing:
+                raise DependencyError(
+                    "duplicate_dependency",
+                    "This dependency relation already exists.",
+                )
+            if resource_id in self._reachable(
+                dependency_id, self._dependencies
+            ):
+                raise DependencyError(
+                    "dependency_cycle",
+                    "This dependency would introduce a cycle.",
+                )
+            accepted.append(dependency_id)
+            accepted_set.add(dependency_id)
+
+        # Every check passed; only now mutate, preserving submission order
+        # in the ordered edge dicts.
+        for dependency_id in accepted:
+            self._dependencies[resource_id][dependency_id] = None
+            self._dependents[dependency_id][resource_id] = None
 
     def has_dependency(self, resource_id: str, dependency_id: str) -> bool:
         """Return whether the direct edge ``resource_id -> dependency_id`` exists."""

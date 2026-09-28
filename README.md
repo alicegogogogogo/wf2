@@ -174,6 +174,35 @@ curl -s -X POST http://127.0.0.1:8000/resources/$A/dependencies \
 - 已经间接可达、但尚不存在的直接边不算重复也不算环，仍以 HTTP 201 建立。
 - 起点资源或 `dependency_id` 指向的资源不存在时返回 HTTP 404（错误码 `resource_not_found`），不会自动建资源。
 
+### 批量登记依赖：`POST /resources/{id}/dependencies/batch`
+
+在单条登记路径之后追加 `batch` 一段，一次性为同一个起点登记多条被依赖边。只接受 `POST` 方法。请求体必须是 JSON 对象，且只允许一个字段：
+
+| 字段 | 类型 | 是否必填 | 说明 |
+| --- | --- | --- | --- |
+| `dependencies` | string[] | 是 | 被依赖资源标识的非空数组，单批最多 100 条；每项非空，不得包含 `/`、`\\`，数组内不得重复 |
+
+整批按原子方式提交：任何一项不合法或冲突都不建立任何一条边，图保持原样。成功返回 HTTP 201，正文按提交顺序逐条回显起点与被依赖资源标识，为紧凑 JSON 并以单个换行结束：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/resources/$A/dependencies/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies":["<资源 B 的 id>","<资源 C 的 id>"]}'
+```
+
+```json
+{"dependencies":[{"resource_id":"<资源 A 的 id>","dependency_id":"<资源 B 的 id>"},{"resource_id":"<资源 A 的 id>","dependency_id":"<资源 C 的 id>"}]}
+```
+
+- 已经间接可达但尚不存在的直接边照常建立，与单条登记的既有口径一致；建边顺序即提交顺序。
+- 冲突与错误的判定次序固定：先请求体与参数，再起点存在性，再各被依赖标识的存在性（按提交顺序）；随后逐条按提交顺序判定自环、批内重复、同向重复与成环，同一条同时命中时只报最前一项对应的错误码。
+- 自环返回 HTTP 409（错误码 `dependency_cycle`）；同向直接边已存在返回 HTTP 409（错误码 `duplicate_dependency`），不覆盖原关系；批内多条边叠加后会引入环时返回 HTTP 409（错误码 `dependency_cycle`）。任何 409 都不建立任何一条边。
+- 批内重复属于请求不合法，返回 HTTP 400（错误码 `invalid_request`）；但每一项先判自环再判批内重复，因此重复项同时是自环（如起点自身在数组中出现）时按 HTTP 409 `dependency_cycle` 报告，不建任何边。
+- 起点或任一被依赖标识不存在时返回 HTTP 404（错误码 `resource_not_found`），不建任何边。
+- 请求体缺失、无法解码为合法 UTF-8 JSON、顶层不是 JSON 对象、字段缺失或类型错误、出现未知字段、数组为空、超过 100 条、某项为空或含分隔符、批内重复，或请求携带任意查询参数，均返回 HTTP 400（错误码 `invalid_request`），不读取业务数据、不留半条边。
+- `POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: POST`）。
+- 建边成功后，依赖查询、影响分析、图谱视图等既有视图立即按新边重算；失败请求不改图、不新增资源，也不改列表分页游标。
+
 ### 解除单条依赖：`DELETE /resources/{id}/dependencies/{dependency_id}`
 
 解除登记依赖路径同一路由之后的一条**直接边**：起点为路径首段的资源，被依赖资源由末段标识给出，只接受 `DELETE` 方法。请求不得携带任何查询参数，也不得声明非空请求体（显式 `Content-Length: 0` 视为空体）。
@@ -233,7 +262,7 @@ curl -s -X POST http://127.0.0.1:8000/resources/$A/dependencies \
 - 请求体缺失、不是合法 UTF-8 JSON、顶层不是 JSON 对象、缺少 `dependency_id`、`dependency_id` 不是字符串/为空/含分隔符，或出现未知字段，均返回 HTTP 400（错误码 `invalid_request`）。
 - 这些接口不接受查询参数；出现任意查询参数返回 HTTP 400（错误码 `invalid_request`）。
 - 起点不存在时，两个查询接口都返回 HTTP 404（错误码 `resource_not_found`），且不改变状态。
-- 对 `/resources/{id}/dependencies` 使用 `GET`、`POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET, POST`）；对 `/resources/{id}/dependencies/{dependency_id}` 使用 `DELETE` 之外的方法返回 HTTP 405（`Allow: DELETE`）；对 `/resources/{id}/impact` 使用 `GET` 之外的方法返回 HTTP 405（`Allow: GET`）。
+- 对 `/resources/{id}/dependencies` 使用 `GET`、`POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET, POST`）；对 `/resources/{id}/dependencies/batch` 使用 `POST` 之外的方法返回 HTTP 405（`Allow: POST`）；对 `/resources/{id}/dependencies/{dependency_id}` 使用 `DELETE` 之外的方法返回 HTTP 405（`Allow: DELETE`）；对 `/resources/{id}/impact` 使用 `GET` 之外的方法返回 HTTP 405（`Allow: GET`）。
 - 任何非法请求都不会新增或修改资源、关系或分页游标。
 
 

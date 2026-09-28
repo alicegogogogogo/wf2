@@ -73,6 +73,7 @@ from .resources import (
     Resource,
     ResourceStore,
     ResourceValidationError,
+    build_dependency_batch_fields,
 )
 from .risk import compute_risk_score, risk_level
 from .sbom import (
@@ -799,6 +800,115 @@ def _handle_dependencies(
         "method_not_allowed",
         f"Method {method} is not allowed for this path.",
         allowed="GET, POST",
+    )
+
+
+def _handle_dependencies_batch(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Element-level validation happens entirely in the builder so a bad
+    # batch is rejected before any business data is read.
+    try:
+        dependency_ids = build_dependency_batch_fields(payload)
+    except ResourceValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    # Existence checks follow the fixed order: start first, then each
+    # depended-upon id in submission order.
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+    for dependency_id in dependency_ids:
+        if store.get(dependency_id) is None:
+            return _error(
+                start_response,
+                "404 Not Found",
+                "resource_not_found",
+                "No resource exists with dependency_id.",
+            )
+
+    # The store judges self loops, in-batch repeats, existing same-direction
+    # edges and introduced cycles per entry in that precedence, and either
+    # commits every edge or none. Cycles and existing edges are 409; an
+    # in-batch repeat is still a 400 invalid_request (checked after self
+    # loops, so a self-referential entry wins as a cycle).
+    try:
+        store.add_dependencies(raw_id, dependency_ids)
+    except ResourceValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+    except DependencyError as exc:
+        return _error(
+            start_response,
+            "409 Conflict",
+            exc.code,
+            exc.message,
+        )
+
+    return _json_response(
+        start_response,
+        "201 Created",
+        {
+            "dependencies": [
+                {"resource_id": raw_id, "dependency_id": dependency_id}
+                for dependency_id in dependency_ids
+            ]
+        },
+        trailing_newline=True,
     )
 
 
@@ -8435,12 +8545,26 @@ def application(
                 return _handle_dependencies(
                     method, environ, head, start_response
                 )
+            if separator and tail == "dependencies/batch":
+                return _handle_dependencies_batch(
+                    method, environ, head, start_response
+                )
             if separator and tail.startswith("dependencies/"):
                 return _handle_dependency_item(
                     method,
                     environ,
                     head,
                     tail[len("dependencies/"):],
+                    start_response,
+                )
+            if separator and suffix.endswith("/dependencies/batch"):
+                # Fallback for a separator inside the start id segment so
+                # the batch handler rejects it without establishing any
+                # edge.
+                return _handle_dependencies_batch(
+                    method,
+                    environ,
+                    suffix[: -len("/dependencies/batch")],
                     start_response,
                 )
             if separator and "/dependencies/" in suffix:
