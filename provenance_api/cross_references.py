@@ -526,6 +526,91 @@ class CrossReferenceStore:
 
         return list(self._records)
 
+    def usage_by_repository(
+        self, resource_store: ResourceStore
+    ) -> list[dict[str, object]]:
+        """Summarize the references grouped by repository name.
+
+        One entry per repository name, ordered by the name's first
+        appearance in reference registration order; the groups themselves
+        are never reordered. Each entry carries the six keys ``repository``,
+        ``upstream``, ``reference_count``, ``resources``,
+        ``resource_count`` and ``local_ids`` in that fixed order. The
+        repository name and its bound upstream are echoed verbatim (case
+        and surrounding whitespace preserved). ``reference_count`` counts
+        the records one by one -- no deduplication or merging, so repeated
+        references from several resources add up. ``resources`` lists the
+        start resources of the references and ``local_ids`` the local
+        resources the remotes were resolved or reused to; both are
+        deduplicated and ordered by resource registration order, with ids
+        whose resource has since been deregistered trailing in their first
+        reference appearance order. ``resource_count`` is the length of
+        ``resources``. Everything is derived from the current records.
+        """
+
+        order: list[str] = []
+        upstream_by_repository: dict[str, str] = {}
+        counts: dict[str, int] = {}
+        resources_by_repository: dict[str, list[str]] = {}
+        seen_resources: dict[str, set[str]] = {}
+        locals_by_repository: dict[str, list[str]] = {}
+        seen_locals: dict[str, set[str]] = {}
+
+        for record in self._records:
+            repository = record.repository
+            if repository not in counts:
+                order.append(repository)
+                # Every record of a name carries the same bound upstream;
+                # the first one seen fixes the echoed value.
+                upstream_by_repository[repository] = record.upstream
+                counts[repository] = 0
+                resources_by_repository[repository] = []
+                seen_resources[repository] = set()
+                locals_by_repository[repository] = []
+                seen_locals[repository] = set()
+            counts[repository] += 1
+            if record.resource_id not in seen_resources[repository]:
+                seen_resources[repository].add(record.resource_id)
+                resources_by_repository[repository].append(record.resource_id)
+            if record.local_id not in seen_locals[repository]:
+                seen_locals[repository].add(record.local_id)
+                locals_by_repository[repository].append(record.local_id)
+
+        # Ranks follow the live resource registry. Ids still registered are
+        # folded into registration order; ids of resources deregistered
+        # afterwards (only possible for resolved local resources -- a start
+        # resource takes its records with it) keep their first-appearance
+        # order after the ranked ones.
+        rank = {
+            resource.id: position
+            for position, resource in enumerate(resource_store.list_all())
+        }
+
+        def registration_ordered(ids: list[str]) -> list[str]:
+            ranked = [identifier for identifier in ids if identifier in rank]
+            ranked.sort(key=rank.__getitem__)
+            ranked.extend(
+                identifier for identifier in ids if identifier not in rank
+            )
+            return ranked
+
+        usage: list[dict[str, object]] = []
+        for repository in order:
+            resources = registration_ordered(resources_by_repository[repository])
+            usage.append(
+                {
+                    "repository": repository,
+                    "upstream": upstream_by_repository[repository],
+                    "reference_count": counts[repository],
+                    "resources": resources,
+                    "resource_count": len(resources),
+                    "local_ids": registration_ordered(
+                        locals_by_repository[repository]
+                    ),
+                }
+            )
+        return usage
+
     def check_prerequisites(
         self,
         repository: str,
