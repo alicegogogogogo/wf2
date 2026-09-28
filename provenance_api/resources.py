@@ -907,3 +907,51 @@ class ResourceStore:
                 }
             )
         return usage
+
+    # --- Digest usage ---------------------------------------------------------
+
+    def digest_usage(self) -> list[dict[str, object]]:
+        """Group every registered resource by its normalized digest.
+
+        One entry per digest, ordered by the digest's first appearance in
+        resource registration order; the groups themselves are never
+        reordered. The order is redetermined from the remaining resources
+        on every call, so deregistration moves each surviving entry to the
+        position of its earliest surviving resource and drops an entry
+        whose digest has no resource left. Each entry carries the four
+        keys ``digest``, ``resources``, ``resource_count`` and ``names``
+        in that fixed order. ``digest`` echoes the stored lowercase,
+        64-character hexadecimal digest unchanged. ``resources`` lists the
+        ids of the resources with that digest in resource registration
+        order, each once. ``resource_count`` is that list's length.
+        ``names`` collects those resources' names in resource registration
+        order, deduplicated and echoed verbatim -- no case folding, no
+        whitespace trimming. Everything is derived on the fly.
+        """
+
+        order: list[str] = []
+        resources_by_digest: dict[str, list[str]] = {}
+        names_by_digest: dict[str, list[str]] = {}
+        seen_names: dict[str, set[str]] = {}
+
+        for resource in self._resources:
+            digest = resource.digest
+            if digest not in resources_by_digest:
+                order.append(digest)
+                resources_by_digest[digest] = []
+                names_by_digest[digest] = []
+                seen_names[digest] = set()
+            resources_by_digest[digest].append(resource.id)
+            if resource.name not in seen_names[digest]:
+                seen_names[digest].add(resource.name)
+                names_by_digest[digest].append(resource.name)
+
+        return [
+            {
+                "digest": digest,
+                "resources": resources_by_digest[digest],
+                "resource_count": len(resources_by_digest[digest]),
+                "names": names_by_digest[digest],
+            }
+            for digest in order
+        ]
