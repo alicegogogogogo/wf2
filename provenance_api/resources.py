@@ -649,3 +649,69 @@ class ResourceStore:
             }
             for resource_id in ids
         ]
+
+    # --- Dependency usage -----------------------------------------------------
+
+    def dependency_usage(self) -> list[dict[str, object]]:
+        """Summarize, per depended-upon resource, who depends on it.
+
+        One entry per resource with at least one dependent, in resource
+        registration order, each with the fixed key order ``id``,
+        ``dependents``, ``dependent_count`` and ``max_dependent_chain``.
+        ``dependents`` lists every resource that directly or transitively
+        depends on the resource, deduplicated and ordered by resource
+        registration order, and ``dependent_count`` is that list's length.
+        ``max_dependent_chain`` is the longest path from any dependent to
+        the resource, counted in nodes with both ends included; a resource
+        that is only directly depended on scores two. Manually registered
+        and cross-reference-resolved edges are counted alike; everything is
+        derived on the fly.
+        """
+
+        ids = [resource.id for resource in self._resources]
+
+        # The graph is a DAG (cycles are rejected at registration time), so
+        # the longest path ending at each node is computed over the reverse
+        # graph with an iterative postorder walk that avoids any recursion
+        # limit on long chains. ``height`` counts nodes of the longest path
+        # ending at the node, so a node without inbound edges scores one
+        # and a node only directly depended on scores two.
+        height: dict[str, int] = {}
+        for root in ids:
+            stack: list[tuple[str, bool]] = [(root, False)]
+            while stack:
+                node, expanded = stack.pop()
+                if node in height:
+                    continue
+                predecessors = self._dependents.get(node, ())
+                if not expanded:
+                    stack.append((node, True))
+                    for predecessor in predecessors:
+                        if predecessor not in height:
+                            stack.append((predecessor, False))
+                    continue
+                height[node] = (
+                    1
+                    if not predecessors
+                    else 1
+                    + max(height[predecessor] for predecessor in predecessors)
+                )
+
+        usage: list[dict[str, object]] = []
+        for resource_id in ids:
+            # Resources nobody depends on get no entry, regardless of
+            # whether they themselves depend on something else.
+            if not self._dependents.get(resource_id):
+                continue
+            dependents = self._registration_order(
+                self._reachable(resource_id, self._dependents)
+            )
+            usage.append(
+                {
+                    "id": resource_id,
+                    "dependents": dependents,
+                    "dependent_count": len(dependents),
+                    "max_dependent_chain": height[resource_id],
+                }
+            )
+        return usage
