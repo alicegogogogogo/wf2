@@ -5172,6 +5172,125 @@ def _handle_component_usage(
     )
 
 
+def _parse_alert_components_query(
+    query_string: str,
+) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``name`` query parameter.
+
+    Returns ``(name, None)`` -- with ``None`` when the parameter is
+    absent -- or ``(None, message)`` for an unknown parameter, a repeated
+    ``name`` or an empty value. The name is matched verbatim against
+    alert component names: case-sensitive, no trimming.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    name: str | None = None
+    for key, value in pairs:
+        if key != "name":
+            return None, f"Unknown query parameter: {key!r}."
+        if name is not None:
+            return None, "Query parameter 'name' must not be repeated."
+        if value == "":
+            return None, "Component name must not be empty."
+        name = value
+    return name, None
+
+
+def _handle_alert_components(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The view is read-only: a declared non-empty (or malformed) body is a
+    # bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``name`` filter is accepted; unknown or repeated
+    # parameters and an empty value are rejected before any data is read.
+    name, query_error = _parse_alert_components_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the alert records alone -- the SBOM is never
+    # consulted. Resources are visited in registration order and each
+    # resource's alerts in submission order, so a component name takes the
+    # position of its earliest alert in that traversal; a ``name`` filter
+    # only skips non-matching alerts and never moves a surviving entry. The
+    # advisory list keeps first-occurrence order with duplicates removed and
+    # values echoed verbatim; the alert count is the raw number of hits,
+    # neither deduplicated nor merged; the highest severity follows the
+    # fixed ordering and is lowercase; the resource list keeps resource
+    # registration order with each resource appearing once, and the count
+    # is its length. Nothing is recorded and no state is touched.
+    order: list[str] = []
+    advisories_by_component: dict[str, list[str]] = {}
+    seen_advisories: dict[str, set[str]] = {}
+    counts_by_component: dict[str, int] = {}
+    severities_by_component: dict[str, list[str]] = {}
+    resources_by_component: dict[str, list[str]] = {}
+    seen_resources: dict[str, set[str]] = {}
+
+    for resource in store.list_all():
+        for alert in vulnerability_store.list_for(resource.id):
+            if name is not None and alert.component != name:
+                continue
+            component = alert.component
+            if component not in counts_by_component:
+                order.append(component)
+                advisories_by_component[component] = []
+                seen_advisories[component] = set()
+                counts_by_component[component] = 0
+                severities_by_component[component] = []
+                resources_by_component[component] = []
+                seen_resources[component] = set()
+            if alert.advisory not in seen_advisories[component]:
+                seen_advisories[component].add(alert.advisory)
+                advisories_by_component[component].append(alert.advisory)
+            counts_by_component[component] += 1
+            severities_by_component[component].append(alert.severity)
+            if resource.id not in seen_resources[component]:
+                seen_resources[component].add(resource.id)
+                resources_by_component[component].append(resource.id)
+
+    usage = [
+        {
+            "name": component,
+            "advisories": advisories_by_component[component],
+            "alert_count": counts_by_component[component],
+            "max_severity": max_severity(severities_by_component[component]),
+            "resources": resources_by_component[component],
+            "resource_count": len(resources_by_component[component]),
+        }
+        for component in order
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        usage,
+        trailing_newline=True,
+    )
+
+
 def _handle_notifications_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -7550,6 +7669,14 @@ def application(
             # the handler answers the 405 (Allow: GET) for every other
             # method.
             return _handle_component_usage(
+                method, environ, start_response
+            )
+
+        if path == "/alert-components":
+            # Global alert usage summary aggregated by alert component name;
+            # the handler answers the 405 (Allow: GET) for every other
+            # method.
+            return _handle_alert_components(
                 method, environ, start_response
             )
 
