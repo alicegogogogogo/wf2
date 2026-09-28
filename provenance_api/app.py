@@ -5582,6 +5582,106 @@ def _handle_severity_coverage(
     )
 
 
+def _handle_advisory_fix_gaps(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The view is read-only: a declared non-empty (or malformed) body is a
+    # bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted; a
+    # repeated parameter is rejected just like any other parameter.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the alert records alone -- the SBOM is never
+    # consulted. Resources are visited in registration order and each
+    # resource's alerts in submission order, so an advisory/component pair
+    # takes the position of its earliest alert in that traversal; entries
+    # unfold in first-occurrence order without ever being reordered. The
+    # advisory and component values are echoed verbatim, fixed versions are
+    # collected verbatim -- no dotted comparison, case folding or whitespace
+    # trimming, and no sorting -- with first-occurring duplicates removed,
+    # and resources are deduplicated in resource registration order so a
+    # resource with several alerts for one pair counts once. The three
+    # counts are tallied alert by alert, neither deduplicated nor merged, so
+    # fixed and unfixed always sum to the raw number of alerts for the pair.
+    # Nothing is recorded and no state is touched, so alert changes and
+    # resource deregistration show up on the next request with no stale
+    # residue.
+    order: list[tuple[str, str]] = []
+    alert_counts: dict[tuple[str, str], int] = {}
+    fixed_counts: dict[tuple[str, str], int] = {}
+    unfixed_counts: dict[tuple[str, str], int] = {}
+    fixed_versions_by_pair: dict[tuple[str, str], list[str]] = {}
+    seen_fixed_versions: dict[tuple[str, str], set[str]] = {}
+    resources_by_pair: dict[tuple[str, str], list[str]] = {}
+    seen_resources: dict[tuple[str, str], set[str]] = {}
+
+    for resource in store.list_all():
+        for alert in vulnerability_store.list_for(resource.id):
+            key = (alert.advisory, alert.component)
+            if key not in alert_counts:
+                order.append(key)
+                alert_counts[key] = 0
+                fixed_counts[key] = 0
+                unfixed_counts[key] = 0
+                fixed_versions_by_pair[key] = []
+                seen_fixed_versions[key] = set()
+                resources_by_pair[key] = []
+                seen_resources[key] = set()
+            alert_counts[key] += 1
+            if alert.fixed_version is not None:
+                version = alert.fixed_version
+                if version not in seen_fixed_versions[key]:
+                    seen_fixed_versions[key].add(version)
+                    fixed_versions_by_pair[key].append(version)
+                fixed_counts[key] += 1
+            else:
+                unfixed_counts[key] += 1
+            if resource.id not in seen_resources[key]:
+                seen_resources[key].add(resource.id)
+                resources_by_pair[key].append(resource.id)
+
+    gaps = [
+        {
+            "advisory": advisory,
+            "component": component,
+            "alert_count": alert_counts[(advisory, component)],
+            "fixed_count": fixed_counts[(advisory, component)],
+            "unfixed_count": unfixed_counts[(advisory, component)],
+            "fixed_versions": fixed_versions_by_pair[(advisory, component)],
+            "resources": resources_by_pair[(advisory, component)],
+        }
+        for advisory, component in order
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        gaps,
+        trailing_newline=True,
+    )
+
+
 def _handle_notifications_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -7989,6 +8089,14 @@ def application(
             # level; the handler answers the 405 (Allow: GET) for every
             # other method.
             return _handle_severity_coverage(
+                method, environ, start_response
+            )
+
+        if path == "/advisory-fix-gaps":
+            # Global fix gap summary aggregated by advisory/component pair;
+            # the handler answers the 405 (Allow: GET) for every other
+            # method.
+            return _handle_advisory_fix_gaps(
                 method, environ, start_response
             )
 
