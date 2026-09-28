@@ -176,7 +176,7 @@ curl -s -X POST http://127.0.0.1:8000/resources/$A/dependencies \
 
 ### 批量登记依赖：`POST /resources/{id}/dependencies/batch`
 
-在单条登记路径之后追加 `batch` 一段，一次性为同一个起点登记多条被依赖边。只接受 `POST` 方法。请求体必须是 JSON 对象，且只允许一个字段：
+在单条登记路径之后追加 `batch` 一段，一次性为同一个起点登记多条被依赖边。该路径接受 `POST`（登记）与 `DELETE`（批量解除，见下节）两种方法。POST 请求体必须是 JSON 对象，且只允许一个字段：
 
 | 字段 | 类型 | 是否必填 | 说明 |
 | --- | --- | --- | --- |
@@ -195,13 +195,37 @@ curl -s -X POST http://127.0.0.1:8000/resources/$A/dependencies/batch \
 ```
 
 - 已经间接可达但尚不存在的直接边照常建立，与单条登记的既有口径一致；建边顺序即提交顺序。
-- 冲突与错误的判定次序固定：先请求体与参数，再起点存在性，再各被依赖标识的存在性（按提交顺序）；随后逐条按提交顺序判定自环、批内重复、同向重复与成环，同一条同时命中时只报最前一项对应的错误码。
+- 冲突判定次序是固定的规则次序，不按提交位置取舍：先请求体与参数，再起点存在性，再各被依赖标识的存在性（按提交顺序）；随后整批依次过四条规则——自环、批内重复、同向重复、成环——前一条规则对批内任意一项命中就只报该规则，不会因为另一条规则的冲突出现在更早的提交位置而改报；同一规则在多处命中时取提交顺序最早的一处。
 - 自环返回 HTTP 409（错误码 `dependency_cycle`）；同向直接边已存在返回 HTTP 409（错误码 `duplicate_dependency`），不覆盖原关系；批内多条边叠加后会引入环时返回 HTTP 409（错误码 `dependency_cycle`）。任何 409 都不建立任何一条边。
-- 批内重复属于请求不合法，返回 HTTP 400（错误码 `invalid_request`）；但每一项先判自环再判批内重复，因此重复项同时是自环（如起点自身在数组中出现）时按 HTTP 409 `dependency_cycle` 报告，不建任何边。
+- 批内重复属于请求不合法，返回 HTTP 400（错误码 `invalid_request`）；但自环规则先于批内重复规则整批筛查，因此数组中出现起点自身（无论是否同时重复）时一律按 HTTP 409 `dependency_cycle` 报告，不建任何边。
 - 起点或任一被依赖标识不存在时返回 HTTP 404（错误码 `resource_not_found`），不建任何边。
 - 请求体缺失、无法解码为合法 UTF-8 JSON、顶层不是 JSON 对象、字段缺失或类型错误、出现未知字段、数组为空、超过 100 条、某项为空或含分隔符、批内重复，或请求携带任意查询参数，均返回 HTTP 400（错误码 `invalid_request`），不读取业务数据、不留半条边。
-- `POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: POST`）。
+- `POST`、`DELETE` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: POST, DELETE`）。
 - 建边成功后，依赖查询、影响分析、图谱视图等既有视图立即按新边重算；失败请求不改图、不新增资源，也不改列表分页游标。
+
+### 批量解除依赖：`DELETE /resources/{id}/dependencies/batch`
+
+与批量登记同一路径，改用 `DELETE` 发起，一次性原子解除同一个起点的多条**直接边**。请求体形状、字段规则与紧凑 JSON 要求与批量登记完全一致：JSON 对象且只允许 `dependencies` 一个字段，值为非空字符串数组，单批最多 100 条，每项非空且不含 `/`、`\\`，数组内不得重复；重复项在请求体阶段即判 HTTP 400，不读取业务数据（解除不存在自环一说，自环边不可能存在，起点自身重复出现同样按批内重复处理）。
+
+整批按原子方式解除：任何一项不合法或没有对应直接边，都不删掉任何一条边，图保持原样。成功返回 HTTP 200，按提交顺序逐条回显起点与被依赖资源标识，紧凑 JSON 以单个换行结束：
+
+```bash
+curl -s -X DELETE http://127.0.0.1:8000/resources/$A/dependencies/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies":["<资源 B 的 id>","<资源 C 的 id>"]}'
+```
+
+```json
+{"dependencies":[{"resource_id":"<资源 A 的 id>","dependency_id":"<资源 B 的 id>"},{"resource_id":"<资源 A 的 id>","dependency_id":"<资源 C 的 id>"}]}
+```
+
+- 删除只作用于列出的直接边：资源登记内容与各条派生记录一律不动，其余直接边保持原建立顺序；因其他路径仍间接可达的关系照常出现在依赖查询等视图中。
+- 路径上没有这条直接边（含被依赖资源已注销、边随注销连带清理，或标识指向从未登记的资源）时返回 HTTP 404（错误码 `dependency_not_found`）；按提交顺序逐项检查，第一条缺失的直接边决定报错，整批不删除任何边。
+- 起点资源不存在时返回 HTTP 404（错误码 `resource_not_found`），图保持原样；起点存在性检查先于直接边存在性检查，两类未找到结果不会混报。
+- 对同一批失败请求重复提交，结果一致：先前仍存在的边不会被半删，报错仍指向同一条缺失关系；成功删除后重复提交返回 HTTP 404 `dependency_not_found`。
+- 请求体缺失、无法解码为合法 UTF-8 JSON、顶层不是 JSON 对象、字段缺失或出现未知字段、数组为空或超过 100 条、某项为空/非字符串/含分隔符、批内重复，或请求携带任意查询参数，均返回 HTTP 400（错误码 `invalid_request`），不读取业务数据、不留半条删除结果。
+- `POST`、`DELETE` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: POST, DELETE`）。
+- 删除成功后，依赖查询、影响分析、图谱视图等立即按剩余的边重算；资源列表创建顺序与此前签发的列表游标继续可用，失败请求不改动图与游标。
 
 ### 解除单条依赖：`DELETE /resources/{id}/dependencies/{dependency_id}`
 
@@ -262,7 +286,7 @@ curl -s -X POST http://127.0.0.1:8000/resources/$A/dependencies/batch \
 - 请求体缺失、不是合法 UTF-8 JSON、顶层不是 JSON 对象、缺少 `dependency_id`、`dependency_id` 不是字符串/为空/含分隔符，或出现未知字段，均返回 HTTP 400（错误码 `invalid_request`）。
 - 这些接口不接受查询参数；出现任意查询参数返回 HTTP 400（错误码 `invalid_request`）。
 - 起点不存在时，两个查询接口都返回 HTTP 404（错误码 `resource_not_found`），且不改变状态。
-- 对 `/resources/{id}/dependencies` 使用 `GET`、`POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET, POST`）；对 `/resources/{id}/dependencies/batch` 使用 `POST` 之外的方法返回 HTTP 405（`Allow: POST`）；对 `/resources/{id}/dependencies/{dependency_id}` 使用 `DELETE` 之外的方法返回 HTTP 405（`Allow: DELETE`）；对 `/resources/{id}/impact` 使用 `GET` 之外的方法返回 HTTP 405（`Allow: GET`）。
+- 对 `/resources/{id}/dependencies` 使用 `GET`、`POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: GET, POST`）；对 `/resources/{id}/dependencies/batch` 使用 `POST`、`DELETE` 之外的方法返回 HTTP 405（`Allow: POST, DELETE`）；对 `/resources/{id}/dependencies/{dependency_id}` 使用 `DELETE` 之外的方法返回 HTTP 405（`Allow: DELETE`）；对 `/resources/{id}/impact` 使用 `GET` 之外的方法返回 HTTP 405（`Allow: GET`）。
 - 任何非法请求都不会新增或修改资源、关系或分页游标。
 
 

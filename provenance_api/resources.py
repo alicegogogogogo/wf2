@@ -115,19 +115,26 @@ def build_resource_fields(
     return name, category, digest, source
 
 
-def build_dependency_batch_fields(payload: object) -> list[str]:
+def build_dependency_batch_fields(
+    payload: object, *, reject_duplicates: bool = False
+) -> list[str]:
     """Validate a decoded dependency batch payload, returning the id list.
 
     The top level must be a JSON object carrying exactly one field,
     ``dependencies``: a non-empty array of at most
     :data:`MAX_DEPENDENCY_BATCH_SIZE` non-empty strings, none containing a
     path separator (``/`` or ``\\``). The ids are returned in their
-    submitted order. Duplicates within the array are deliberately not
-    screened here: their check is ordered after self loops (but before
-    existing-edge and cycle checks) in :meth:`ResourceStore.add_dependencies`
-    so that, e.g., a self-referential first entry reports the cycle rather
-    than the repeat. Existence and graph conflicts are likewise checked
-    later so their error codes keep precedence.
+    submitted order.
+
+    When ``reject_duplicates`` is set (the batch-removal path), an id
+    repeated inside the array is rejected here like every other shape
+    error, so the request fails before any business data is read. The
+    batch-registration path leaves the flag clear: its repeat check is
+    ordered after self loops (but before existing-edge and cycle checks)
+    in :meth:`ResourceStore.add_dependencies` so that, e.g., a
+    self-referential repeated entry reports the cycle rather than the
+    repeat. Existence and graph conflicts are likewise checked later so
+    their error codes keep precedence.
     """
 
     if not isinstance(payload, dict):
@@ -159,6 +166,7 @@ def build_dependency_batch_fields(payload: object) -> list[str]:
         )
 
     dependency_ids: list[str] = []
+    seen: set[str] = set()
     for position, item in enumerate(items):
         if not isinstance(item, str) or not item:
             raise ResourceValidationError(
@@ -169,6 +177,12 @@ def build_dependency_batch_fields(payload: object) -> list[str]:
                 f"Dependency at index {position} must not contain path "
                 "separators."
             )
+        if reject_duplicates and item in seen:
+            raise ResourceValidationError(
+                "A dependency must not be listed more than once in the "
+                "same batch."
+            )
+        seen.add(item)
         dependency_ids.append(item)
 
     return dependency_ids
@@ -411,42 +425,56 @@ class ResourceStore:
         registered (the caller checks existence); ``dependency_ids`` must
         come from :func:`build_dependency_batch_fields`, so it is a
         non-empty list of non-empty, separator-free strings in submission
-        order. Conflicts are judged per entry in submission order, and
-        within one entry in the order self loop, in-batch repeat, existing
-        same-direction edge, introduced cycle -- the first failure wins.
-        A self loop or an introduced cycle raises :class:`DependencyError`
-        with code ``dependency_cycle`` and an existing edge raises one with
-        code ``duplicate_dependency`` (both 409); an id repeated inside the
-        batch raises :class:`ResourceValidationError` (400
-        ``invalid_request``), matching the request-level rule -- but only
-        once the entry is not itself a self loop, which is checked first.
-        Every edge in the batch shares the same origin, so an earlier
-        accepted edge can never feed a path back to the start that did not
-        already exist; cycle detection therefore uses the committed graph
-        exactly like :meth:`check_dependency`. The whole batch is atomic: a
+        order. Conflict precedence is a fixed rule order, not the
+        submission position: the whole batch is first screened for self
+        loops, then for repeats inside the batch, then for existing
+        same-direction edges, and finally for edges that would introduce a
+        cycle. When several entries hit different rules at once, only the
+        foremost rule is reported; within one rule the earliest submission
+        position wins. A self loop or an introduced cycle raises
+        :class:`DependencyError` with code ``dependency_cycle`` and an
+        existing edge raises one with code ``duplicate_dependency`` (both
+        409); an id repeated inside the batch raises
+        :class:`ResourceValidationError` (400 ``invalid_request``), but
+        only when no entry is a self loop, which is screened first.
+        Every edge in the batch shares the same origin, so an accepted
+        edge can never feed a path back to the start that did not already
+        exist; cycle detection therefore uses the committed graph exactly
+        like :meth:`check_dependency`. The whole batch is atomic: a
         failure leaves the graph exactly as it was; on success every edge is
         established in submission order.
         """
 
         existing = self._dependencies.get(resource_id, ())
-        accepted: list[str] = []
-        accepted_set: set[str] = set()
+
+        # Each pass is read-only; the graph is touched only once every rule
+        # has passed, which makes the precedence independent of where in
+        # the batch each conflict sits and guarantees all-or-nothing
+        # behavior.
         for dependency_id in dependency_ids:
             if dependency_id == resource_id:
                 raise DependencyError(
                     "dependency_cycle",
                     "A resource must not depend on itself.",
                 )
-            if dependency_id in accepted_set:
+
+        seen: set[str] = set()
+        for dependency_id in dependency_ids:
+            if dependency_id in seen:
                 raise ResourceValidationError(
                     "A dependency must not be listed more than once in the "
                     "same batch."
                 )
+            seen.add(dependency_id)
+
+        for dependency_id in dependency_ids:
             if dependency_id in existing:
                 raise DependencyError(
                     "duplicate_dependency",
                     "This dependency relation already exists.",
                 )
+
+        for dependency_id in dependency_ids:
             if resource_id in self._reachable(
                 dependency_id, self._dependencies
             ):
@@ -454,12 +482,10 @@ class ResourceStore:
                     "dependency_cycle",
                     "This dependency would introduce a cycle.",
                 )
-            accepted.append(dependency_id)
-            accepted_set.add(dependency_id)
 
         # Every check passed; only now mutate, preserving submission order
         # in the ordered edge dicts.
-        for dependency_id in accepted:
+        for dependency_id in dependency_ids:
             self._dependencies[resource_id][dependency_id] = None
             self._dependents[dependency_id][resource_id] = None
 
@@ -485,6 +511,49 @@ class ResourceStore:
         if dependents is not None:
             dependents.pop(resource_id, None)
         return True
+
+    def remove_dependencies(
+        self, resource_id: str, dependency_ids: list[str]
+    ) -> None:
+        """Atomically remove several direct edges out of ``resource_id``.
+
+        The start resource must already be registered (the caller checks
+        existence); ``dependency_ids`` comes from
+        :func:`build_dependency_batch_fields` with duplicate rejection on,
+        so it is a non-empty list of distinct, non-empty, separator-free
+        strings in submission order. Every listed direct edge must
+        currently exist; the first submission position without such an
+        edge raises :class:`DependencyError` with code
+        ``dependency_not_found`` and no edge is removed, so a repeat of a
+        failed request reports the same missing relation. Only when every
+        edge is present are they all removed; resource records and every
+        other edge are left untouched, and transitive relations that
+        survive through other paths are recomputed by the read views.
+        """
+
+        dependencies = self._dependencies.get(resource_id)
+        if dependencies is None:
+            raise DependencyError(
+                "dependency_not_found",
+                "No direct dependency relation exists from this resource "
+                "to the requested dependency.",
+            )
+        # Read-only pass first: a missing entry must never leave the batch
+        # half-deleted. The first absent position wins, in submission order.
+        for dependency_id in dependency_ids:
+            if dependency_id not in dependencies:
+                raise DependencyError(
+                    "dependency_not_found",
+                    "No direct dependency relation exists from this "
+                    "resource to the requested dependency.",
+                )
+
+        # Every edge exists; remove them all after the checks.
+        for dependency_id in dependency_ids:
+            del dependencies[dependency_id]
+            dependents = self._dependents.get(dependency_id)
+            if dependents is not None:
+                dependents.pop(resource_id, None)
 
     def list_dependencies(self, resource_id: str) -> list[str]:
         """Return every reachable dependency id in registration order."""

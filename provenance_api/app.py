@@ -803,61 +803,97 @@ def _handle_dependencies(
     )
 
 
-def _handle_dependencies_batch(
-    method: str,
+def _parse_dependency_batch_body(
     environ: dict[str, Any],
-    raw_id: str,
     start_response: StartResponse,
-) -> Iterable[bytes]:
-    if method != "POST":
-        return _error(
-            start_response,
-            "405 Method Not Allowed",
-            "method_not_allowed",
-            f"Method {method} is not allowed for this path.",
-            allowed="POST",
-        )
+    *,
+    reject_duplicates: bool,
+) -> tuple[Iterable[bytes] | None, list[str] | None]:
+    """Validate the request of a batch dependency operation.
 
-    id_error = _validate_path_id(raw_id)
-    if id_error is not None:
-        return _error(
-            start_response, "400 Bad Request", "invalid_request", id_error
-        )
+    Reads the body and applies every request-level rule: any query
+    parameter, a missing or undecodable body, a non-object payload, an
+    unknown or missing field, an empty or oversized ``dependencies``
+    array and any empty, non-string or separator-bearing entry are a 400
+    ``invalid_request``. When ``reject_duplicates`` is set (batch
+    removal), an id repeated inside the array is rejected here too, ahead
+    of every business-data read; registration leaves the check to the
+    store so its fixed self-loop-first precedence applies.
+
+    Returns ``(None, dependency_ids)`` on success or
+    ``(error_response, None)`` on failure.
+    """
+
     query_error = _query_parameter_error(environ)
     if query_error is not None:
-        return _error(
-            start_response, "400 Bad Request", "invalid_request", query_error
+        return (
+            _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                query_error,
+            ),
+            None,
         )
 
     raw = _read_body(environ)
     if not raw:
-        return _error(
-            start_response,
-            "400 Bad Request",
-            "invalid_request",
-            "Request body is empty.",
+        return (
+            _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                "Request body is empty.",
+            ),
+            None,
         )
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return _error(
-            start_response,
-            "400 Bad Request",
-            "invalid_request",
-            "Request body must be valid UTF-8 JSON.",
+        return (
+            _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                "Request body must be valid UTF-8 JSON.",
+            ),
+            None,
         )
 
     # Element-level validation happens entirely in the builder so a bad
     # batch is rejected before any business data is read.
     try:
-        dependency_ids = build_dependency_batch_fields(payload)
-    except ResourceValidationError as exc:
-        return _error(
-            start_response,
-            "400 Bad Request",
-            "invalid_request",
-            exc.message,
+        dependency_ids = build_dependency_batch_fields(
+            payload, reject_duplicates=reject_duplicates
         )
+    except ResourceValidationError as exc:
+        return (
+            _error(
+                start_response,
+                "400 Bad Request",
+                "invalid_request",
+                exc.message,
+            ),
+            None,
+        )
+    return None, dependency_ids
+
+
+def _handle_dependencies_batch_post(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+
+    error, dependency_ids = _parse_dependency_batch_body(
+        environ, start_response, reject_duplicates=False
+    )
+    if error is not None:
+        return error
+    assert dependency_ids is not None
 
     # Existence checks follow the fixed order: start first, then each
     # depended-upon id in submission order.
@@ -877,11 +913,11 @@ def _handle_dependencies_batch(
                 "No resource exists with dependency_id.",
             )
 
-    # The store judges self loops, in-batch repeats, existing same-direction
-    # edges and introduced cycles per entry in that precedence, and either
-    # commits every edge or none. Cycles and existing edges are 409; an
-    # in-batch repeat is still a 400 invalid_request (checked after self
-    # loops, so a self-referential entry wins as a cycle).
+    # The store applies the fixed rule order across the whole batch --
+    # self loop, in-batch repeat, existing same-direction edge, introduced
+    # cycle, independent of submission position -- and either commits
+    # every edge or none. Cycles and existing edges are 409; an in-batch
+    # repeat is a 400 invalid_request once no self loop is present.
     try:
         store.add_dependencies(raw_id, dependency_ids)
     except ResourceValidationError as exc:
@@ -909,6 +945,82 @@ def _handle_dependencies_batch(
             ]
         },
         trailing_newline=True,
+    )
+
+
+def _handle_dependencies_batch_delete(
+    environ: dict[str, Any], raw_id: str, start_response: StartResponse
+) -> Iterable[bytes]:
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+
+    # Batch removal screens repeats together with the other request-level
+    # rules, so the body parse never touches business data.
+    error, dependency_ids = _parse_dependency_batch_body(
+        environ, start_response, reject_duplicates=True
+    )
+    if error is not None:
+        return error
+    assert dependency_ids is not None
+
+    # The start resource must exist before any edge is looked up; a
+    # missing start and a missing direct edge are never reported together.
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # The store checks every listed direct edge before removing any: the
+    # first position without an edge is a dependency_not_found and the
+    # graph stays exactly as it was, so repeating the request reports the
+    # same relation and never half-deletes the batch.
+    try:
+        store.remove_dependencies(raw_id, dependency_ids)
+    except DependencyError as exc:
+        return _error(
+            start_response,
+            "404 Not Found",
+            exc.code,
+            exc.message,
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {
+            "dependencies": [
+                {"resource_id": raw_id, "dependency_id": dependency_id}
+                for dependency_id in dependency_ids
+            ]
+        },
+        trailing_newline=True,
+    )
+
+
+def _handle_dependencies_batch(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method == "POST":
+        return _handle_dependencies_batch_post(environ, raw_id, start_response)
+    if method == "DELETE":
+        return _handle_dependencies_batch_delete(
+            environ, raw_id, start_response
+        )
+    return _error(
+        start_response,
+        "405 Method Not Allowed",
+        "method_not_allowed",
+        f"Method {method} is not allowed for this path.",
+        allowed="POST, DELETE",
     )
 
 

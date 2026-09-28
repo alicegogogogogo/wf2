@@ -431,9 +431,9 @@ class DependencyBatchTests(unittest.TestCase):
 
     # --- Method handling ---------------------------------------------------
 
-    def test_non_post_methods_return_405_with_post_only_allow(self) -> None:
+    def test_other_methods_return_405_with_post_and_delete_allow(self) -> None:
         a = self._create("a")
-        for method in ("GET", "DELETE", "PUT", "PATCH"):
+        for method in ("GET", "PUT", "PATCH"):
             with self.subTest(method=method):
                 status, headers, body = call_json(
                     method, f"/resources/{a}/dependencies/batch"
@@ -441,7 +441,8 @@ class DependencyBatchTests(unittest.TestCase):
                 self.assertEqual(status, "405 Method Not Allowed")
                 self.assertEqual(body["error"], "method_not_allowed")
                 self.assertEqual(
-                    [h for h in headers if h[0] == "Allow"], [("Allow", "POST")]
+                    [h for h in headers if h[0] == "Allow"],
+                    [("Allow", "POST, DELETE")],
                 )
 
     # --- Views and cursors -------------------------------------------------
