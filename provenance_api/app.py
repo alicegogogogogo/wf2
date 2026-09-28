@@ -5291,6 +5291,102 @@ def _handle_alert_components(
     )
 
 
+def _handle_fix_coverage(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The view is read-only: a declared non-empty (or malformed) body is a
+    # bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``name`` filter is accepted; unknown or repeated
+    # parameters and an empty value are rejected before any data is read.
+    name, query_error = _parse_alert_components_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the alert records alone -- the SBOM is never
+    # consulted. Resources are visited in registration order and each
+    # resource's alerts in submission order, so a component name takes the
+    # position of its earliest alert in that traversal; a ``name`` filter
+    # only skips non-matching alerts and never moves a surviving entry. The
+    # fixed-version and advisory lists keep first-occurrence order with
+    # duplicates removed and values echoed verbatim (no dot comparison,
+    # case folding, trimming or sorting); the two counts are raw per-alert
+    # tallies, neither deduplicated nor merged, so together they equal the
+    # number of alerts for the component. Nothing is recorded and no state
+    # is touched.
+    order: list[str] = []
+    fixed_versions_by_component: dict[str, list[str]] = {}
+    seen_fixed_versions: dict[str, set[str]] = {}
+    advisories_by_component: dict[str, list[str]] = {}
+    seen_advisories: dict[str, set[str]] = {}
+    fixed_counts: dict[str, int] = {}
+    unfixed_counts: dict[str, int] = {}
+
+    for resource in store.list_all():
+        for alert in vulnerability_store.list_for(resource.id):
+            if name is not None and alert.component != name:
+                continue
+            component = alert.component
+            if component not in fixed_counts:
+                order.append(component)
+                fixed_versions_by_component[component] = []
+                seen_fixed_versions[component] = set()
+                advisories_by_component[component] = []
+                seen_advisories[component] = set()
+                fixed_counts[component] = 0
+                unfixed_counts[component] = 0
+            if alert.fixed_version is not None:
+                if alert.fixed_version not in seen_fixed_versions[component]:
+                    seen_fixed_versions[component].add(alert.fixed_version)
+                    fixed_versions_by_component[component].append(
+                        alert.fixed_version
+                    )
+                fixed_counts[component] += 1
+            else:
+                unfixed_counts[component] += 1
+            if alert.advisory not in seen_advisories[component]:
+                seen_advisories[component].add(alert.advisory)
+                advisories_by_component[component].append(alert.advisory)
+
+    coverage = [
+        {
+            "name": component,
+            "fixed_versions": fixed_versions_by_component[component],
+            "fixed_count": fixed_counts[component],
+            "unfixed_count": unfixed_counts[component],
+            "advisories": advisories_by_component[component],
+        }
+        for component in order
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        coverage,
+        trailing_newline=True,
+    )
+
+
 def _handle_notifications_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -7677,6 +7773,14 @@ def application(
             # the handler answers the 405 (Allow: GET) for every other
             # method.
             return _handle_alert_components(
+                method, environ, start_response
+            )
+
+        if path == "/fix-coverage":
+            # Global fix-coverage summary aggregated by alert component
+            # name; the handler answers the 405 (Allow: GET) for every
+            # other method.
+            return _handle_fix_coverage(
                 method, environ, start_response
             )
 
