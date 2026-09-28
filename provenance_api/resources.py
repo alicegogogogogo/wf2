@@ -14,6 +14,9 @@ _DIGEST_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
 _ALLOWED_FIELDS = frozenset({"name", "category", "digest", "source"})
 _REQUIRED_FIELDS = ("name", "category", "digest")
 
+#: Maximum number of dependency edges accepted in one batch registration.
+MAX_DEPENDENCY_BATCH_SIZE = 100
+
 
 class ResourceValidationError(ValueError):
     """A registration payload failed field-level validation."""
@@ -110,6 +113,64 @@ def build_resource_fields(
         source = _require_non_empty_string(payload["source"], "Source")
 
     return name, category, digest, source
+
+
+def build_dependency_batch_fields(payload: object) -> list[str]:
+    """Validate a decoded dependency-batch payload and return the id list.
+
+    The top level must be a JSON object with exactly one field,
+    ``dependencies``: a non-empty array of at most
+    :data:`MAX_DEPENDENCY_BATCH_SIZE` non-empty strings, none of which may
+    contain path separators and no two of which may be equal. The ids are
+    returned in array order.
+    """
+
+    if not isinstance(payload, dict):
+        raise ResourceValidationError("Request body must be a JSON object.")
+
+    unknown_fields = set(payload) - {"dependencies"}
+    if unknown_fields:
+        raise ResourceValidationError(
+            f"Unknown field: {sorted(unknown_fields)[0]!r}."
+        )
+    if "dependencies" not in payload:
+        raise ResourceValidationError(
+            "Missing required field: 'dependencies'."
+        )
+
+    items = payload["dependencies"]
+    if not isinstance(items, list):
+        raise ResourceValidationError(
+            "Field 'dependencies' must be an array."
+        )
+    if not items:
+        raise ResourceValidationError(
+            "Field 'dependencies' must not be empty."
+        )
+    if len(items) > MAX_DEPENDENCY_BATCH_SIZE:
+        raise ResourceValidationError(
+            f"Field 'dependencies' must not exceed "
+            f"{MAX_DEPENDENCY_BATCH_SIZE} entries."
+        )
+
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for item in items:
+        if not isinstance(item, str) or not item:
+            raise ResourceValidationError(
+                "Each dependency id must be a non-empty string."
+            )
+        if "/" in item or "\\" in item:
+            raise ResourceValidationError(
+                "Dependency ids must not contain path separators."
+            )
+        if item in seen:
+            raise ResourceValidationError(
+                "Dependency ids must not repeat within the batch."
+            )
+        seen.add(item)
+        normalized.append(item)
+    return normalized
 
 
 class ResourceStore:
@@ -339,6 +400,79 @@ class ResourceStore:
         self.check_dependency(resource_id, dependency_id)
         self._dependencies[resource_id][dependency_id] = None
         self._dependents[dependency_id][resource_id] = None
+
+    def add_dependencies(
+        self, resource_id: str, dependency_ids: list[str]
+    ) -> None:
+        """Atomically record several edges out of ``resource_id``.
+
+        Every involved resource must already be registered and the caller is
+        expected to have validated the payload (non-empty list, non-empty
+        separator-free ids, no in-batch repetition); the defensive checks
+        here mirror the fixed conflict precedence: self loops first, then
+        same-direction duplicates (existing or repeated within the batch),
+        then cycles introduced once every edge of the batch is overlaid.
+        When any item fails, no edge is created and the graph is left
+        exactly as it was.
+        """
+
+        # Phase 1: a self loop anywhere in the batch outranks every other
+        # conflict, regardless of array position.
+        for dependency_id in dependency_ids:
+            if dependency_id == resource_id:
+                raise DependencyError(
+                    "dependency_cycle",
+                    "A resource must not depend on itself.",
+                )
+
+        # Phase 2: edges that already exist, or that the batch itself would
+        # create twice. Payload validation rejects repeats with 400 before
+        # this method runs; the set still guards direct callers.
+        existing = self._dependencies.get(resource_id, {})
+        pending: list[str] = []
+        scheduled: set[str] = set()
+        for dependency_id in dependency_ids:
+            if dependency_id in existing or dependency_id in scheduled:
+                raise DependencyError(
+                    "duplicate_dependency",
+                    "This dependency relation already exists.",
+                )
+            pending.append(dependency_id)
+            scheduled.add(dependency_id)
+
+        # Phase 3: overlay every pending outbound edge on the current graph
+        # and reject the batch when a pending target can reach the start.
+        # Only the start node's adjacency changes, so a walk from a target
+        # closes a cycle exactly when it reaches the start, whether through
+        # existing edges alone or through another edge added by this batch.
+        overlay: dict[str, dict[str, None]] = {
+            resource_id: {**existing, **{dep: None for dep in pending}}
+        }
+
+        def successors(node: str) -> dict[str, None]:
+            if node in overlay:
+                return overlay[node]
+            return self._dependencies.get(node, {})
+
+        for dependency_id in pending:
+            seen: set[str] = set()
+            stack = [dependency_id]
+            while stack:
+                node = stack.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                stack.extend(successors(node))
+            if resource_id in seen:
+                raise DependencyError(
+                    "dependency_cycle",
+                    "This dependency would introduce a cycle.",
+                )
+
+        # All checks passed: commit the edges in submission order.
+        for dependency_id in pending:
+            self._dependencies[resource_id][dependency_id] = None
+            self._dependents[dependency_id][resource_id] = None
 
     def has_dependency(self, resource_id: str, dependency_id: str) -> bool:
         """Return whether the direct edge ``resource_id -> dependency_id`` exists."""

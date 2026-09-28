@@ -174,6 +174,35 @@ curl -s -X POST http://127.0.0.1:8000/resources/$A/dependencies \
 - 已经间接可达、但尚不存在的直接边不算重复也不算环，仍以 HTTP 201 建立。
 - 起点资源或 `dependency_id` 指向的资源不存在时返回 HTTP 404（错误码 `resource_not_found`），不会自动建资源。
 
+### 批量登记依赖：`POST /resources/{id}/dependencies/batch`
+
+一次为同一个起点资源批量登记多条被依赖边。请求体必须是一个完整的 JSON 对象，且只允许 `dependencies` 一个字段：其值是非空字符串数组，单批最多 100 条；每个元素是要新增的被依赖资源标识，非空且不得包含 `/`、`\\`，数组内部不得重复。
+
+整批按原子方式提交：任何一项不合法或冲突都不建立任何一条边，图保持原样。成功返回 HTTP 201，响应体顶层是 `dependencies` 数组，按提交顺序逐条回显起点与被依赖资源标识，键序与单条登记响应一致，正文为紧凑 JSON 并以单个换行结束：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/resources/$A/dependencies/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"dependencies":["<资源 B 的 id>","<资源 C 的 id>"]}'
+```
+
+```json
+{"dependencies":[{"resource_id":"<资源 A 的 id>","dependency_id":"<资源 B 的 id>"},{"resource_id":"<资源 A 的 id>","dependency_id":"<资源 C 的 id>"}]}
+```
+
+冲突与错误：
+
+- 校验次序固定为：请求体与参数、起点存在性、各被依赖标识存在性；随后依次判定自环、批内重复、同向重复与成环，同时命中只报最前一项。
+- 请求体缺失、无法解码为 UTF-8 JSON、顶层不是 JSON 对象、缺少 `dependencies` 字段、字段类型错误、含未知字段，均返回 HTTP 400（错误码 `invalid_request`），不留半条边。
+- 数组为空、超过 100 条、元素不是非空字符串或含 `/`、`\\`、批内重复，均返回 HTTP 400（错误码 `invalid_request`）。
+- 路径标识为空或含 `/`、`\\`，或请求携带任意查询参数，返回 HTTP 400（错误码 `invalid_request`），不读取业务数据。
+- 起点资源或任一被依赖标识不存在时返回 HTTP 404（错误码 `resource_not_found`），不建任何边。
+- 自环（起点出现在数组中）返回 HTTP 409（错误码 `dependency_cycle`）；同向直接边已存在（批内多边叠加后与既有边重复）时返回 HTTP 409（错误码 `duplicate_dependency`），不覆盖原关系；整批多边叠加后会引入环时返回 HTTP 409（错误码 `dependency_cycle`），图保持不变。
+- 已经间接可达但尚不存在的直接边照常建立，与单条登记的既有口径一致。
+- `POST` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`，`Allow: POST`）。
+
+建边成功后，依赖查询、影响分析、依赖漏洞传导、图谱视图等既有视图立即按新边重算；失败请求不留半条边，也不改资源列表游标。本入口不改变单条依赖登记与解除及其他既有入口的行为。
+
 ### 解除单条依赖：`DELETE /resources/{id}/dependencies/{dependency_id}`
 
 解除登记依赖路径同一路由之后的一条**直接边**：起点为路径首段的资源，被依赖资源由末段标识给出，只接受 `DELETE` 方法。请求不得携带任何查询参数，也不得声明非空请求体（显式 `Content-Length: 0` 视为空体）。
