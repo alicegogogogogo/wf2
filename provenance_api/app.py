@@ -5682,6 +5682,104 @@ def _handle_advisory_fix_gaps(
     )
 
 
+def _handle_advisory_fix_progress(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The view is read-only: a declared non-empty (or malformed) body is a
+    # bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted; a
+    # repeated parameter is rejected just like any other parameter.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the alert records alone -- the SBOM is never
+    # consulted. Resources are visited in registration order and each
+    # resource's alerts in submission order, so an advisory takes the
+    # position of its earliest alert in that traversal; entries unfold in
+    # first-occurrence order without ever being reordered. The advisory and
+    # component values are echoed verbatim -- no case folding or whitespace
+    # trimming, and no sorting -- with first-occurring duplicates removed;
+    # resources are deduplicated in resource registration order so a
+    # resource with several alerts for one advisory counts once. The two
+    # counts are tallied alert by alert, neither deduplicated nor merged, so
+    # fixed and unfixed always sum to the raw number of alerts for the
+    # advisory. Nothing is recorded and no state is touched, so alert
+    # changes and resource deregistration show up on the next request with
+    # no stale residue.
+    order: list[str] = []
+    alert_counts: dict[str, int] = {}
+    fixed_counts: dict[str, int] = {}
+    unfixed_counts: dict[str, int] = {}
+    components_by_advisory: dict[str, list[str]] = {}
+    seen_components: dict[str, set[str]] = {}
+    resources_by_advisory: dict[str, list[str]] = {}
+    seen_resources: dict[str, set[str]] = {}
+
+    for resource in store.list_all():
+        for alert in vulnerability_store.list_for(resource.id):
+            advisory = alert.advisory
+            if advisory not in alert_counts:
+                order.append(advisory)
+                alert_counts[advisory] = 0
+                fixed_counts[advisory] = 0
+                unfixed_counts[advisory] = 0
+                components_by_advisory[advisory] = []
+                seen_components[advisory] = set()
+                resources_by_advisory[advisory] = []
+                seen_resources[advisory] = set()
+            alert_counts[advisory] += 1
+            if alert.fixed_version is not None:
+                fixed_counts[advisory] += 1
+            else:
+                unfixed_counts[advisory] += 1
+            if alert.component not in seen_components[advisory]:
+                seen_components[advisory].add(alert.component)
+                components_by_advisory[advisory].append(alert.component)
+            if resource.id not in seen_resources[advisory]:
+                seen_resources[advisory].add(resource.id)
+                resources_by_advisory[advisory].append(resource.id)
+
+    progress = [
+        {
+            "advisory": advisory,
+            "alert_count": alert_counts[advisory],
+            "fixed_count": fixed_counts[advisory],
+            "unfixed_count": unfixed_counts[advisory],
+            "components": components_by_advisory[advisory],
+            "resources": resources_by_advisory[advisory],
+            "resource_count": len(resources_by_advisory[advisory]),
+        }
+        for advisory in order
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        progress,
+        trailing_newline=True,
+    )
+
+
 def _handle_notifications_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -8097,6 +8195,13 @@ def application(
             # the handler answers the 405 (Allow: GET) for every other
             # method.
             return _handle_advisory_fix_gaps(
+                method, environ, start_response
+            )
+
+        if path == "/advisory-fix-progress":
+            # Global fix progress summary aggregated by advisory id; the
+            # handler answers the 405 (Allow: GET) for every other method.
+            return _handle_advisory_fix_progress(
                 method, environ, start_response
             )
 
