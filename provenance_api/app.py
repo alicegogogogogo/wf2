@@ -5414,6 +5414,80 @@ def _handle_fix_coverage(
     )
 
 
+def _handle_fix_coverage_progress(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The view is read-only: a declared non-empty (or malformed) body is a
+    # bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # The view takes no parameters at all; any (or any repeated) query
+    # parameter is rejected before any data is read.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the alert records alone -- the SBOM is never
+    # consulted. Every registered resource gets exactly one entry, in
+    # registration order, including resources without alerts; a resource's
+    # alerts are visited in submission order, so the component list keeps
+    # first-occurrence order with duplicates removed and names echoed
+    # verbatim. The three counts are tallied alert by alert, neither
+    # deduplicated nor merged, so fixed plus unfixed always equals the raw
+    # alert total. Nothing is recorded and no state is touched, so alert
+    # changes and resource deregistration show up on the next request with
+    # no stale residue.
+    progress: list[dict[str, object]] = []
+    for resource in store.list_all():
+        components: list[str] = []
+        seen_components: set[str] = set()
+        alert_count = 0
+        fixed_count = 0
+        unfixed_count = 0
+        for alert in vulnerability_store.list_for(resource.id):
+            alert_count += 1
+            if alert.fixed_version is not None:
+                fixed_count += 1
+            else:
+                unfixed_count += 1
+            if alert.component not in seen_components:
+                seen_components.add(alert.component)
+                components.append(alert.component)
+        progress.append(
+            {
+                "id": resource.id,
+                "alert_count": alert_count,
+                "fixed_count": fixed_count,
+                "unfixed_count": unfixed_count,
+                "components": components,
+            }
+        )
+    return _json_response(
+        start_response,
+        "200 OK",
+        progress,
+        trailing_newline=True,
+    )
+
+
 def _handle_notifications_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -7808,6 +7882,13 @@ def application(
             # component name; the handler answers the 405 (Allow: GET) for
             # every other method.
             return _handle_fix_coverage(method, environ, start_response)
+
+        if path == "/fix-coverage-progress":
+            # Global per-resource fix coverage progress summary; the handler
+            # answers the 405 (Allow: GET) for every other method.
+            return _handle_fix_coverage_progress(
+                method, environ, start_response
+            )
 
         if path.startswith("/advisories/"):
             # The identifier segment is validated by the handler; an
