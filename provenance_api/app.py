@@ -5061,6 +5061,114 @@ def _handle_component_licenses(
     )
 
 
+def _parse_component_usage_query(
+    query_string: str,
+) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``name`` query parameter.
+
+    Returns ``(name, None)`` -- with ``None`` when the parameter is
+    absent -- or ``(None, message)`` for an unknown parameter, a bare or
+    repeated ``name`` or an empty value. The name is matched verbatim
+    against component names: case-sensitive, no trimming.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    name: str | None = None
+    for key, value in pairs:
+        if key != "name":
+            return None, f"Unknown query parameter: {key!r}."
+        if name is not None:
+            return None, "Query parameter 'name' must not be repeated."
+        if value == "":
+            return None, "Component name must not be empty."
+        name = value
+    return name, None
+
+
+def _handle_component_usage(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The usage view is read-only: a declared non-empty (or malformed)
+    # body is a bad request without consulting any business data. An
+    # omitted header and an explicit zero length are accepted as an empty
+    # body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``name`` filter is accepted; unknown, bare or
+    # repeated parameters and an empty value are rejected before any data
+    # is read.
+    name, query_error = _parse_component_usage_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current stores: SBOM components are
+    # visited in resource registration order and, within one resource, in
+    # SBOM submission order. Entries unfold in the order a component name
+    # first appears in that traversal. The version list keeps the
+    # first-occurrence order with duplicates removed and values echoed
+    # verbatim; the resource list is an insertion-ordered set, so each
+    # resource id appears at most once and stays in registration order.
+    # Resources without an SBOM document are skipped silently, and a
+    # document with an empty component list contributes no entries.
+    # Nothing is recorded and no state is touched.
+    name_order: list[str] = []
+    versions_by_name: dict[str, list[str]] = {}
+    resources_by_name: dict[str, dict[str, None]] = {}
+    for resource in store.list_all():
+        document = sbom_store.get_sbom(resource.id)
+        if document is None:
+            continue
+        for component in document.components:
+            if name is not None and component.name != name:
+                continue
+            versions = versions_by_name.get(component.name)
+            if versions is None:
+                name_order.append(component.name)
+                versions_by_name[component.name] = [component.version]
+                resources_by_name[component.name] = {resource.id: None}
+                continue
+            if component.version not in versions:
+                versions.append(component.version)
+            resources_by_name[component.name].setdefault(resource.id, None)
+
+    usage = [
+        {
+            "name": component_name,
+            "versions": versions_by_name[component_name],
+            "resources": list(resources_by_name[component_name]),
+            "resource_count": len(resources_by_name[component_name]),
+        }
+        for component_name in name_order
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        usage,
+        trailing_newline=True,
+    )
+
+
 def _handle_notifications_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -7433,6 +7541,12 @@ def application(
             return _handle_component_licenses(
                 method, environ, start_response
             )
+
+        if path == "/component-usage":
+            # Global component usage summary grouped by component name;
+            # the handler answers the 405 (Allow: GET) for every other
+            # method.
+            return _handle_component_usage(method, environ, start_response)
 
         if path.startswith("/advisories/"):
             # The identifier segment is validated by the handler; an
