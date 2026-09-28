@@ -7865,6 +7865,63 @@ def _handle_cross_reference_usage(
     )
 
 
+def _handle_cross_reference_targets(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Per-resolved-local-target usage view at
+    ``GET /cross-reference-targets``.
+
+    The current references are grouped by the local id each remote was
+    resolved or reused to at registration time, one entry per local id
+    ordered by its first appearance in reference registration order
+    (redetermined from the remaining records after any deletion). Each
+    entry carries the five fixed keys ``local_id``, ``repositories``,
+    ``remote_ids``, ``reference_count`` and ``resources``: the local id
+    echoed verbatim, pointing repositories deduplicated in reference
+    registration order, one remote id per reference with no
+    deduplication, the records counted one by one, and the start
+    resources deduplicated in resource registration order. Computed on
+    the fly from the remaining records and recorded nowhere; no upstream
+    is ever contacted and reference and dependency entry points keep
+    their existing behavior.
+    """
+
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # Read-only: a declared non-empty (or malformed) body is a bad request
+    # without consulting any business data. An omitted header and an
+    # explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    targets = cross_reference_store.usage_by_local_target(store)
+    return _json_response(
+        start_response,
+        "200 OK",
+        targets,
+        trailing_newline=True,
+    )
+
+
 def _parse_signatures_summary_query(
     query_string: str,
 ) -> tuple[str | None, str | None]:
@@ -8510,6 +8567,13 @@ def application(
             # Per-repository cross-reference usage view; the handler
             # answers the 405 (Allow: GET) for every other method.
             return _handle_cross_reference_usage(
+                method, environ, start_response
+            )
+
+        if path == "/cross-reference-targets":
+            # Per-resolved-local-target cross-reference usage view; the
+            # handler answers the 405 (Allow: GET) for every other method.
+            return _handle_cross_reference_targets(
                 method, environ, start_response
             )
 

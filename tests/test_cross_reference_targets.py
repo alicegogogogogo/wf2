@@ -7,7 +7,7 @@ from unittest import mock
 
 from provenance_api.app import application, reset_state
 
-PATH = "/cross-reference-usage"
+PATH = "/cross-reference-targets"
 
 UPSTREAM = "https://repo.example.invalid"
 REMOTE_NAME = "remote-model"
@@ -15,12 +15,11 @@ DIGEST = "a" * 64
 SOURCE = "https://repo.example.invalid/sources/remote-42"
 
 FIELDS = [
-    "repository",
-    "upstream",
+    "local_id",
+    "repositories",
+    "remote_ids",
     "reference_count",
     "resources",
-    "resource_count",
-    "local_ids",
 ]
 
 
@@ -54,7 +53,7 @@ def call(
     return str(captured["status"]), list(captured["headers"]), b"".join(parts)
 
 
-def call_usage(
+def call_targets(
     method: str = "GET",
     body: bytes = b"",
     **kwargs: object,
@@ -172,7 +171,7 @@ def delete_edge(resource_id: str, dependency_id: str) -> str:
     return status
 
 
-class CrossReferenceUsageViewTests(unittest.TestCase):
+class CrossReferenceTargetsViewTests(unittest.TestCase):
     def setUp(self) -> None:
         reset_state()
 
@@ -187,24 +186,23 @@ class CrossReferenceUsageViewTests(unittest.TestCase):
         )
         self.assertEqual(raw, b"[]\n")
 
-    def test_one_reference_one_entry_with_six_fields_in_order(self) -> None:
+    def test_one_reference_one_entry_with_five_fields_in_order(self) -> None:
         start_id = register_local()
         with patch_resolve():
             status, _created = post_reference(start_id, reference_body())
         self.assertEqual(status, "201 Created")
         resolved_id = local_id_for("remote-42")
 
-        status, _h, usage = call_usage()
+        status, _h, targets = call_targets()
         self.assertEqual(status, "200 OK")
-        self.assertEqual(len(usage), 1)
-        entry = usage[0]
+        self.assertEqual(len(targets), 1)
+        entry = targets[0]
         self.assertEqual(list(entry), FIELDS)
-        self.assertEqual(entry["repository"], "partner")
-        self.assertEqual(entry["upstream"], UPSTREAM)
+        self.assertEqual(entry["local_id"], resolved_id)
+        self.assertEqual(entry["repositories"], ["partner"])
+        self.assertEqual(entry["remote_ids"], ["remote-42"])
         self.assertEqual(entry["reference_count"], 1)
         self.assertEqual(entry["resources"], [start_id])
-        self.assertEqual(entry["resource_count"], 1)
-        self.assertEqual(entry["local_ids"], [resolved_id])
 
     def test_compact_json_single_trailing_newline(self) -> None:
         start_id = register_local()
@@ -218,13 +216,13 @@ class CrossReferenceUsageViewTests(unittest.TestCase):
 
     # --- Grouping, order, counting and deduplication -----------------------
 
-    def test_entries_follow_first_repository_occurrence(self) -> None:
+    def test_entries_follow_first_local_occurrence(self) -> None:
         s1 = register_local(name="s1")
         s2 = register_local(name="s2", digest="c1" * 32)
         s3 = register_local(name="s3", digest="c2" * 32)
 
-        # "beta" is seen first, then "alpha": entry order follows reference
-        # registration order, never the alphabet.
+        # The local resolved for "beta" appears first; the shared local for
+        # "alpha" is created second and reused for the third reference.
         with patch_resolve(digest="d" * 64, name="m-beta", source="u-b"):
             self.assertEqual(
                 post_reference(
@@ -253,7 +251,7 @@ class CrossReferenceUsageViewTests(unittest.TestCase):
             )
         with patch_resolve(digest="e" * 64, name="m-a1", source="u-a1"):
             # Same digest/name/category as the previous remote: the resolved
-            # local resource is reused, while another start resource joins.
+            # local resource is reused, so both references share one entry.
             self.assertEqual(
                 post_reference(
                     s3,
@@ -267,196 +265,228 @@ class CrossReferenceUsageViewTests(unittest.TestCase):
                 "201 Created",
             )
 
-        status, _h, usage = call_usage()
-        self.assertEqual(status, "200 OK")
-        self.assertEqual([entry["repository"] for entry in usage], ["beta", "alpha"])
-
-        beta, alpha = usage
-        self.assertEqual(beta["upstream"], "https://beta.invalid")
-        self.assertEqual(beta["reference_count"], 1)
-        self.assertEqual(beta["resources"], [s1])
-        self.assertEqual(beta["resource_count"], 1)
-
-        # Two records across two resources accumulate; the shared resolved
-        # local appears once.
+        beta_local = local_id_for("rb-1")
         alpha_local = local_id_for("ra-1")
         self.assertEqual(alpha_local, local_id_for("ra-2"))
-        self.assertEqual(alpha["upstream"], "https://alpha.invalid")
+
+        status, _h, targets = call_targets()
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(
+            [entry["local_id"] for entry in targets],
+            [beta_local, alpha_local],
+        )
+
+        beta, alpha = targets
+        self.assertEqual(beta["repositories"], ["beta"])
+        self.assertEqual(beta["remote_ids"], ["rb-1"])
+        self.assertEqual(beta["reference_count"], 1)
+        self.assertEqual(beta["resources"], [s1])
+
+        # Two records reuse one local: remote ids accumulate one per
+        # reference, repositories stay deduplicated.
+        self.assertEqual(alpha["repositories"], ["alpha"])
+        self.assertEqual(alpha["remote_ids"], ["ra-1", "ra-2"])
         self.assertEqual(alpha["reference_count"], 2)
         self.assertEqual(alpha["resources"], [s2, s3])
-        self.assertEqual(alpha["resource_count"], 2)
-        self.assertEqual(alpha["local_ids"], [alpha_local])
+
+    def test_repositories_deduplicated_in_reference_order(self) -> None:
+        s1 = register_local(name="s1")
+        s2 = register_local(name="s2", digest="c1" * 32)
+        s3 = register_local(name="s3", digest="c2" * 32)
+
+        # Three references all resolve to the same local. "beta" points at
+        # it first, then "alpha" from two remote ids: the repository list
+        # must follow reference first-appearance, never the alphabet.
+        with patch_resolve():
+            post_reference(
+                s1,
+                reference_body(
+                    repository="beta",
+                    upstream="https://beta.invalid",
+                    remote_id="rb-1",
+                ),
+            )
+        with patch_resolve():
+            post_reference(
+                s2,
+                reference_body(repository="alpha", remote_id="ra-1"),
+            )
+        with patch_resolve():
+            post_reference(
+                s3,
+                reference_body(repository="alpha", remote_id="ra-2"),
+            )
+
+        status, _h, targets = call_targets()
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(len(targets), 1)
+        entry = targets[0]
+        self.assertEqual(entry["repositories"], ["beta", "alpha"])
+        self.assertEqual(entry["remote_ids"], ["rb-1", "ra-1", "ra-2"])
+        self.assertEqual(entry["reference_count"], 3)
+
+    def test_remote_ids_listed_per_reference_without_dedup(self) -> None:
+        # The same remote id string under two different repositories is a
+        # distinct pair; both resolve to one local (identical metadata) and
+        # the remote id appears twice, once per reference.
+        s1 = register_local(name="s1")
+        s2 = register_local(name="s2", digest="c1" * 32)
+        with patch_resolve():
+            post_reference(
+                s1,
+                reference_body(
+                    repository="alpha",
+                    upstream="https://alpha.invalid",
+                    remote_id="shared-rid",
+                ),
+            )
+        with patch_resolve():
+            post_reference(
+                s2,
+                reference_body(
+                    repository="beta",
+                    upstream="https://beta.invalid",
+                    remote_id="shared-rid",
+                ),
+            )
+
+        status, _h, targets = call_targets()
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(len(targets), 1)
+        entry = targets[0]
+        self.assertEqual(entry["remote_ids"], ["shared-rid", "shared-rid"])
+        self.assertEqual(entry["reference_count"], 2)
+        self.assertEqual(entry["repositories"], ["alpha", "beta"])
+        self.assertEqual(entry["resources"], [s1, s2])
 
     def test_resources_deduplicated_in_resource_registration_order(self) -> None:
         s1 = register_local(name="s1")
         s2 = register_local(name="s2", digest="c1" * 32)
         s3 = register_local(name="s3", digest="c2" * 32)
 
-        # References arrive interleaved across the three resources.
-        with patch_resolve(digest="d" * 64, name="m1", source="u1"):
+        # References to the same resolved local arrive interleaved across
+        # the three resources: s3 references first, s1 last, so first
+        # appearance would order them s3, s2, s1 while the result follows
+        # resource registration order.
+        with patch_resolve():
             post_reference(
-                s3,
-                reference_body(repository="repo", remote_id="r1", digest="d" * 64),
+                s3, reference_body(repository="repo", remote_id="r1")
             )
-        with patch_resolve(digest="e" * 64, name="m2", source="u2"):
+        with patch_resolve():
             post_reference(
-                s1,
-                reference_body(repository="repo", remote_id="r2", digest="e" * 64),
+                s2, reference_body(repository="repo", remote_id="r2")
             )
-        with patch_resolve(digest="f" * 64, name="m3", source="u3"):
+        with patch_resolve():
             post_reference(
-                s2,
-                reference_body(repository="repo", remote_id="r3", digest="f" * 64),
-            )
-        with patch_resolve(digest="0" * 64, name="m4", source="u4"):
-            # A second reference from s1: the resource is still listed once.
-            post_reference(
-                s1,
-                reference_body(repository="repo", remote_id="r4", digest="0" * 64),
+                s1, reference_body(repository="repo", remote_id="r3")
             )
 
-        status, _h, usage = call_usage()
+        status, _h, targets = call_targets()
         self.assertEqual(status, "200 OK")
-        self.assertEqual(len(usage), 1)
-        entry = usage[0]
-        self.assertEqual(entry["reference_count"], 4)
+        self.assertEqual(len(targets), 1)
+        entry = targets[0]
+        self.assertEqual(entry["reference_count"], 3)
+        self.assertEqual(entry["remote_ids"], ["r1", "r2", "r3"])
         self.assertEqual(entry["resources"], [s1, s2, s3])
-        self.assertEqual(entry["resource_count"], 3)
 
-    def test_local_ids_deduplicated_and_registration_ordered(self) -> None:
-        # A resource with the remote digest pre-registered locally, before
-        # the reference flow starts.
-        existing = register_local(
-            name=REMOTE_NAME, category="Model", digest=DIGEST, source=SOURCE
-        )
-        start = register_local(name="start", digest="c1" * 32)
-
-        # First reference resolves to a brand-new local (registered now,
-        # i.e. after ``existing``); the second reuses the older existing
-        # resource. First reference appearance would list them in the other
-        # order, so this proves the local list follows registration order.
-        with patch_resolve(digest="e" * 64, name="m-new", source="u-new"):
-            post_reference(
-                start,
-                reference_body(repository="repo", remote_id="r-new", digest="e" * 64),
-            )
-        with patch_resolve():
-            post_reference(
-                start,
-                reference_body(repository="repo", remote_id="r-old"),
-            )
-
-        status, _h, usage = call_usage()
-        self.assertEqual(status, "200 OK")
-        entry = usage[0]
-        self.assertEqual(entry["local_ids"], [existing, local_id_for("r-new")])
-        self.assertEqual(entry["reference_count"], 2)
-        self.assertEqual(entry["resources"], [start])
-
-    def test_name_and_upstream_echoed_verbatim(self) -> None:
+    def test_local_id_echoed_verbatim(self) -> None:
         start_id = register_local()
-        raw_name = " PaRtNeR "
-        raw_upstream = "https://repo.example.invalid/ "
         with patch_resolve():
-            status, _body = post_reference(
-                start_id,
-                reference_body(
-                    repository=raw_name,
-                    upstream=raw_upstream,
-                ),
-            )
-        self.assertEqual(status, "201 Created")
+            post_reference(start_id, reference_body())
+        before = call("GET", PATH)[2]
 
-        status, _h, usage = call_usage()
+        # Deregistration of the resolved local and removal of the dependency
+        # edge never rewrite historical references: the grouping key,
+        # repository, remote id and start resource all stay as recorded.
+        resolved_id = local_id_for("remote-42")
+        self.assertEqual(delete_edge(start_id, resolved_id), "200 OK")
+        self.assertEqual(delete_resource(resolved_id), "200 OK")
+
+        status, _h, after_raw = call("GET", PATH)
         self.assertEqual(status, "200 OK")
-        self.assertEqual(usage[0]["repository"], raw_name)
-        self.assertEqual(usage[0]["upstream"], raw_upstream)
+        self.assertEqual(after_raw, before)
+        targets = json.loads(after_raw)
+        self.assertEqual(targets[0]["local_id"], resolved_id)
 
     # --- Recomputation -----------------------------------------------------
-
-    def test_recomputes_after_single_reference_deletion(self) -> None:
-        s1 = register_local(name="s1")
-        s2 = register_local(name="s2", digest="c1" * 32)
-        with patch_resolve():
-            post_reference(s1, reference_body(repository="alpha", remote_id="a1"))
-        with patch_resolve(digest="e" * 64, name="m-b", source="u-b"):
-            post_reference(
-                s2,
-                reference_body(
-                    repository="beta",
-                    upstream="https://beta.invalid",
-                    remote_id="b1",
-                    digest="e" * 64,
-                ),
-            )
-        with patch_resolve(digest="f" * 64, name="m-a2", source="u-a2"):
-            post_reference(
-                s1,
-                reference_body(
-                    repository="alpha", remote_id="a2", digest="f" * 64
-                ),
-            )
-
-        status = delete_reference(s1, "alpha", "a1")
-        self.assertEqual(status, "200 OK")
-
-        status, _h, usage = call_usage()
-        self.assertEqual(status, "200 OK")
-        alpha = next(entry for entry in usage if entry["repository"] == "alpha")
-        self.assertEqual(alpha["reference_count"], 1)
-        self.assertEqual(alpha["local_ids"], [local_id_for("a2")])
-
-        # Deleting the last reference of a repository drops the whole entry;
-        # the other entry stays in its first-appearance position.
-        status = delete_reference(s1, "alpha", "a2")
-        self.assertEqual(status, "200 OK")
-        status, _h, usage = call_usage()
-        self.assertEqual(status, "200 OK")
-        self.assertEqual([entry["repository"] for entry in usage], ["beta"])
 
     def test_entry_order_redetermined_after_single_reference_deletion(self) -> None:
         s1 = register_local(name="s1")
         s2 = register_local(name="s2", digest="c1" * 32)
         s3 = register_local(name="s3", digest="c2" * 32)
-        with patch_resolve():
-            post_reference(s1, reference_body(repository="alpha", remote_id="a1"))
-        with patch_resolve(digest="e" * 64, name="m-b", source="u-b"):
+        with patch_resolve(digest="e" * 64, name="m-a", source="u-a"):
+            post_reference(
+                s1,
+                reference_body(
+                    repository="alpha",
+                    upstream="https://alpha.invalid",
+                    remote_id="a1",
+                    digest="e" * 64,
+                ),
+            )
+        with patch_resolve(digest="d" * 64, name="m-b", source="u-b"):
             post_reference(
                 s2,
                 reference_body(
                     repository="beta",
                     upstream="https://beta.invalid",
                     remote_id="b1",
+                    digest="d" * 64,
+                ),
+            )
+        with patch_resolve(digest="e" * 64, name="m-a", source="u-a"):
+            # Same metadata as a1: the alpha local is reused from s3.
+            post_reference(
+                s3,
+                reference_body(
+                    repository="alpha",
+                    upstream="https://alpha.invalid",
+                    remote_id="a2",
                     digest="e" * 64,
                 ),
             )
-        with patch_resolve():
-            # Same resolved metadata as a1: the local is reused while a
-            # further start resource joins the same repository group.
-            post_reference(
-                s3, reference_body(repository="alpha", remote_id="a2")
-            )
 
-        status, _h, usage = call_usage()
-        self.assertEqual([entry["repository"] for entry in usage], ["alpha", "beta"])
+        alpha_local = local_id_for("a1")
+        beta_local = local_id_for("b1")
 
-        # Deleting alpha's first-occurrence reference redetermines the
-        # first-appearance order from the remaining records: beta now comes
-        # first and surviving alpha takes the second slot.
+        status, _h, targets = call_targets()
+        self.assertEqual(
+            [entry["local_id"] for entry in targets],
+            [alpha_local, beta_local],
+        )
+
+        # Deleting the first-occurrence reference moves alpha behind beta:
+        # the order is redetermined from the remaining records.
         self.assertEqual(delete_reference(s1, "alpha", "a1"), "200 OK")
-        status, _h, usage = call_usage()
+        status, _h, targets = call_targets()
         self.assertEqual(status, "200 OK")
-        self.assertEqual([entry["repository"] for entry in usage], ["beta", "alpha"])
-        alpha = next(entry for entry in usage if entry["repository"] == "alpha")
-        self.assertEqual(alpha["reference_count"], 1)
-        self.assertEqual(alpha["resources"], [s3])
-        self.assertEqual(alpha["local_ids"], [local_id_for("a2")])
+        self.assertEqual(
+            [entry["local_id"] for entry in targets],
+            [beta_local, alpha_local],
+        )
+        alpha_entry = next(
+            entry for entry in targets if entry["local_id"] == alpha_local
+        )
+        self.assertEqual(alpha_entry["remote_ids"], ["a2"])
+        self.assertEqual(alpha_entry["reference_count"], 1)
+        self.assertEqual(alpha_entry["repositories"], ["alpha"])
+        self.assertEqual(alpha_entry["resources"], [s3])
+
+        # Deleting the last reference at that local drops the whole entry.
+        self.assertEqual(delete_reference(s3, "alpha", "a2"), "200 OK")
+        status, _h, targets = call_targets()
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(
+            [entry["local_id"] for entry in targets], [beta_local]
+        )
 
     def test_start_resource_deregistration_recomputes_aggregates(self) -> None:
         s1 = register_local(name="s1")
         s2 = register_local(name="s2", digest="c1" * 32)
         with patch_resolve():
-            post_reference(s1, reference_body(repository="shared", remote_id="r1"))
+            post_reference(
+                s1, reference_body(repository="shared", remote_id="r1")
+            )
         with patch_resolve(digest="e" * 64, name="m2", source="u2"):
             post_reference(
                 s2,
@@ -464,19 +494,20 @@ class CrossReferenceUsageViewTests(unittest.TestCase):
                     repository="shared", remote_id="r2", digest="e" * 64
                 ),
             )
+        second_local = local_id_for("r2")
 
         status = delete_resource(s1)
         self.assertEqual(status, "200 OK")
 
-        status, _h, usage = call_usage()
+        status, _h, targets = call_targets()
         self.assertEqual(status, "200 OK")
-        self.assertEqual(len(usage), 1)
-        entry = usage[0]
-        self.assertEqual(entry["repository"], "shared")
+        self.assertEqual(len(targets), 1)
+        entry = targets[0]
+        self.assertEqual(entry["local_id"], second_local)
         self.assertEqual(entry["reference_count"], 1)
+        self.assertEqual(entry["remote_ids"], ["r2"])
+        self.assertEqual(entry["repositories"], ["shared"])
         self.assertEqual(entry["resources"], [s2])
-        self.assertEqual(entry["resource_count"], 1)
-        self.assertEqual(entry["local_ids"], [local_id_for("r2")])
 
         # Deregistering the last start resource leaves an empty array.
         self.assertEqual(delete_resource(s2), "200 OK")
@@ -484,57 +515,28 @@ class CrossReferenceUsageViewTests(unittest.TestCase):
         self.assertEqual(status, "200 OK")
         self.assertEqual(raw, b"[]\n")
 
-    def test_dependency_edge_removal_does_not_change_usage(self) -> None:
+    def test_dependency_edge_removal_does_not_change_targets(self) -> None:
         start_id = register_local()
         with patch_resolve():
             post_reference(start_id, reference_body())
-        _status, _h, before = call_usage()
+        _status, _h, before = call_targets()
 
         self.assertEqual(
             delete_edge(start_id, local_id_for("remote-42")), "200 OK"
         )
 
-        status, _h, after = call_usage()
+        status, _h, after = call_targets()
         self.assertEqual(status, "200 OK")
         self.assertEqual(after, before)
-
-    def test_deregistered_resolved_local_still_listed_in_local_ids(self) -> None:
-        # Dependency removal or deregistration of the resolved local
-        # resource never rewrites historical references.
-        s1 = register_local(name="s1")
-        s2 = register_local(name="s2", digest="c1" * 32)
-        with patch_resolve():
-            post_reference(s1, reference_body(repository="repo", remote_id="r1"))
-        with patch_resolve(digest="e" * 64, name="m2", source="u2"):
-            post_reference(
-                s2,
-                reference_body(
-                    repository="repo", remote_id="r2", digest="e" * 64
-                ),
-            )
-        first_local = local_id_for("r1")
-        second_local = local_id_for("r2")
-
-        # The first resolved local was registered first; deregistering it
-        # leaves its reference (started by s1) intact. The surviving id keeps
-        # registration ordering while the dangling id is still listed once.
-        self.assertEqual(delete_resource(first_local), "200 OK")
-
-        status, _h, usage = call_usage()
-        self.assertEqual(status, "200 OK")
-        entry = usage[0]
-        self.assertEqual(entry["reference_count"], 2)
-        self.assertEqual(entry["resources"], [s1, s2])
-        self.assertEqual(entry["local_ids"], [second_local, first_local])
 
     def test_view_never_contacts_upstream_and_is_read_only(self) -> None:
         with mock.patch(
             "provenance_api.app.resolve_remote",
             side_effect=AssertionError("must not resolve"),
         ):
-            status, _h, usage = call_usage()
+            status, _h, targets = call_targets()
         self.assertEqual(status, "200 OK")
-        self.assertEqual(usage, [])
+        self.assertEqual(targets, [])
 
         # Repeated reads are identical.
         self.assertEqual(call("GET", PATH)[2], call("GET", PATH)[2])
@@ -561,7 +563,7 @@ class CrossReferenceUsageViewTests(unittest.TestCase):
         )
 
 
-class CrossReferenceUsageRequestTests(unittest.TestCase):
+class CrossReferenceTargetsRequestTests(unittest.TestCase):
     def setUp(self) -> None:
         reset_state()
 
@@ -585,7 +587,7 @@ class CrossReferenceUsageRequestTests(unittest.TestCase):
         self.assertEqual(raw, b"[]\n")
 
     def test_declared_non_empty_body_returns_400(self) -> None:
-        status, _h, body = call_usage(body=b"x")
+        status, _h, body = call_targets(body=b"x")
         self.assertEqual(status, "400 Bad Request")
         self.assertEqual(body["error"], "invalid_request")
 
@@ -598,13 +600,13 @@ class CrossReferenceUsageRequestTests(unittest.TestCase):
 
     def test_query_parameters_return_400(self) -> None:
         for query_string in ("x=1", "x=", "a=b&c=d", "x=1&x=2"):
-            status, _h, body = call_usage(query_string=query_string)
+            status, _h, body = call_targets(query_string=query_string)
             self.assertEqual(status, "400 Bad Request", query_string)
             self.assertEqual(body["error"], "invalid_request")
 
     def test_methods_other_than_get_return_405_with_get_only_allow(self) -> None:
         for method in ("POST", "PUT", "DELETE", "PATCH", "HEAD"):
-            status, headers, body = call_usage(method)
+            status, headers, body = call_targets(method)
             self.assertEqual(status, "405 Method Not Allowed", method)
             self.assertIn(("Allow", "GET"), headers)
             allow_values = [value for key, value in headers if key == "Allow"]
@@ -613,12 +615,12 @@ class CrossReferenceUsageRequestTests(unittest.TestCase):
 
     def test_non_get_method_with_body_or_query_still_returns_405(self) -> None:
         # Method is decided before the request shape is examined.
-        status, headers, body = call_usage("DELETE", query_string="x=1")
+        status, headers, body = call_targets("DELETE", query_string="x=1")
         self.assertEqual(status, "405 Method Not Allowed")
         self.assertEqual(headers and [v for k, v in headers if k == "Allow"], ["GET"])
         self.assertEqual(body["error"], "method_not_allowed")
 
-        status, headers, body = call_usage("POST", body=b"{}")
+        status, headers, body = call_targets("POST", body=b"{}")
         self.assertEqual(status, "405 Method Not Allowed")
         self.assertEqual([v for k, v in headers if k == "Allow"], ["GET"])
         self.assertEqual(body["error"], "method_not_allowed")
