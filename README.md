@@ -2781,6 +2781,25 @@ curl -s -X POST http://127.0.0.1:8000/resources/$LOCAL_ID/cross-references \
 
 每条记录都只含 `resource_id` 与登记体的四个键，共五个字段。
 
+### 删除单条引用：`DELETE /resources/{id}/cross-references/{repository}/{remote_id}`
+
+在引用集合路径之后再追加两段路径来定位一条记录：先仓库名、再远端标识。两段都按路径段做百分号解码，随后与登记值逐字匹配（区分大小写，不做任何修剪或归一化）；任一为空、或解码后含路径分隔符（`/`、`\`，含 `%2F`、`%5C`）一律拒绝。该入口只接受 `DELETE`，不携带查询参数，也不接受非空请求体。
+
+```bash
+curl -s -X DELETE \
+  http://127.0.0.1:8000/resources/$LOCAL_ID/cross-references/partner/remote-42
+```
+
+成功返回 HTTP 200，紧凑 UTF-8 JSON 以单个换行结束，回显被删引用的五个字段，键序固定为 `resource_id`、`repository`、`upstream`、`remote_id`、`digest`：
+
+```json
+{"resource_id":"<起点 id>","repository":"partner","upstream":"https://repo.example.invalid/","remote_id":"remote-42","digest":"aaaa…aaaa"}
+```
+
+删除只移除引用记录本身：登记时解析生成或复用的本地资源与建立的依赖边都保留，并继续出现在依赖查询、影响分析和图谱视图中，不留任何引用残影。全局跨仓库引用汇总（`GET /`）下一次查询立即按剩余记录重算，被删条目整体消失；删除该仓库的最后一条引用后，其仓库名绑定与 `(repository, remote_id)` 唯一性占用一并释放。删除后以同名仓库与同远端标识重新登记引用可以成功，沿用既有登记处理顺序并按 201 返回；若保留下来的依赖边仍在图上，重新登记会复用该边而不是报 `duplicate_dependency`，若该边期间已被单独解除则重新建立。
+
+引用不存在或已删除都返回 HTTP 404（错误码 `reference_not_found`），重复删除结果一致。起点资源不存在返回 HTTP 404（错误码 `resource_not_found`），其判定次序在引用查找之前。
+
 ### 跨仓库引用接口的错误
 
 请求侧问题返回 HTTP 400（错误码 `invalid_request`），且不联系上游、不改变任何状态：
@@ -2796,7 +2815,10 @@ curl -s -X POST http://127.0.0.1:8000/resources/$LOCAL_ID/cross-references \
 | 场景 | HTTP 状态 | 错误码 |
 | --- | --- | --- |
 | 起点资源不存在 | 404 | `resource_not_found` |
-| 方法不符（`GET`、`POST` 之外），响应带 `Allow: GET, POST` | 405 | `method_not_allowed` |
+| 方法不符（引用集合的 `GET`、`POST` 之外），响应带 `Allow: GET, POST` | 405 | `method_not_allowed` |
+| 删除时引用不存在或已删除（重复删除结果一致） | 404 | `reference_not_found` |
+| 删除入口的方法非 `DELETE`，响应带 `Allow: DELETE` | 405 | `method_not_allowed` |
+| 删除路径的仓库名或远端标识段为空，或解码后含 `/`、`\`；携带任意查询参数；声明非空或非法请求体（省略 `Content-Length` 与显式 `Content-Length: 0` 均视为空体） | 400 | `invalid_request` |
 | 同名仓库已绑定不同上游地址 | 409 | `repository_conflict` |
 | 同一仓库与远端标识重复登记 | 409 | `duplicate_reference` |
 | 本地已有同摘要资源但名称或类别不一致 | 409 | `identity_conflict` |

@@ -395,6 +395,7 @@ class _Plan:
     digest: str
     dependency: Resource
     create_resource: bool
+    reattach_edge: bool = False
 
 
 class CrossReferenceStore:
@@ -410,11 +411,20 @@ class CrossReferenceStore:
         self._records: list[CrossReference] = []
         self._repository_upstream: dict[str, str] = {}
         self._pairs: set[tuple[str, str]] = set()
+        #: Edges orphaned by a single-reference deletion. Deleting one
+        #: reference keeps its resolved resource and dependency edge; the
+        #: ``(resource_id, repository, remote_id) -> local_id`` marker lets a
+        #: later re-registration of the very same reference re-adopt its
+        #: surviving edge instead of rejecting it as a duplicate. Markers are
+        #: consumed by :meth:`commit`, dropped when the start resource is
+        #: removed, and otherwise stay until a successful re-registration.
+        self._detached_edges: dict[tuple[str, str, str], str] = {}
 
     def reset(self) -> None:
         self._records = []
         self._repository_upstream = {}
         self._pairs = set()
+        self._detached_edges = {}
 
     def remove_resource(self, resource_id: str) -> None:
         """Remove every reference registered by a resource.
@@ -437,6 +447,65 @@ class CrossReferenceStore:
                 record.repository, record.upstream
             )
             self._pairs.add((record.repository, record.remote_id))
+        # A deregistered start can never re-register its references, so its
+        # detached-edge markers are moot.
+        self._detached_edges = {
+            key: local_id
+            for key, local_id in self._detached_edges.items()
+            if key[0] != resource_id
+        }
+
+    def remove_one(
+        self,
+        resource_store: ResourceStore,
+        resource_id: str,
+        repository: str,
+        remote_id: str,
+    ) -> CrossReference | None:
+        """Delete a single reference, keeping its resource and edge.
+
+        Only the reference record is removed; the repository bindings and
+        the ``(repository, remote_id)`` uniqueness index are rebuilt from
+        the remaining records, so deleting the last reference of a
+        repository releases its binding and the pair may be registered
+        again. The local resource resolved at registration time and the
+        dependency edge to it are deliberately left on the graph. When the
+        edge is still present it is marked detached, so a re-registration
+        of the same ``(resource_id, repository, remote_id)`` re-adopts the
+        edge instead of failing as a duplicate.
+
+        Returns the removed record, or ``None`` when no reference matches
+        (the call then changes nothing, so a repeated deletion behaves the
+        same as the first).
+        """
+
+        index = next(
+            (
+                position
+                for position, record in enumerate(self._records)
+                if record.resource_id == resource_id
+                and record.repository == repository
+                and record.remote_id == remote_id
+            ),
+            None,
+        )
+        if index is None:
+            return None
+        record = self._records.pop(index)
+
+        if resource_store.has_dependency(resource_id, record.local_id):
+            self._detached_edges[
+                (resource_id, repository, remote_id)
+            ] = record.local_id
+
+        self._repository_upstream = {}
+        self._pairs = set()
+        for remaining in self._records:
+            self._repository_upstream.setdefault(
+                remaining.repository, remaining.upstream
+            )
+            self._pairs.add((remaining.repository, remaining.remote_id))
+        return record
 
     def list_for(self, resource_id: str) -> list[CrossReference]:
         """Return a resource's references in registration order."""
@@ -543,15 +612,28 @@ class CrossReferenceStore:
         else:
             create_resource = False
 
-        try:
-            # Pure validation: raises for a self loop, an existing
-            # same-direction edge or a would-be cycle without mutating the
-            # graph.
-            resource_store.check_dependency(resource_id, dependency.id)
-        except DependencyError as exc:
-            raise CrossReferenceError(
-                exc.code, exc.message, http_status=409
-            ) from exc
+        # An edge still on the graph after the reference that established
+        # it was deleted is a retained, detached edge: re-registering the
+        # same reference re-adopts it instead of tripping the duplicate-edge
+        # check. Any other existing edge keeps the baseline validation.
+        detached_local_id = self._detached_edges.get(
+            (resource_id, repository, remote_id)
+        )
+        reattaching = (
+            detached_local_id is not None
+            and detached_local_id == dependency.id
+            and resource_store.has_dependency(resource_id, dependency.id)
+        )
+        if not reattaching:
+            try:
+                # Pure validation: raises for a self loop, an existing
+                # same-direction edge or a would-be cycle without mutating the
+                # graph.
+                resource_store.check_dependency(resource_id, dependency.id)
+            except DependencyError as exc:
+                raise CrossReferenceError(
+                    exc.code, exc.message, http_status=409
+                ) from exc
 
         return _Plan(
             resource_id=resource_id,
@@ -561,6 +643,7 @@ class CrossReferenceStore:
             digest=digest,
             dependency=dependency,
             create_resource=create_resource,
+            reattach_edge=reattaching,
         )
 
     def commit(
@@ -586,11 +669,25 @@ class CrossReferenceStore:
             dependency = plan.dependency
 
         try:
-            resource_store.add_dependency(plan.resource_id, dependency.id)
+            if plan.reattach_edge:
+                # The edge was deliberately kept when its reference was
+                # deleted; re-adopt the existing edge without adding it
+                # again.
+                pass
+            else:
+                resource_store.add_dependency(
+                    plan.resource_id, dependency.id
+                )
         except DependencyError:
             if plan.create_resource:
                 resource_store.discard(dependency.id)
             raise
+
+        # A fresh record now covers this key, so any retained-edge marker is
+        # spent (reattach) or stale (the edge was removed in the meantime).
+        self._detached_edges.pop(
+            (plan.resource_id, plan.repository, plan.remote_id), None
+        )
 
         record = CrossReference(
             resource_id=plan.resource_id,
