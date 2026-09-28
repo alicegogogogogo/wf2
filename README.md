@@ -2781,6 +2781,35 @@ curl -s -X POST http://127.0.0.1:8000/resources/$LOCAL_ID/cross-references \
 
 每条记录都只含 `resource_id` 与登记体的四个键，共五个字段。
 
+### 删除单条引用：`DELETE /resources/{id}/cross-references/{repository}/{remote_id}`
+
+在引用集合路径之后再追加**仓库名**与**远端标识**两段来定位一条引用记录。两段都先按路径段做百分号解码，再与登记值逐字匹配（区分大小写、不做裁剪）；路径段为空、不是合法 UTF-8，或解码后含 `/`、`\\` 的一律拒绝。该入口只接受 `DELETE`，不携带任何查询参数，也不接受非空请求体——省略 `Content-Length` 头或显式 `Content-Length: 0` 都视为空体照常处理。
+
+```bash
+curl -s -X DELETE \
+  http://127.0.0.1:8000/resources/$LOCAL_ID/cross-references/partner/remote-42
+```
+
+删除成功返回 HTTP 200，紧凑 UTF-8 JSON 以单个换行结束，回显被删引用的五个字段，键序固定为 `resource_id`、`repository`、`upstream`、`remote_id`、`digest`：
+
+```json
+{"resource_id":"<起点 id>","repository":"partner","upstream":"https://repo.example.invalid/","remote_id":"remote-42","digest":"aaaa…aaaa"}
+```
+
+删除只移除引用记录本身：登记时解析生成或复用的本地资源与那条依赖边（起点 → 解析资源）都保留，继续出现在依赖查询、影响分析和图谱视图中，不产生残影。全局跨仓库引用汇总（`GET /`）下一次查询立即按剩余记录重算，被删条目整体消失；仓库名与 `(repository, remote_id)` 唯一性索引同样按剩余记录重建，因此删除最后一条同名仓库的引用后，该名称可与不同上游重新绑定。删除后以同名仓库与同远端标识重新登记引用可以成功，按既有 201 口径处理：保留下来的依赖边被重新登记直接接管（若该边在此期间已被单独解除，则重新建立），不会按重复边拒绝。
+
+删除入口的错误：
+
+| 场景 | HTTP 状态 | 错误码 |
+| --- | --- | --- |
+| 起点资源不存在（判定次序先于引用存在性） | 404 | `resource_not_found` |
+| 引用不存在或已删除；重复删除结果一致 | 404 | `reference_not_found` |
+| 路径段为空或含 `/`、`\\`，或携带查询参数 | 400 | `invalid_request` |
+| 声明非空或非法（非整数）`Content-Length` 请求体 | 400 | `invalid_request` |
+| `DELETE` 之外的方法，响应带 `Allow: DELETE` | 405 | `method_not_allowed` |
+
+错误体沿用既有 JSON 错误形状（`{"error":"…","message":"…"}`），紧凑 JSON 并以单个换行结束。删除入口不联系任何上游，也不改变引用登记解析、按资源查询、全局汇总、依赖登记与解除、资源注销连带清理引用等既有口径；数据仍只存于当前进程内存，停止或重启即清空，服务不生成任何持久化文件。
+
 ### 跨仓库引用接口的错误
 
 请求侧问题返回 HTTP 400（错误码 `invalid_request`），且不联系上游、不改变任何状态：

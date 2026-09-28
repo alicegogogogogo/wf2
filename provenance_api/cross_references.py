@@ -39,6 +39,12 @@ state changes:
 Everything lives in the current process memory: records, bindings,
 resources and edges are lost on restart and nothing is written to a
 file. Batching and concurrency are intentionally out of scope.
+
+A single reference can be unregistered through
+:meth:`CrossReferenceStore.remove_one`: only the reference record is
+removed, so the resolved local resource and its dependency edge survive
+and keep showing up in dependency queries, impact analysis and graph
+views.
 """
 
 from __future__ import annotations
@@ -395,6 +401,7 @@ class _Plan:
     digest: str
     dependency: Resource
     create_resource: bool
+    reuse_existing_edge: bool
 
 
 class CrossReferenceStore:
@@ -410,11 +417,17 @@ class CrossReferenceStore:
         self._records: list[CrossReference] = []
         self._repository_upstream: dict[str, str] = {}
         self._pairs: set[tuple[str, str]] = set()
+        # References removed one by one keep their dependency edge; this
+        # maps the removed reference triple to the ``local_id`` its edge
+        # points at so an identical re-registration can re-adopt that edge
+        # instead of failing it as a duplicate. Consumed on commit.
+        self._retained_edges: dict[tuple[str, str, str], str] = {}
 
     def reset(self) -> None:
         self._records = []
         self._repository_upstream = {}
         self._pairs = set()
+        self._retained_edges = {}
 
     def remove_resource(self, resource_id: str) -> None:
         """Remove every reference registered by a resource.
@@ -437,6 +450,13 @@ class CrossReferenceStore:
                 record.repository, record.upstream
             )
             self._pairs.add((record.repository, record.remote_id))
+        # The deregistered start takes its edges with it, so the retained
+        # edge remembered for it can never be re-adopted.
+        self._retained_edges = {
+            triple: local_id
+            for triple, local_id in self._retained_edges.items()
+            if triple[0] != resource_id
+        }
 
     def list_for(self, resource_id: str) -> list[CrossReference]:
         """Return a resource's references in registration order."""
@@ -446,6 +466,52 @@ class CrossReferenceStore:
             for record in self._records
             if record.resource_id == resource_id
         ]
+
+    def remove_one(
+        self, resource_id: str, repository: str, remote_id: str
+    ) -> CrossReference | None:
+        """Remove a single reference identified by its start and pair.
+
+        The ``(repository, remote_id)`` pair is matched verbatim against the
+        recorded values. Returns the removed record, or ``None`` when no
+        record matches (including one removed before); a second removal of
+        the same pair therefore behaves like the first missing one.
+
+        Only the reference record disappears: the repository binding and
+        uniqueness indexes are rebuilt from the remaining records, while the
+        local resource resolved at registration time and the dependency edge
+        pointing at it are deliberately kept.
+        """
+
+        removed: CrossReference | None = None
+        remaining: list[CrossReference] = []
+        for record in self._records:
+            if (
+                removed is None
+                and record.resource_id == resource_id
+                and record.repository == repository
+                and record.remote_id == remote_id
+            ):
+                removed = record
+            else:
+                remaining.append(record)
+        if removed is None:
+            return None
+        self._records = remaining
+        self._repository_upstream = {}
+        self._pairs = set()
+        for record in self._records:
+            self._repository_upstream.setdefault(
+                record.repository, record.upstream
+            )
+            self._pairs.add((record.repository, record.remote_id))
+        # The edge start -> local_id is kept on the graph; remember it so an
+        # identical re-registration adopts the existing edge rather than
+        # tripping the duplicate-edge guard.
+        self._retained_edges[
+            (removed.resource_id, removed.repository, removed.remote_id)
+        ] = removed.local_id
+        return removed
 
     def list_all(self) -> list[CrossReference]:
         """Return every reference in global registration order.
@@ -543,15 +609,29 @@ class CrossReferenceStore:
         else:
             create_resource = False
 
-        try:
-            # Pure validation: raises for a self loop, an existing
-            # same-direction edge or a would-be cycle without mutating the
-            # graph.
-            resource_store.check_dependency(resource_id, dependency.id)
-        except DependencyError as exc:
-            raise CrossReferenceError(
-                exc.code, exc.message, http_status=409
-            ) from exc
+        # A reference removed one by one leaves its edge on the graph. An
+        # identical re-registration re-adopts that edge instead of tripping
+        # the duplicate-edge guard: the edge is only reused when it still
+        # exists and points at the resolved dependency.
+        retained_local_id = self._retained_edges.get(
+            (resource_id, repository, remote_id)
+        )
+        reuse_existing_edge = (
+            retained_local_id is not None
+            and retained_local_id == dependency.id
+            and resource_store.has_dependency(resource_id, dependency.id)
+        )
+
+        if not reuse_existing_edge:
+            try:
+                # Pure validation: raises for a self loop, an existing
+                # same-direction edge or a would-be cycle without mutating
+                # the graph.
+                resource_store.check_dependency(resource_id, dependency.id)
+            except DependencyError as exc:
+                raise CrossReferenceError(
+                    exc.code, exc.message, http_status=409
+                ) from exc
 
         return _Plan(
             resource_id=resource_id,
@@ -561,6 +641,7 @@ class CrossReferenceStore:
             digest=digest,
             dependency=dependency,
             create_resource=create_resource,
+            reuse_existing_edge=reuse_existing_edge,
         )
 
     def commit(
@@ -585,12 +666,25 @@ class CrossReferenceStore:
         else:
             dependency = plan.dependency
 
-        try:
-            resource_store.add_dependency(plan.resource_id, dependency.id)
-        except DependencyError:
-            if plan.create_resource:
-                resource_store.discard(dependency.id)
-            raise
+        if plan.reuse_existing_edge:
+            # The edge survived the earlier single-reference deletion; the
+            # re-registration adopts it as-is rather than adding a second.
+            pass
+        else:
+            try:
+                resource_store.add_dependency(
+                    plan.resource_id, dependency.id
+                )
+            except DependencyError:
+                if plan.create_resource:
+                    resource_store.discard(dependency.id)
+                raise
+        # The re-registration settles the retained edge whether it was
+        # adopted as-is or re-established after the edge was separately
+        # removed.
+        self._retained_edges.pop(
+            (plan.resource_id, plan.repository, plan.remote_id), None
+        )
 
         record = CrossReference(
             resource_id=plan.resource_id,

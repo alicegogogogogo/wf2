@@ -10,7 +10,7 @@ import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, unquote_to_bytes
 
 from .advisories import advisory_detail, advisory_fixes, summarize_advisories
 from .cache import CacheError, LayerCacheStore
@@ -640,6 +640,30 @@ def _validate_path_id(raw_id: str) -> str | None:
     if "/" in raw_id or "\\" in raw_id:
         return "Resource id must not contain path separators."
     return None
+
+
+def _decode_reference_segment(
+    raw_segment: str, label: str
+) -> tuple[str | None, str | None]:
+    """Percent-decode one cross-reference locator path segment.
+
+    Returns ``(value, None)`` on success or ``(None, message)`` when the
+    segment is empty, decodes to bytes that are not valid UTF-8, or still
+    contains a path separator after decoding. Decoding happens per segment
+    so an encoded ``%2F`` never crosses a path boundary.
+    """
+
+    if not raw_segment:
+        return None, f"{label} must not be empty."
+    try:
+        value = unquote_to_bytes(raw_segment).decode("utf-8")
+    except UnicodeDecodeError:
+        return None, f"{label} must be valid UTF-8."
+    if not value:
+        return None, f"{label} must not be empty."
+    if "/" in value or "\\" in value:
+        return None, f"{label} must not contain path separators."
+    return value, None
 
 
 def _query_parameter_error(environ: dict[str, Any]) -> str | None:
@@ -7614,12 +7638,136 @@ def _handle_cross_references_get(
     )
 
 
+def _handle_cross_reference_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_repository: str,
+    raw_remote_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Single-reference routes below the collection path.
+
+    Only ``DELETE /resources/{id}/cross-references/{repository}/{remote_id}``
+    exists; the two locator segments are matched verbatim against the
+    recorded values after per-segment percent-decoding.
+    """
+
+    if method != "DELETE":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="DELETE",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    repository, repository_error = _decode_reference_segment(
+        raw_repository, "Repository"
+    )
+    if repository_error is not None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            repository_error,
+        )
+    remote_id, remote_id_error = _decode_reference_segment(
+        raw_remote_id, "Remote id"
+    )
+    if remote_id_error is not None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            remote_id_error,
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # A missing start resource is decided before the reference is looked
+    # up, so deleting a reference under an unknown resource never reports
+    # reference_not_found.
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    record = cross_reference_store.remove_one(raw_id, repository, remote_id)
+    if record is None:
+        # Never registered, or already deleted: the answer is identical.
+        return _error(
+            start_response,
+            "404 Not Found",
+            "reference_not_found",
+            "No cross-reference is registered for that repository and "
+            "remote id.",
+        )
+
+    # Only the reference record is removed; the resolved local resource
+    # and its dependency edge stay on the graph.
+    return _json_response(
+        start_response,
+        "200 OK",
+        record.to_dict(),
+        trailing_newline=True,
+    )
+
+
 def _handle_cross_references(
     method: str,
     environ: dict[str, Any],
     raw_id: str,
     start_response: StartResponse,
+    tail: str | None = None,
 ) -> Iterable[bytes]:
+    if tail is not None:
+        # An item path: ``cross-references/<repository>/<remote_id>``.
+        if not tail:
+            # A trailing slash names the item route with both locator
+            # segments empty; the handler rejects it as a bad request,
+            # mirroring the dependency item route.
+            return _handle_cross_reference_item(
+                method, environ, raw_id, "", "", start_response
+            )
+        raw_repository, separator, raw_remote_id = tail.partition("/")
+        if not separator:
+            # Both locator segments are required; naming the collection
+            # plus a single segment matches no route.
+            return _json_response(
+                start_response,
+                "404 Not Found",
+                {
+                    "error": "not_found",
+                    "message": "The requested resource does not exist.",
+                },
+            )
+        return _handle_cross_reference_item(
+            method,
+            environ,
+            raw_id,
+            raw_repository,
+            raw_remote_id,
+            start_response,
+        )
+
     if method == "POST":
         return _handle_cross_references_post(environ, raw_id, start_response)
     if method == "GET":
@@ -8792,6 +8940,16 @@ def application(
                 return _handle_cross_references(
                     method, environ, head, start_response
                 )
+            if separator and tail.startswith("cross-references/"):
+                # Single-reference item route: the two locator segments are
+                # decoded and validated by the handler.
+                return _handle_cross_references(
+                    method,
+                    environ,
+                    head,
+                    start_response,
+                    tail[len("cross-references/"):],
+                )
             if separator and tail == "signatures/verify":
                 return _handle_signature_verify(
                     method, environ, head, start_response
@@ -9038,6 +9196,20 @@ def application(
                     environ,
                     suffix[: -len("/dependency-vulnerability-impact")],
                     start_response,
+                )
+            if separator and "/cross-references/" in suffix:
+                # Fallback for a separator inside the start id segment of a
+                # single-reference item path so the handler rejects it
+                # without removing any reference.
+                malformed_id, _, raw_tail = suffix.rpartition(
+                    "/cross-references/"
+                )
+                return _handle_cross_references(
+                    method,
+                    environ,
+                    malformed_id,
+                    start_response,
+                    raw_tail,
                 )
             if separator and suffix.endswith("/cross-references"):
                 # Fallback for a separator inside the id segment so the
