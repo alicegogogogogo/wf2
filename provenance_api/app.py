@@ -7812,6 +7812,55 @@ def _handle_cross_reference_summary(
     )
 
 
+def _handle_cross_reference_usage(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Per-repository usage rollup at ``GET /cross-reference-usage``.
+
+    One entry per repository name among the current references, in the
+    order each name first appears in reference registration order, each
+    carrying the fixed key order ``repository``, ``upstream``,
+    ``reference_count``, ``resources``, ``resource_count`` and
+    ``local_ids``. Computed on the fly and recorded nowhere; no upstream
+    is ever contacted and the reference and dependency endpoints are
+    untouched.
+    """
+
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # Read-only: a declared non-empty (or malformed) body is a bad request
+    # without consulting any business data. An omitted header and an
+    # explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        cross_reference_store.repository_usage(store),
+        trailing_newline=True,
+    )
+
+
 def _parse_signatures_summary_query(
     query_string: str,
 ) -> tuple[str | None, str | None]:
@@ -8450,6 +8499,13 @@ def application(
             # Global cross-reference summary; the handler answers the 405
             # (Allow: GET) for every other method.
             return _handle_cross_reference_summary(
+                method, environ, start_response
+            )
+
+        if path == "/cross-reference-usage":
+            # Per-repository cross-reference usage rollup; the handler
+            # answers the 405 (Allow: GET) for every other method.
+            return _handle_cross_reference_usage(
                 method, environ, start_response
             )
 

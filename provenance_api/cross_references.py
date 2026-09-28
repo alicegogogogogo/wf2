@@ -526,6 +526,98 @@ class CrossReferenceStore:
 
         return list(self._records)
 
+    def repository_usage(
+        self, resource_store: ResourceStore
+    ) -> list[dict[str, object]]:
+        """Group every current reference by repository name.
+
+        One entry per repository name, in the order in which the name first
+        appears in reference registration order; entries are never
+        reordered. Each entry carries, in fixed order:
+
+        - ``repository`` and ``upstream``: the name and the address bound
+          to it, echoed verbatim (no case folding, no whitespace trimming);
+        - ``reference_count``: every reference is counted individually,
+          with no deduplication or merging, so references to the same
+          repository from different resources accumulate;
+        - ``resources`` and ``resource_count``: the distinct start
+          resources that registered a reference, deduplicated and ordered
+          by resource registration order;
+        - ``local_ids``: the distinct local resource ids references were
+          resolved to (created or reused at registration time),
+          deduplicated and ordered the same way.
+
+        A resolved local resource may have been deregistered while the
+        historical reference survives (its edge is gone): such an id is
+        still listed. Surviving ids follow the current resource
+        registration order; ids no longer registered follow the order in
+        which they first appear in reference registration order.
+        Everything is derived on the fly and nothing is recorded.
+        """
+
+        order: list[str] = []
+        upstreams: dict[str, str] = {}
+        counts: dict[str, int] = {}
+        start_sets: dict[str, set[str]] = {}
+        local_sets: dict[str, set[str]] = {}
+        local_first_seen: dict[str, dict[str, None]] = {}
+
+        for record in self._records:
+            name = record.repository
+            if name not in counts:
+                order.append(name)
+                upstreams[name] = record.upstream
+                counts[name] = 0
+                start_sets[name] = set()
+                local_sets[name] = set()
+                local_first_seen[name] = {}
+            counts[name] += 1
+            start_sets[name].add(record.resource_id)
+            local_sets[name].add(record.local_id)
+            local_first_seen[name].setdefault(record.local_id, None)
+
+        registered_order = [
+            resource.id for resource in resource_store.list_all()
+        ]
+
+        def in_resource_order(
+            ids: set[str], missing_order: list[str]
+        ) -> list[str]:
+            ordered = [
+                resource_id
+                for resource_id in registered_order
+                if resource_id in ids
+            ]
+            present = set(ordered)
+            # Historical ids whose resource was deregistered keep the given
+            # reference first-seen order.
+            ordered.extend(
+                resource_id
+                for resource_id in missing_order
+                if resource_id in ids and resource_id not in present
+            )
+            return ordered
+
+        usage: list[dict[str, object]] = []
+        for name in order:
+            first_seen_order = list(local_first_seen[name])
+            # A start resource is deregistered together with every reference
+            # it started (see ``remove_resource``), so no surviving record's
+            # start can be missing from the registry.
+            starts = in_resource_order(start_sets[name], [])
+            locals_ = in_resource_order(local_sets[name], first_seen_order)
+            usage.append(
+                {
+                    "repository": name,
+                    "upstream": upstreams[name],
+                    "reference_count": counts[name],
+                    "resources": starts,
+                    "resource_count": len(starts),
+                    "local_ids": locals_,
+                }
+            )
+        return usage
+
     def check_prerequisites(
         self,
         repository: str,
