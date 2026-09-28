@@ -66,6 +66,77 @@ def summarize_advisories(
     ]
 
 
+def summarize_alert_components(
+    resources: ResourceStore,
+    vulnerabilities: VulnerabilityStore,
+    name: str | None = None,
+) -> list[dict[str, object]]:
+    """Aggregate every alert by the component name it was recorded against.
+
+    Only the alert records themselves participate; the SBOM component
+    inventory is never consulted, so a name that never appears on an alert
+    yields no entry regardless of what SBOM documents list.
+
+    Resources are expanded in registration order and each resource's alerts
+    in their submission order; a component name takes the position of its
+    earliest matching alert under that traversal. Each name yields one
+    record with the fixed key order: the name echoed verbatim, then the
+    advisory identifier list, the raw alert count, the highest severity,
+    the resource list and the resource count. Advisories are deduplicated
+    in first-appearance order and echoed verbatim; the alert count is the
+    raw number of hits, neither deduplicated nor merged; the highest
+    severity follows the fixed case-insensitive order and is rendered
+    lowercase. Resources are deduplicated in registration order and the
+    count is the length of that list.
+
+    With ``name`` set, only alerts whose component name matches the value
+    byte-for-byte (case-sensitive, no trimming) participate; a filter that
+    matches nothing yields an empty array.
+    """
+
+    component_order: list[str] = []
+    advisory_lists: dict[str, list[str]] = {}
+    advisory_seen: dict[str, set[str]] = {}
+    resource_lists: dict[str, list[str]] = {}
+    resource_seen: dict[str, set[str]] = {}
+    counts: dict[str, int] = {}
+    severities: dict[str, list[str]] = {}
+
+    for resource in resources.list_all():
+        for alert in vulnerabilities.list_for(resource.id):
+            if name is not None and alert.component != name:
+                continue
+            component = alert.component
+            if component not in counts:
+                component_order.append(component)
+                advisory_lists[component] = []
+                advisory_seen[component] = set()
+                resource_lists[component] = []
+                resource_seen[component] = set()
+                counts[component] = 0
+                severities[component] = []
+            if alert.advisory not in advisory_seen[component]:
+                advisory_seen[component].add(alert.advisory)
+                advisory_lists[component].append(alert.advisory)
+            if resource.id not in resource_seen[component]:
+                resource_seen[component].add(resource.id)
+                resource_lists[component].append(resource.id)
+            counts[component] += 1
+            severities[component].append(alert.severity)
+
+    return [
+        {
+            "name": component,
+            "advisories": advisory_lists[component],
+            "advisory_count": counts[component],
+            "max_severity": max_severity(severities[component]),
+            "resources": resource_lists[component],
+            "resource_count": len(resource_lists[component]),
+        }
+        for component in component_order
+    ]
+
+
 def advisory_detail(
     resources: ResourceStore,
     vulnerabilities: VulnerabilityStore,

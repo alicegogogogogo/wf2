@@ -12,7 +12,12 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl
 
-from .advisories import advisory_detail, advisory_fixes, summarize_advisories
+from .advisories import (
+    advisory_detail,
+    advisory_fixes,
+    summarize_advisories,
+    summarize_alert_components,
+)
 from .cache import CacheError, LayerCacheStore
 from .component_fixes import recommended_fix_version
 from .content import ContentError, ContentStore, SessionStatus
@@ -7403,6 +7408,86 @@ def _handle_advisory_fixes(
     )
 
 
+def _parse_alert_components_query(
+    query_string: str,
+) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``name`` query parameter.
+
+    Returns ``(name, None)`` -- with ``None`` when the parameter is
+    absent -- or ``(None, message)`` for an unknown parameter, a repeated
+    ``name`` or an empty value (a bare ``name`` carries an empty value).
+    The name is matched verbatim against component names: case-sensitive,
+    no trimming.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    name: str | None = None
+    for key, value in pairs:
+        if key != "name":
+            return None, f"Unknown query parameter: {key!r}."
+        if name is not None:
+            return None, "Query parameter 'name' must not be repeated."
+        if value == "":
+            return None, "Component name must not be empty."
+        name = value
+    return name, None
+
+
+def _handle_alert_components(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The view is read-only: a declared non-empty (or malformed) body is a
+    # bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``name`` filter is accepted; unknown or repeated
+    # parameters (including a bare or empty ``name``) are rejected before
+    # any data is read.
+    name, query_error = _parse_alert_components_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the alert records alone: resources are
+    # visited in registration order and each resource's alerts in
+    # submission order, so a component name's first matching alert fixes
+    # the entry order. Each name yields one record with the name echoed
+    # verbatim first, followed by the advisory list, the raw alert count,
+    # the highest severity, the resource list and the resource count in
+    # that fixed key order. The SBOM inventory is never consulted. Nothing
+    # is recorded and no state is touched.
+    components = summarize_alert_components(
+        store, vulnerability_store, name
+    )
+    return _json_response(
+        start_response,
+        "200 OK",
+        components,
+        trailing_newline=True,
+    )
+
+
 def application(
     environ: dict[str, Any], start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -7550,6 +7635,14 @@ def application(
             # the handler answers the 405 (Allow: GET) for every other
             # method.
             return _handle_component_usage(
+                method, environ, start_response
+            )
+
+        if path == "/alert-components":
+            # Global alert usage summary aggregated by the component names
+            # carried on alert records; the handler answers the 405
+            # (Allow: GET) for every other method.
+            return _handle_alert_components(
                 method, environ, start_response
             )
 
