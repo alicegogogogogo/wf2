@@ -594,3 +594,58 @@ class ResourceStore:
             "in_degree": ranking(in_degree),
             "max_depth": max_depth,
         }
+
+    def dependency_closure_summary(self) -> list[dict[str, object]]:
+        """Summarize dependency closure size per registered resource.
+
+        One entry per resource, in registration order, each with the fixed
+        key order ``id``, ``direct_count``, ``closure_count`` and
+        ``max_chain``. ``direct_count`` counts the resource's own outbound
+        edges (manual and cross-reference-resolved edges alike);
+        ``closure_count`` is the deduplicated reachable dependency count
+        excluding the resource itself (zero for an empty closure);
+        ``max_chain`` is the longest outgoing path counted in nodes and
+        including the start resource, so a resource without dependencies
+        scores one. Everything is derived on the fly.
+        """
+
+        ids = [resource.id for resource in self._resources]
+
+        # The graph is a DAG (cycles are rejected at registration time), so
+        # the longest chain is the maximum successor-path depth. The
+        # iterative postorder walk avoids any recursion limit on long
+        # chains; ``depth`` counts nodes, so a resource without
+        # dependencies scores one.
+        depth: dict[str, int] = {}
+        for root in ids:
+            stack: list[tuple[str, bool]] = [(root, False)]
+            while stack:
+                node, expanded = stack.pop()
+                if node in depth:
+                    continue
+                successors = self._dependencies.get(node, ())
+                if not expanded:
+                    stack.append((node, True))
+                    for successor in successors:
+                        if successor not in depth:
+                            stack.append((successor, False))
+                    continue
+                depth[node] = (
+                    1
+                    if not successors
+                    else 1 + max(depth[successor] for successor in successors)
+                )
+
+        return [
+            {
+                "id": resource_id,
+                "direct_count": len(
+                    self._dependencies.get(resource_id, ())
+                ),
+                "closure_count": len(
+                    self._reachable(resource_id, self._dependencies)
+                ),
+                "max_chain": depth[resource_id],
+            }
+            for resource_id in ids
+        ]
