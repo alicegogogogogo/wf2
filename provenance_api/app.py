@@ -5488,6 +5488,100 @@ def _handle_fix_coverage_progress(
     )
 
 
+def _handle_severity_coverage(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The view is read-only: a declared non-empty (or malformed) body is a
+    # bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No filtering or pagination parameters whatsoever are accepted; a
+    # repeated parameter is rejected just like any other parameter.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the alert records alone -- the SBOM is never
+    # consulted. Resources are visited in registration order and each
+    # resource's alerts in submission order, so a severity takes the
+    # position of its earliest alert in that traversal; severities are
+    # stored and rendered in lowercase at registration and are grouped on
+    # that verbatim value. The two counts are tallied alert by alert,
+    # neither deduplicated nor merged, so they always sum to the raw number
+    # of alerts. Advisories keep first-occurrence order with duplicates
+    # removed and values echoed verbatim -- no case folding. Resources are
+    # deduplicated in registration order, so a resource with several alerts
+    # at the same level counts once. Nothing is recorded and no state is
+    # touched, so alert changes and resource deregistration show up on the
+    # next request with no stale residue.
+    order: list[str] = []
+    fixed_counts: dict[str, int] = {}
+    unfixed_counts: dict[str, int] = {}
+    advisories_by_severity: dict[str, list[str]] = {}
+    seen_advisories: dict[str, set[str]] = {}
+    resources_by_severity: dict[str, list[str]] = {}
+    seen_resources: dict[str, set[str]] = {}
+
+    for resource in store.list_all():
+        for alert in vulnerability_store.list_for(resource.id):
+            severity = alert.severity
+            if severity not in fixed_counts:
+                order.append(severity)
+                fixed_counts[severity] = 0
+                unfixed_counts[severity] = 0
+                advisories_by_severity[severity] = []
+                seen_advisories[severity] = set()
+                resources_by_severity[severity] = []
+                seen_resources[severity] = set()
+            if alert.fixed_version is not None:
+                fixed_counts[severity] += 1
+            else:
+                unfixed_counts[severity] += 1
+            if alert.advisory not in seen_advisories[severity]:
+                seen_advisories[severity].add(alert.advisory)
+                advisories_by_severity[severity].append(alert.advisory)
+            if resource.id not in seen_resources[severity]:
+                seen_resources[severity].add(resource.id)
+                resources_by_severity[severity].append(resource.id)
+
+    coverage = [
+        {
+            "severity": severity,
+            "alert_count": fixed_counts[severity] + unfixed_counts[severity],
+            "fixed_count": fixed_counts[severity],
+            "unfixed_count": unfixed_counts[severity],
+            "advisories": advisories_by_severity[severity],
+            "resources": resources_by_severity[severity],
+            "resource_count": len(resources_by_severity[severity]),
+        }
+        for severity in order
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        coverage,
+        trailing_newline=True,
+    )
+
+
 def _handle_notifications_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -7887,6 +7981,14 @@ def application(
             # Global per-resource fix coverage progress summary; the handler
             # answers the 405 (Allow: GET) for every other method.
             return _handle_fix_coverage_progress(
+                method, environ, start_response
+            )
+
+        if path == "/severity-coverage":
+            # Global fix coverage summary aggregated by alert severity
+            # level; the handler answers the 405 (Allow: GET) for every
+            # other method.
+            return _handle_severity_coverage(
                 method, environ, start_response
             )
 
