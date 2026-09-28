@@ -5291,6 +5291,129 @@ def _handle_alert_components(
     )
 
 
+def _parse_fix_coverage_query(
+    query_string: str,
+) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``name`` query parameter.
+
+    Returns ``(name, None)`` -- with ``None`` when the parameter is
+    absent -- or ``(None, message)`` for an unknown parameter, a repeated
+    ``name`` or an empty value. The name is matched verbatim against
+    alert component names: case-sensitive, no trimming.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    name: str | None = None
+    for key, value in pairs:
+        if key != "name":
+            return None, f"Unknown query parameter: {key!r}."
+        if name is not None:
+            return None, "Query parameter 'name' must not be repeated."
+        if value == "":
+            return None, "Component name must not be empty."
+        name = value
+    return name, None
+
+
+def _handle_fix_coverage(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The view is read-only: a declared non-empty (or malformed) body is a
+    # bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``name`` filter is accepted; unknown or repeated
+    # parameters and an empty value are rejected before any data is read.
+    name, query_error = _parse_fix_coverage_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the alert records alone -- the SBOM is never
+    # consulted. Resources are visited in registration order and each
+    # resource's alerts in submission order, so a component name takes the
+    # position of its earliest alert in that traversal; a ``name`` filter
+    # only skips non-matching alerts and never moves a surviving entry.
+    # Fixed versions are collected verbatim -- no dotted comparison, case
+    # folding or whitespace trimming, and no sorting -- with first-occurring
+    # duplicates removed. The two counts are tallied alert by alert, neither
+    # deduplicated nor merged, so they always sum to the raw number of hits.
+    # The advisory list keeps first-occurrence order with duplicates removed
+    # and values echoed verbatim. Nothing is recorded and no state is
+    # touched, so alert changes and resource deregistration show up on the
+    # next request with no stale residue.
+    order: list[str] = []
+    fixed_versions_by_component: dict[str, list[str]] = {}
+    seen_fixed_versions: dict[str, set[str]] = {}
+    fixed_counts: dict[str, int] = {}
+    unfixed_counts: dict[str, int] = {}
+    advisories_by_component: dict[str, list[str]] = {}
+    seen_advisories: dict[str, set[str]] = {}
+
+    for resource in store.list_all():
+        for alert in vulnerability_store.list_for(resource.id):
+            if name is not None and alert.component != name:
+                continue
+            component = alert.component
+            if component not in fixed_counts:
+                order.append(component)
+                fixed_versions_by_component[component] = []
+                seen_fixed_versions[component] = set()
+                fixed_counts[component] = 0
+                unfixed_counts[component] = 0
+                advisories_by_component[component] = []
+                seen_advisories[component] = set()
+            if alert.fixed_version is not None:
+                version = alert.fixed_version
+                if version not in seen_fixed_versions[component]:
+                    seen_fixed_versions[component].add(version)
+                    fixed_versions_by_component[component].append(version)
+                fixed_counts[component] += 1
+            else:
+                unfixed_counts[component] += 1
+            if alert.advisory not in seen_advisories[component]:
+                seen_advisories[component].add(alert.advisory)
+                advisories_by_component[component].append(alert.advisory)
+
+    coverage = [
+        {
+            "name": component,
+            "fixed_versions": fixed_versions_by_component[component],
+            "fixed_count": fixed_counts[component],
+            "unfixed_count": unfixed_counts[component],
+            "advisories": advisories_by_component[component],
+        }
+        for component in order
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        coverage,
+        trailing_newline=True,
+    )
+
+
 def _handle_notifications_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -7679,6 +7802,12 @@ def application(
             return _handle_alert_components(
                 method, environ, start_response
             )
+
+        if path == "/fix-coverage":
+            # Global per-component fix coverage summary aggregated by alert
+            # component name; the handler answers the 405 (Allow: GET) for
+            # every other method.
+            return _handle_fix_coverage(method, environ, start_response)
 
         if path.startswith("/advisories/"):
             # The identifier segment is validated by the handler; an
