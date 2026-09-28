@@ -4965,6 +4965,102 @@ def _handle_component_inventory(
     )
 
 
+def _parse_component_licenses_query(
+    query_string: str,
+) -> tuple[str | None, str | None]:
+    """Parse the optional, single ``name`` query parameter.
+
+    Returns ``(name, None)`` -- with ``None`` when the parameter is
+    absent -- or ``(None, message)`` for an unknown parameter, a repeated
+    ``name`` or an empty value. The name is matched verbatim against
+    component names: case-sensitive, no trimming.
+    """
+
+    pairs = parse_qsl(
+        query_string, keep_blank_values=True, strict_parsing=False
+    )
+    name: str | None = None
+    for key, value in pairs:
+        if key != "name":
+            return None, f"Unknown query parameter: {key!r}."
+        if name is not None:
+            return None, "Query parameter 'name' must not be repeated."
+        if value == "":
+            return None, "Component name must not be empty."
+        name = value
+    return name, None
+
+
+def _handle_component_licenses(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The summary is read-only: a declared non-empty (or malformed) body is
+    # a bad request without consulting any business data. An omitted header
+    # and an explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # Only the optional ``name`` filter is accepted; unknown or repeated
+    # parameters and an empty value are rejected before any data is read.
+    name, query_error = _parse_component_licenses_query(
+        str(environ.get("QUERY_STRING", ""))
+    )
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current stores: entries unfold in
+    # resource registration order, and within one resource the components
+    # keep their SBOM submission order. Resources without an SBOM document
+    # are skipped silently, and a document with an empty component list
+    # contributes no entries. Each record puts the owning resource id
+    # first, followed by the component name and version echoed verbatim
+    # and the license declared for this resource echoed verbatim (null
+    # when no license is declared). Nothing is recorded and no state is
+    # touched.
+    entries: list[dict[str, object]] = []
+    for resource in store.list_all():
+        document = sbom_store.get_sbom(resource.id)
+        if document is None:
+            continue
+        license_record = sbom_store.get_license(resource.id)
+        license_value = (
+            license_record.spdx_id if license_record is not None else None
+        )
+        for component in document.components:
+            if name is not None and component.name != name:
+                continue
+            entries.append(
+                {
+                    "resource_id": resource.id,
+                    "name": component.name,
+                    "version": component.version,
+                    "license": license_value,
+                }
+            )
+    return _json_response(
+        start_response,
+        "200 OK",
+        entries,
+        trailing_newline=True,
+    )
+
+
 def _handle_notifications_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -7328,6 +7424,13 @@ def application(
             # Global component inventory summary; the handler answers the
             # 405 (Allow: GET) for every other method.
             return _handle_component_inventory(
+                method, environ, start_response
+            )
+
+        if path == "/component-licenses":
+            # Global component license summary; the handler answers the
+            # 405 (Allow: GET) for every other method.
+            return _handle_component_licenses(
                 method, environ, start_response
             )
 
