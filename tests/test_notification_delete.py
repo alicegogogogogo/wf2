@@ -484,25 +484,38 @@ class NotificationDeleteMethodTests(unittest.TestCase):
             self.resource_id, str(self.record["id"])
         )
 
-    def test_only_delete_is_allowed(self) -> None:
-        for method in ("GET", "POST", "PUT", "PATCH", "HEAD"):
+    def test_other_methods_are_405_with_allow_put(self) -> None:
+        for method in ("GET", "POST", "PATCH", "HEAD"):
             with self.subTest(method=method):
                 status, headers, body = call_json(method, self.item_path)
                 self.assertEqual(status, "405 Method Not Allowed", method)
                 allow = [value for key, value in headers if key == "Allow"]
-                self.assertEqual(allow, ["DELETE"])
+                self.assertEqual(allow, ["PUT"])
                 self.assertEqual(body["error"], "method_not_allowed")
 
-    def test_non_delete_with_query_still_returns_405(self) -> None:
+    def test_put_is_the_update_method_not_a_method_error(self) -> None:
+        # PUT replaces the record in place: with no body it is a bad
+        # request rather than a method error, and it never deletes.
+        status, _h, body = call_json("PUT", self.item_path)
+        self.assertEqual(status, "400 Bad Request")
+        self.assertEqual(body["error"], "invalid_request")
+        status, _h, listing = call_json(
+            "GET", f"/resources/{self.resource_id}/notifications"
+        )
+        self.assertEqual(
+            [n["id"] for n in listing["notifications"]], [self.record["id"]]
+        )
+
+    def test_non_allowed_method_with_query_still_returns_405(self) -> None:
         # Method is decided before the request shape is examined.
         status, headers, body = call_json(
             "GET", self.item_path, query_string="x=1"
         )
         self.assertEqual(status, "405 Method Not Allowed")
-        self.assertIn(("Allow", "DELETE"), headers)
+        self.assertIn(("Allow", "PUT"), headers)
         self.assertEqual(body["error"], "method_not_allowed")
 
-    def test_non_delete_does_not_delete(self) -> None:
+    def test_non_allowed_method_does_not_delete(self) -> None:
         status, _h, _b = call_json("POST", self.item_path)
         self.assertEqual(status, "405 Method Not Allowed")
         status, _h, listing = call_json(

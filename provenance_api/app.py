@@ -6502,6 +6502,74 @@ def _handle_notifications(
     )
 
 
+def _handle_notification_item_put(
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_notification_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    raw = _read_body(environ)
+    if not raw:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body is empty.",
+        )
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Request body must be valid UTF-8 JSON.",
+        )
+
+    # Validate the whole body before touching any store, so a bad request
+    # can never leave a partial update and always answers 400 (even for a
+    # resource or notification that does not exist).
+    try:
+        build_notification_fields(payload)
+    except NotificationValidationError as exc:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            exc.message,
+        )
+
+    # The owning resource is looked up before the notification, so a missing
+    # resource is reported as resource_not_found even when the notification
+    # is absent as well.
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    record = notification_store.update(raw_id, raw_notification_id, payload)
+    if record is None:
+        # A notification that never existed, one owned by another resource
+        # and one already deleted answer alike, and no existing record is
+        # disturbed.
+        return _error(
+            start_response,
+            "404 Not Found",
+            "notification_not_found",
+            "No notification exists with the requested id.",
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        record.to_dict(),
+        trailing_newline=True,
+    )
+
+
 def _handle_notification_item(
     method: str,
     environ: dict[str, Any],
@@ -6509,27 +6577,31 @@ def _handle_notification_item(
     raw_notification_id: str,
     start_response: StartResponse,
 ) -> Iterable[bytes]:
-    """Delete one notification at ``/resources/{id}/notifications/{nid}``.
+    """Delete or replace one notification at the notification item path.
 
-    Only DELETE is accepted and the request carries no query parameters
-    and no body; an omitted Content-Length and an explicit zero length
-    are both treated as an empty body. The notification id is
-    percent-decoded as a path segment and matched verbatim. Lookup is
+    DELETE removes the record and carries no query parameters or body; an
+    omitted Content-Length and an explicit zero length are both treated as
+    an empty body. PUT replaces the record in place with a complete JSON
+    object carrying the same three required fields as a registration; the
+    notification id and the record's submission position are unchanged, and
+    resubmitting identical content answers 200 without producing a new
+    record. Neither method accepts query parameters. The notification id
+    is percent-decoded as a path segment and matched verbatim. Lookup is
     scoped to the owning resource, so an id that is unknown, belongs to
     another resource or was already deleted answers 404
-    ``notification_not_found`` alike and leaves every record untouched.
-    On success the removed record is echoed with the same fixed key
-    order as a registration response and every notification query and
-    usage view is recomputed from the remaining records.
+    ``notification_not_found`` alike and leaves every record untouched. On
+    success the record is echoed with the same fixed key order as a
+    registration response and every notification query and usage view is
+    recomputed from the current records.
     """
 
-    if method != "DELETE":
+    if method not in ("DELETE", "PUT"):
         return _error(
             start_response,
             "405 Method Not Allowed",
             "method_not_allowed",
             f"Method {method} is not allowed for this path.",
-            allowed="DELETE",
+            allowed="PUT",
         )
 
     id_error = _validate_path_id(raw_id)
@@ -6553,6 +6625,12 @@ def _handle_notification_item(
         return _error(
             start_response, "400 Bad Request", "invalid_request", query_error
         )
+
+    if method == "PUT":
+        return _handle_notification_item_put(
+            environ, raw_id, notification_id, start_response
+        )
+
     # A declared non-empty (or malformed) body is a bad request; an omitted
     # Content-Length and an explicit zero length are accepted as empty.
     body_error = _bodyless_request_error(environ)

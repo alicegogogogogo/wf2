@@ -2,11 +2,12 @@
 
 A notification record pairs a channel with a target and a message. Every
 submission creates an independent record: records are never deduplicated
-or updated and are kept per resource in submission order. A single
-record can be removed explicitly through its notification id; otherwise
-a record only disappears when its resource is deregistered. Nothing
-here is persisted: stopping or restarting the service clears every
-notification, and no files are written.
+and are kept per resource in submission order. A single record can be
+replaced in place through its notification id, keeping the id and its
+submission position, or removed explicitly through the same id;
+otherwise a record only disappears when its resource is deregistered.
+Nothing here is persisted: stopping or restarting the service clears
+every notification, and no files are written.
 """
 
 from __future__ import annotations
@@ -141,6 +142,48 @@ class NotificationStore:
         """Return a resource's notifications in submission order."""
 
         return list(self._records.get(resource_id, ()))
+
+    def update(
+        self, resource_id: str, notification_id: str, payload: object
+    ) -> Notification | None:
+        """Replace one notification of ``resource_id`` in place.
+
+        The payload has the same shape and validation rules as a
+        registration. Lookup is scoped to ``resource_id``: an id that is
+        unknown, belongs to another resource or was already removed answers
+        ``None`` and leaves every stored notification untouched. On success
+        the record keeps the same id and its position in the resource's
+        submission order; only channel, target and message can change, so
+        resubmitting identical content answers 200 without producing a new
+        record. Every derived view is recomputed on its next call from the
+        updated records, so a changed channel or target regroups the record
+        immediately.
+        """
+
+        channel, target, message = build_notification_fields(payload)
+
+        records = self._records.get(resource_id)
+        if records is None:
+            return None
+        index = next(
+            (
+                position
+                for position, record in enumerate(records)
+                if record.id == notification_id
+            ),
+            None,
+        )
+        if index is None:
+            return None
+
+        updated = Notification(
+            id=notification_id,
+            channel=channel,
+            target=target,
+            message=message,
+        )
+        records[index] = updated
+        return updated
 
     def remove_one(
         self, resource_id: str, notification_id: str
