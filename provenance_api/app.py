@@ -6583,6 +6583,108 @@ def _handle_notifications_summary(
     )
 
 
+def _handle_notification_usage(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Global channel-grouped notification usage at ``GET /notification-usage``.
+
+    All in-process notifications are grouped by channel, one entry per
+    channel ordered by the channel's first appearance in a traversal over
+    resource registration order and notification submission order
+    within each resource. Each entry carries the six fixed keys
+    ``channel``, ``notifications``, ``notification_count``, ``targets``,
+    ``resources`` and ``resource_count`` in that order. The channel and
+    targets are echoed verbatim: no case folding and no whitespace
+    trimming, so channels or targets differing only by case or
+    surrounding whitespace stay separate. Notification records are
+    listed and counted individually without deduplication, targets are
+    deduplicated by first appearance, and resource ids are deduplicated
+    in resource registration order. Computed on the fly from the current
+    stores and recorded nowhere; notification registration, per-resource
+    queries and the global summary keep their existing behavior.
+    """
+
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The usage view is read-only: a declared non-empty (or malformed) body
+    # is a bad request without consulting any business data. An omitted
+    # header and an explicit zero length count as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No parameters whatsoever are accepted; no filtering is offered.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current stores: resources are visited in
+    # registration order, each resource's records in submission order, and
+    # the channel entries unfold in first-appearance order without ever
+    # being sorted. Resources without notifications contribute nothing.
+    # Nothing is recorded and no state is touched.
+    channel_order: list[str] = []
+    notification_ids_by_channel: dict[str, list[str]] = {}
+    targets_by_channel: dict[str, list[str]] = {}
+    seen_targets: dict[str, set[str]] = {}
+    resources_by_channel: dict[str, list[str]] = {}
+    seen_resources: dict[str, set[str]] = {}
+
+    for resource in store.list_all():
+        for record in notification_store.list_for(resource.id):
+            channel = record.channel
+            if channel not in notification_ids_by_channel:
+                channel_order.append(channel)
+                notification_ids_by_channel[channel] = []
+                targets_by_channel[channel] = []
+                seen_targets[channel] = set()
+                resources_by_channel[channel] = []
+                seen_resources[channel] = set()
+            # Every notification is an independent record: ids and counts
+            # are never deduplicated or merged.
+            notification_ids_by_channel[channel].append(record.id)
+            # Targets are deduplicated verbatim: case and surrounding
+            # whitespace are significant.
+            if record.target not in seen_targets[channel]:
+                seen_targets[channel].add(record.target)
+                targets_by_channel[channel].append(record.target)
+            # Resource ids keep resource registration order, each once.
+            if resource.id not in seen_resources[channel]:
+                seen_resources[channel].add(resource.id)
+                resources_by_channel[channel].append(resource.id)
+
+    results = [
+        {
+            "channel": channel,
+            "notifications": notification_ids_by_channel[channel],
+            "notification_count": len(notification_ids_by_channel[channel]),
+            "targets": targets_by_channel[channel],
+            "resources": resources_by_channel[channel],
+            "resource_count": len(resources_by_channel[channel]),
+        }
+        for channel in channel_order
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        results,
+        trailing_newline=True,
+    )
+
+
 def _handle_cache_layer_post(
     environ: dict[str, Any], raw_digest: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -9108,6 +9210,13 @@ def application(
             # Global notification summary; the handler answers the 405
             # (Allow: GET) for every other method.
             return _handle_notifications_summary(
+                method, environ, start_response
+            )
+
+        if path == "/notification-usage":
+            # Global channel-grouped notification usage view; the handler
+            # answers the 405 (Allow: GET) for every other method.
+            return _handle_notification_usage(
                 method, environ, start_response
             )
 
