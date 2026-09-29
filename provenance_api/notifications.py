@@ -205,3 +205,69 @@ class NotificationStore:
             }
             for channel in order
         ]
+
+    def usage_by_target(
+        self, resource_ids: list[str]
+    ) -> list[dict[str, object]]:
+        """Summarize all notifications grouped by their target.
+
+        The resources are walked in resource registration order and the
+        notifications of each resource in their submission order, so a
+        target entry is opened by the first notification encountered for
+        it and the entries unfold by that first appearance; the groups are
+        never reordered. The order is redetermined from the remaining
+        records on every call, so deregistering a resource (which takes
+        its notifications with it) lets each surviving entry take the
+        position of its earliest surviving notification rather than
+        keeping a stale slot, and a target whose last notification
+        disappears is omitted altogether. Each entry carries the six
+        fixed keys ``target``, ``notifications``, ``notification_count``,
+        ``channels``, ``resources`` and ``resource_count`` in that order.
+        The target is echoed verbatim: no case folding and no whitespace
+        trimming, so values that differ only in case or surrounding
+        whitespace stay separate groups. ``notifications`` lists the
+        notification ids in traversal order with no deduplication or
+        merging, and ``notification_count`` counts them one by one.
+        ``channels`` lists the channels deduplicated by first appearance
+        and echoed verbatim. ``resources`` lists the owning resource ids
+        deduplicated in resource registration order, each once, and
+        ``resource_count`` is that list's length. Everything is derived
+        on the fly from the current records.
+        """
+
+        order: list[str] = []
+        notifications: dict[str, list[str]] = {}
+        channels: dict[str, list[str]] = {}
+        seen_channels: dict[str, set[str]] = {}
+        resources: dict[str, list[str]] = {}
+        seen_resources: dict[str, set[str]] = {}
+
+        for resource_id in resource_ids:
+            for record in self._records.get(resource_id, ()):
+                target = record.target
+                if target not in notifications:
+                    order.append(target)
+                    notifications[target] = []
+                    channels[target] = []
+                    seen_channels[target] = set()
+                    resources[target] = []
+                    seen_resources[target] = set()
+                notifications[target].append(record.id)
+                if record.channel not in seen_channels[target]:
+                    seen_channels[target].add(record.channel)
+                    channels[target].append(record.channel)
+                if resource_id not in seen_resources[target]:
+                    seen_resources[target].add(resource_id)
+                    resources[target].append(resource_id)
+
+        return [
+            {
+                "target": target,
+                "notifications": notifications[target],
+                "notification_count": len(notifications[target]),
+                "channels": channels[target],
+                "resources": resources[target],
+                "resource_count": len(resources[target]),
+            }
+            for target in order
+        ]
