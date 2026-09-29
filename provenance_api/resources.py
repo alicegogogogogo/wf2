@@ -935,7 +935,6 @@ class ResourceStore:
 
         order: list[str] = []
         resources_by_digest: dict[str, list[str]] = {}
-        seen_resources: dict[str, set[str]] = {}
         names_by_digest: dict[str, list[str]] = {}
         seen_names: dict[str, set[str]] = {}
 
@@ -944,12 +943,11 @@ class ResourceStore:
             if digest not in resources_by_digest:
                 order.append(digest)
                 resources_by_digest[digest] = []
-                seen_resources[digest] = set()
                 names_by_digest[digest] = []
                 seen_names[digest] = set()
-            if resource.id not in seen_resources[digest]:
-                seen_resources[digest].add(resource.id)
-                resources_by_digest[digest].append(resource.id)
+            # Every registry record is visited exactly once, so the unique
+            # resource id needs no further deduplication.
+            resources_by_digest[digest].append(resource.id)
             # Names are deduplicated verbatim: case and surrounding
             # whitespace are significant.
             if resource.name not in seen_names[digest]:
@@ -998,7 +996,6 @@ class ResourceStore:
 
         order: list[str] = []
         resources_by_name: dict[str, list[str]] = {}
-        seen_resources: dict[str, set[str]] = {}
         digests_by_name: dict[str, list[str]] = {}
         seen_digests: dict[str, set[str]] = {}
         categories_by_name: dict[str, list[str]] = {}
@@ -1009,14 +1006,13 @@ class ResourceStore:
             if name not in resources_by_name:
                 order.append(name)
                 resources_by_name[name] = []
-                seen_resources[name] = set()
                 digests_by_name[name] = []
                 seen_digests[name] = set()
                 categories_by_name[name] = []
                 seen_categories[name] = set()
-            if resource.id not in seen_resources[name]:
-                seen_resources[name].add(resource.id)
-                resources_by_name[name].append(resource.id)
+            # Every registry record is visited exactly once, so the unique
+            # resource id needs no further deduplication.
+            resources_by_name[name].append(resource.id)
             # Digests are stored in their canonical lowercase form.
             if resource.digest not in seen_digests[name]:
                 seen_digests[name].add(resource.digest)
@@ -1068,7 +1064,6 @@ class ResourceStore:
 
         order: list[str | None] = []
         resources_by_source: dict[str | None, list[str]] = {}
-        seen_resources: dict[str | None, set[str]] = {}
         names_by_source: dict[str | None, list[str]] = {}
         seen_names: dict[str | None, set[str]] = {}
         categories_by_source: dict[str | None, list[str]] = {}
@@ -1079,14 +1074,13 @@ class ResourceStore:
             if source not in resources_by_source:
                 order.append(source)
                 resources_by_source[source] = []
-                seen_resources[source] = set()
                 names_by_source[source] = []
                 seen_names[source] = set()
                 categories_by_source[source] = []
                 seen_categories[source] = set()
-            if resource.id not in seen_resources[source]:
-                seen_resources[source].add(resource.id)
-                resources_by_source[source].append(resource.id)
+            # Every registry record is visited exactly once, so the unique
+            # resource id needs no further deduplication.
+            resources_by_source[source].append(resource.id)
             # Names are deduplicated verbatim: case and surrounding
             # whitespace are significant.
             if resource.name not in seen_names[source]:
@@ -1106,4 +1100,73 @@ class ResourceStore:
                 "categories": categories_by_source[source],
             }
             for source in order
+        ]
+
+    # --- Category usage ------------------------------------------------------
+
+    def category_usage(self) -> list[dict[str, object]]:
+        """Group the registered resources by their normalized category.
+
+        One entry per category, ordered by the category's first appearance
+        in resource registration order; the groups themselves are never
+        reordered. The order is redetermined from the remaining resources
+        on every call, so after a deregistration each surviving entry --
+        including the one immediately following the deleted first
+        occurrence -- takes the position of its earliest surviving
+        resource rather than keeping a stale slot, and a category whose
+        last resource is removed disappears altogether. Each entry
+        carries the five fixed keys ``category``, ``resources``,
+        ``resource_count``, ``names`` and ``digests`` in that order. The
+        category is listed in the stored normalized lowercase form.
+        ``resources`` lists the ids of the resources in that category in
+        resource registration order, each one once, and
+        ``resource_count`` is that list's length. ``names`` collects
+        those resources' names, deduplicated in resource registration
+        order and echoed verbatim: no case folding and no whitespace
+        trimming, so names differing only by case or surrounding
+        whitespace stay separate entries. ``digests`` collects their
+        normalized digests likewise: deduplicated by first appearance in
+        resource registration order and listed in the stored lowercase
+        form. Everything is derived on the fly from the current
+        registry.
+        """
+
+        order: list[str] = []
+        resources_by_category: dict[str, list[str]] = {}
+        names_by_category: dict[str, list[str]] = {}
+        seen_names: dict[str, set[str]] = {}
+        digests_by_category: dict[str, list[str]] = {}
+        seen_digests: dict[str, set[str]] = {}
+
+        for resource in self._resources:
+            category = resource.category
+            if category not in resources_by_category:
+                order.append(category)
+                resources_by_category[category] = []
+                names_by_category[category] = []
+                seen_names[category] = set()
+                digests_by_category[category] = []
+                seen_digests[category] = set()
+            # Every registry record is visited exactly once, so the unique
+            # resource id needs no further deduplication.
+            resources_by_category[category].append(resource.id)
+            # Names are deduplicated verbatim: case and surrounding
+            # whitespace are significant.
+            if resource.name not in seen_names[category]:
+                seen_names[category].add(resource.name)
+                names_by_category[category].append(resource.name)
+            # Digests are stored in their canonical lowercase form.
+            if resource.digest not in seen_digests[category]:
+                seen_digests[category].add(resource.digest)
+                digests_by_category[category].append(resource.digest)
+
+        return [
+            {
+                "category": category,
+                "resources": resources_by_category[category],
+                "resource_count": len(resources_by_category[category]),
+                "names": names_by_category[category],
+                "digests": digests_by_category[category],
+            }
+            for category in order
         ]
