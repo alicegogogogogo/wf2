@@ -1764,6 +1764,65 @@ def _handle_source_usage(
     )
 
 
+def _handle_state_usage(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Global lifecycle-state-grouped resource usage view at ``GET /state-usage``.
+
+    The current resources are grouped by their current lifecycle state
+    (the fixed four states), one entry per state ordered by its first
+    appearance in resource registration order (redetermined from the
+    remaining resources after every lifecycle submission, registration
+    or deregistration). A resource that never left the default state is
+    grouped under ``staged`` without materializing a lifecycle record.
+    Each entry carries the five fixed keys ``state``, ``resources``,
+    ``resource_count``, ``names`` and ``digests``: the lowercase state
+    echoed verbatim, the resource ids in registration order each once,
+    that list's length, the resources' names deduplicated in
+    registration order and echoed verbatim, and their normalized
+    lowercase digests deduplicated by first appearance. Computed on the
+    fly from the remaining registry and recorded nowhere; lifecycle
+    reads and submissions and the name, digest, source and category
+    usage views keep their existing behavior.
+    """
+
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The usage view is read-only: a declared non-empty (or malformed) body
+    # is a bad request without consulting any business data. An omitted
+    # header and an explicit zero length count as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current registry and lifecycle records;
+    # nothing is recorded or cached.
+    return _json_response(
+        start_response,
+        "200 OK",
+        lifecycle_store.state_usage(store.list_all()),
+        trailing_newline=True,
+    )
+
+
 def _parse_graph_path_query(
     query_string: str,
 ) -> tuple[str | None, str | None, str | None]:
@@ -8856,6 +8915,12 @@ def application(
             # the handler answers the 405 (Allow: GET) for every other
             # method.
             return _handle_source_usage(method, environ, start_response)
+
+        if path == "/state-usage":
+            # Global resource usage view grouped by current lifecycle
+            # state; the handler answers the 405 (Allow: GET) for every
+            # other method.
+            return _handle_state_usage(method, environ, start_response)
 
         if path == "/graph/path/all":
             return _handle_graph_path_all(method, environ, start_response)
