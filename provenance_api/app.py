@@ -6641,6 +6641,64 @@ def _handle_notification_usage(
     )
 
 
+def _handle_notification_targets(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Per-target notification usage view at ``GET /notification-targets``.
+
+    The current notifications are grouped by their target, one entry per
+    target ordered by its first appearance while resources are walked in
+    registration order and each resource's notifications in submission
+    order (redetermined from the remaining records after any
+    deregistration). Each entry carries the six fixed keys ``target``,
+    ``notifications``, ``notification_count``, ``channels``,
+    ``resources`` and ``resource_count``: the target echoed verbatim, the
+    notification ids in traversal order, that list's length, the channels
+    deduplicated by first appearance, and the owning resources
+    deduplicated in resource registration order with its count. Computed
+    on the fly from the remaining records and recorded nowhere;
+    notification registration and querying, the global summary and the
+    per-channel usage view keep their existing behavior.
+    """
+
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # Read-only: a declared non-empty (or malformed) body is a bad request
+    # without consulting any business data. An omitted header and an
+    # explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    usage = notification_store.usage_by_target(
+        [resource.id for resource in store.list_all()]
+    )
+    return _json_response(
+        start_response,
+        "200 OK",
+        usage,
+        trailing_newline=True,
+    )
+
+
 def _handle_cache_layer_post(
     environ: dict[str, Any], raw_digest: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -9173,6 +9231,13 @@ def application(
             # Global notification usage grouped by channel; the handler
             # answers the 405 (Allow: GET) for every other method.
             return _handle_notification_usage(
+                method, environ, start_response
+            )
+
+        if path == "/notification-targets":
+            # Global notification usage grouped by target; the handler
+            # answers the 405 (Allow: GET) for every other method.
+            return _handle_notification_targets(
                 method, environ, start_response
             )
 
