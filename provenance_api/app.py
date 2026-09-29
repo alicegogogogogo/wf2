@@ -1589,6 +1589,65 @@ def _handle_digest_usage(
     )
 
 
+def _handle_name_usage(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Global name-grouped resource usage view at ``GET /name-usage``.
+
+    The current resources are grouped by their registration name, one
+    entry per name ordered by its first appearance in resource
+    registration order (redetermined from the remaining resources after
+    every registration or deregistration). The same name may be
+    registered repeatedly across categories and digests; all such
+    resources collapse into the one entry. Each entry carries the five
+    fixed keys ``name``, ``resources``, ``resource_count``, ``digests``
+    and ``categories``: the name echoed verbatim with no case folding
+    or whitespace trimming, the resource ids in registration order each
+    once, that list's length, the resources' normalized lowercase
+    digests deduplicated by first appearance, and their normalized
+    lowercase categories deduplicated in registration order. Computed
+    on the fly from the remaining registry and recorded nowhere;
+    resource registration, querying, pagination and content validation
+    keep their existing behavior.
+    """
+
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The usage view is read-only: a declared non-empty (or malformed) body
+    # is a bad request without consulting any business data. An omitted
+    # header and an explicit zero length count as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current registry; nothing is recorded
+    # or cached.
+    return _json_response(
+        start_response,
+        "200 OK",
+        store.name_usage(),
+        trailing_newline=True,
+    )
+
+
 def _parse_graph_path_query(
     query_string: str,
 ) -> tuple[str | None, str | None, str | None]:
@@ -8663,6 +8722,12 @@ def application(
             # the handler answers the 405 (Allow: GET) for every other
             # method.
             return _handle_digest_usage(method, environ, start_response)
+
+        if path == "/name-usage":
+            # Global resource usage view grouped by registration name;
+            # the handler answers the 405 (Allow: GET) for every other
+            # method.
+            return _handle_name_usage(method, environ, start_response)
 
         if path == "/graph/path/all":
             return _handle_graph_path_all(method, environ, start_response)

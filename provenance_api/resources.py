@@ -965,3 +965,74 @@ class ResourceStore:
             }
             for digest in order
         ]
+
+    # --- Name usage ----------------------------------------------------------
+
+    def name_usage(self) -> list[dict[str, object]]:
+        """Group the registered resources by their registration name.
+
+        One entry per name, ordered by the name's first appearance in
+        resource registration order; the groups themselves are never
+        reordered. The order is redetermined from the remaining resources
+        on every call, so after a deregistration each surviving entry --
+        including the one immediately following the deleted first
+        occurrence -- takes the position of its earliest surviving
+        resource rather than keeping a stale slot, and a name whose last
+        resource is removed disappears altogether. A name may be
+        registered repeatedly across categories and digests; all such
+        resources collapse into the one entry. Each entry carries the
+        five fixed keys ``name``, ``resources``, ``resource_count``,
+        ``digests`` and ``categories`` in that order. The name is echoed
+        verbatim: no case folding and no whitespace trimming, so names
+        differing only by case or surrounding whitespace stay separate
+        entries. ``resources`` lists the ids of the resources carrying
+        that name in resource registration order, each one once, and
+        ``resource_count`` is that list's length. ``digests`` collects
+        those resources' normalized digests, deduplicated by first
+        appearance in resource registration order and listed in the
+        stored lowercase form. ``categories`` collects the resources'
+        categories likewise: deduplicated in resource registration
+        order and listed in the stored lowercase form. Everything is
+        derived on the fly from the current registry.
+        """
+
+        order: list[str] = []
+        resources_by_name: dict[str, list[str]] = {}
+        seen_resources: dict[str, set[str]] = {}
+        digests_by_name: dict[str, list[str]] = {}
+        seen_digests: dict[str, set[str]] = {}
+        categories_by_name: dict[str, list[str]] = {}
+        seen_categories: dict[str, set[str]] = {}
+
+        for resource in self._resources:
+            name = resource.name
+            if name not in resources_by_name:
+                order.append(name)
+                resources_by_name[name] = []
+                seen_resources[name] = set()
+                digests_by_name[name] = []
+                seen_digests[name] = set()
+                categories_by_name[name] = []
+                seen_categories[name] = set()
+            if resource.id not in seen_resources[name]:
+                seen_resources[name].add(resource.id)
+                resources_by_name[name].append(resource.id)
+            # Digests are stored in their canonical lowercase form.
+            if resource.digest not in seen_digests[name]:
+                seen_digests[name].add(resource.digest)
+                digests_by_name[name].append(resource.digest)
+            # Categories are stored in their normalized lowercase form.
+            if resource.category not in seen_categories[name]:
+                seen_categories[name].add(resource.category)
+                categories_by_name[name].append(resource.category)
+
+        return [
+            {
+                "name": name,
+                "resources": resources_by_name[name],
+                "resource_count": len(resources_by_name[name]),
+                "digests": digests_by_name[name],
+                "categories": categories_by_name[name],
+            }
+            for name in order
+        ]
