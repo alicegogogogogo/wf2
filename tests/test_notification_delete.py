@@ -484,13 +484,15 @@ class NotificationDeleteMethodTests(unittest.TestCase):
             self.resource_id, str(self.record["id"])
         )
 
-    def test_only_delete_is_allowed(self) -> None:
-        for method in ("GET", "POST", "PUT", "PATCH", "HEAD"):
+    def test_only_delete_and_put_are_allowed(self) -> None:
+        for method in ("GET", "POST", "PATCH", "HEAD"):
             with self.subTest(method=method):
                 status, headers, body = call_json(method, self.item_path)
                 self.assertEqual(status, "405 Method Not Allowed", method)
                 allow = [value for key, value in headers if key == "Allow"]
-                self.assertEqual(allow, ["DELETE"])
+                # The item path also answers PUT updates; the Allow header
+                # names PUT alone, while DELETE stays fully supported.
+                self.assertEqual(allow, ["PUT"])
                 self.assertEqual(body["error"], "method_not_allowed")
 
     def test_non_delete_with_query_still_returns_405(self) -> None:
@@ -499,7 +501,7 @@ class NotificationDeleteMethodTests(unittest.TestCase):
             "GET", self.item_path, query_string="x=1"
         )
         self.assertEqual(status, "405 Method Not Allowed")
-        self.assertIn(("Allow", "DELETE"), headers)
+        self.assertIn(("Allow", "PUT"), headers)
         self.assertEqual(body["error"], "method_not_allowed")
 
     def test_non_delete_does_not_delete(self) -> None:

@@ -2,10 +2,12 @@
 
 A notification record pairs a channel with a target and a message. Every
 submission creates an independent record: records are never deduplicated
-or updated and are kept per resource in submission order. A single
-record can be removed explicitly through its notification id; otherwise
-a record only disappears when its resource is deregistered. Nothing
-here is persisted: stopping or restarting the service clears every
+and are kept per resource in submission order. A single record can be
+updated in place through its notification id, keeping that id and its
+submission position while its channel, target and message are replaced;
+it can also be removed explicitly through that id. Otherwise a record
+only disappears when its resource is deregistered. Nothing here is
+persisted: stopping or restarting the service clears every
 notification, and no files are written.
 """
 
@@ -169,6 +171,53 @@ class NotificationStore:
         if index is None:
             return None
         return records.pop(index)
+
+    def update(
+        self, resource_id: str, notification_id: str, payload: object
+    ) -> Notification | None:
+        """Update one notification of ``resource_id`` in place by its id.
+
+        The payload has the same shape as a registration and is fully
+        validated by :func:`build_notification_fields` before any lookup,
+        so a bad payload raises :class:`NotificationValidationError`
+        before a single record is touched. All three fields are replaced
+        with the validated values.
+
+        Lookup is scoped to ``resource_id``: an id that is unknown,
+        belongs to another resource or was already removed answers
+        ``None`` and leaves every stored notification untouched. On
+        success the record keeps the same id and stays at its submission
+        position; only the channel, target and message can change, so the
+        resource's submission order is undisturbed while every derived
+        view is recomputed from the new values on its next call. An
+        identical resubmission simply replaces the record with an equal
+        one and is answered ``200`` without creating a new record.
+        """
+
+        channel, target, message = build_notification_fields(payload)
+
+        records = self._records.get(resource_id)
+        if records is None:
+            return None
+        index = next(
+            (
+                position
+                for position, record in enumerate(records)
+                if record.id == notification_id
+            ),
+            None,
+        )
+        if index is None:
+            return None
+
+        updated = Notification(
+            id=records[index].id,
+            channel=channel,
+            target=target,
+            message=message,
+        )
+        records[index] = updated
+        return updated
 
     def usage_by_channel(
         self, resource_ids: list[str]
