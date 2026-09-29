@@ -1,10 +1,12 @@
 """In-process notification registration for registered resources.
 
 A notification record pairs a channel with a target and a message. Every
-submission creates an independent record: records are never deduplicated,
-updated or deleted, and are kept per resource in submission order. Nothing
-here is persisted: stopping or restarting the service clears every
-notification, and no files are written.
+submission creates an independent record: records are never deduplicated
+or updated and are kept per resource in submission order. A single
+record can be removed explicitly through its notification id; apart
+from that, records only disappear with their resource when it is
+deregistered. Nothing here is persisted: stopping or restarting the
+service clears every notification, and no files are written.
 """
 
 from __future__ import annotations
@@ -139,6 +141,35 @@ class NotificationStore:
         """Return a resource's notifications in submission order."""
 
         return list(self._records.get(resource_id, ()))
+
+    def remove_one(
+        self, resource_id: str, notification_id: str
+    ) -> Notification | None:
+        """Delete one notification of ``resource_id`` by its id.
+
+        Only the matching notification record is removed; the surviving
+        records keep their submission order, so every derived view
+        (per-resource listing, global summary and the usage groupings)
+        redetermines itself from the remainder on its next query. A
+        notification id that is unknown, belongs to another resource or
+        was already removed matches nothing: the call returns ``None``
+        and changes no state, so deleting is safe to repeat.
+        """
+
+        records = self._records.get(resource_id)
+        if not records:
+            return None
+        index = next(
+            (
+                position
+                for position, record in enumerate(records)
+                if record.id == notification_id
+            ),
+            None,
+        )
+        if index is None:
+            return None
+        return records.pop(index)
 
     def usage_by_channel(
         self, resource_ids: list[str]

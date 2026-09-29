@@ -6502,6 +6502,92 @@ def _handle_notifications(
     )
 
 
+def _handle_notification_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_notification_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Delete one notification at
+    ``DELETE /resources/{id}/notifications/{notification_id}``.
+
+    Only the notification record itself is removed: the resource and
+    every other record (dependencies, content, lifecycle, alerts,
+    signatures, ...) are untouched. The per-resource listing, the global
+    summary and the usage views are all computed on the fly, so they
+    reflect the removal on their next query.
+    """
+
+    if method != "DELETE":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="DELETE",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    if (
+        not raw_notification_id
+        or "/" in raw_notification_id
+        or "\\" in raw_notification_id
+    ):
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            "Notification id must not be empty or contain path separators.",
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    # A declared non-empty (or malformed) body is a bad request; an omitted
+    # Content-Length and an explicit zero length are accepted as empty.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # The resource is looked up before the notification, so a missing
+    # resource reports resource_not_found even when the notification is
+    # absent as well.
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    record = notification_store.remove_one(raw_id, raw_notification_id)
+    if record is None:
+        # An id that never existed, one owned by another resource and one
+        # already deleted answer alike, so deleting is safe to repeat.
+        return _error(
+            start_response,
+            "404 Not Found",
+            "notification_not_found",
+            "No notification exists with the requested id.",
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        record.to_dict(),
+        trailing_newline=True,
+    )
+
+
 def _parse_notifications_summary_query(
     query_string: str,
 ) -> tuple[str | None, str | None]:
@@ -9553,6 +9639,14 @@ def application(
                 return _handle_notifications(
                     method, environ, head, start_response
                 )
+            if separator and tail.startswith("notifications/"):
+                return _handle_notification_item(
+                    method,
+                    environ,
+                    head,
+                    tail[len("notifications/"):],
+                    start_response,
+                )
             if separator and tail == "cross-references":
                 return _handle_cross_references(
                     method, environ, head, start_response
@@ -9799,6 +9893,20 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/notifications")],
+                    start_response,
+                )
+            if separator and "/notifications/" in suffix:
+                # Fallback for a separator inside the id segment so the
+                # item handler rejects it without removing any
+                # notification.
+                malformed_id, _, raw_notification_id = suffix.rpartition(
+                    "/notifications/"
+                )
+                return _handle_notification_item(
+                    method,
+                    environ,
+                    malformed_id,
+                    raw_notification_id,
                     start_response,
                 )
             if separator and suffix.endswith(
