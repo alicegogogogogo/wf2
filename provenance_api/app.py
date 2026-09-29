@@ -6502,6 +6502,96 @@ def _handle_notifications(
     )
 
 
+def _handle_notification_item(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    raw_notification_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Delete one notification at ``/resources/{id}/notifications/{nid}``.
+
+    Only DELETE is accepted and the request carries no query parameters
+    and no body; an omitted Content-Length and an explicit zero length
+    are both treated as an empty body. The notification id is
+    percent-decoded as a path segment and matched verbatim. Lookup is
+    scoped to the owning resource, so an id that is unknown, belongs to
+    another resource or was already deleted answers 404
+    ``notification_not_found`` alike and leaves every record untouched.
+    On success the removed record is echoed with the same fixed key
+    order as a registration response and every notification query and
+    usage view is recomputed from the remaining records.
+    """
+
+    if method != "DELETE":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="DELETE",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    notification_id, notification_id_error = _decode_reference_segment(
+        raw_notification_id, "Notification id"
+    )
+    if notification_id_error is not None:
+        return _error(
+            start_response,
+            "400 Bad Request",
+            "invalid_request",
+            notification_id_error,
+        )
+
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    # A declared non-empty (or malformed) body is a bad request; an omitted
+    # Content-Length and an explicit zero length are accepted as empty.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # The owning resource is looked up before the notification, so a missing
+    # resource is reported as resource_not_found even when the notification
+    # is absent as well.
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    record = notification_store.remove_one(raw_id, notification_id)
+    if record is None:
+        # A notification that never existed, one owned by another resource
+        # and one already deleted answer alike, so deleting is safe to
+        # repeat and no existing state is disturbed.
+        return _error(
+            start_response,
+            "404 Not Found",
+            "notification_not_found",
+            "No notification exists with the requested id.",
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        record.to_dict(),
+        trailing_newline=True,
+    )
+
+
 def _parse_notifications_summary_query(
     query_string: str,
 ) -> tuple[str | None, str | None]:
@@ -9553,6 +9643,14 @@ def application(
                 return _handle_notifications(
                     method, environ, head, start_response
                 )
+            if separator and tail.startswith("notifications/"):
+                return _handle_notification_item(
+                    method,
+                    environ,
+                    head,
+                    tail[len("notifications/"):],
+                    start_response,
+                )
             if separator and tail == "cross-references":
                 return _handle_cross_references(
                     method, environ, head, start_response
@@ -9799,6 +9897,20 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/notifications")],
+                    start_response,
+                )
+            if separator and "/notifications/" in suffix:
+                # Fallback for a separator inside the id segment of a
+                # notification item path so the handler rejects it without
+                # removing any record.
+                malformed_id, _, raw_notification_id = suffix.rpartition(
+                    "/notifications/"
+                )
+                return _handle_notification_item(
+                    method,
+                    environ,
+                    malformed_id,
+                    raw_notification_id,
                     start_response,
                 )
             if separator and suffix.endswith(

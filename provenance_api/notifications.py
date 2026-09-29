@@ -1,8 +1,10 @@
 """In-process notification registration for registered resources.
 
 A notification record pairs a channel with a target and a message. Every
-submission creates an independent record: records are never deduplicated,
-updated or deleted, and are kept per resource in submission order. Nothing
+submission creates an independent record: records are never deduplicated
+or updated and are kept per resource in submission order. A single
+record can be removed explicitly through its notification id; otherwise
+a record only disappears when its resource is deregistered. Nothing
 here is persisted: stopping or restarting the service clears every
 notification, and no files are written.
 """
@@ -139,6 +141,34 @@ class NotificationStore:
         """Return a resource's notifications in submission order."""
 
         return list(self._records.get(resource_id, ()))
+
+    def remove_one(
+        self, resource_id: str, notification_id: str
+    ) -> Notification | None:
+        """Remove and return one notification of ``resource_id`` by its id.
+
+        Lookup is scoped to ``resource_id``: an id that is unknown, belongs
+        to another resource or was already removed answers ``None`` and
+        leaves every stored notification untouched. On success the record
+        is dropped from the resource's list while the surviving records
+        keep their submission order; every derived view is recomputed from
+        what remains, so the removed id can never linger there.
+        """
+
+        records = self._records.get(resource_id)
+        if records is None:
+            return None
+        index = next(
+            (
+                position
+                for position, record in enumerate(records)
+                if record.id == notification_id
+            ),
+            None,
+        )
+        if index is None:
+            return None
+        return records.pop(index)
 
     def usage_by_channel(
         self, resource_ids: list[str]
