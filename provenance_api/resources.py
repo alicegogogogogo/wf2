@@ -1036,3 +1036,74 @@ class ResourceStore:
             }
             for name in order
         ]
+
+    # --- Source usage --------------------------------------------------------
+
+    def source_usage(self) -> list[dict[str, object]]:
+        """Group the registered resources by their registration source.
+
+        One entry per source, ordered by the source's first appearance in
+        resource registration order; the groups themselves are never
+        reordered. Resources registered without a source collapse into a
+        single entry whose ``source`` echoes ``None`` rather than omitting
+        the key. The order is redetermined from the remaining resources on
+        every call, so after a deregistration each surviving entry --
+        including the one immediately following the deleted first
+        occurrence -- takes the position of its earliest surviving
+        resource rather than keeping a stale slot, and a source whose last
+        resource is removed disappears altogether. Each entry carries the
+        five fixed keys ``source``, ``resources``, ``resource_count``,
+        ``names`` and ``categories`` in that order. The source is echoed
+        verbatim: no case folding and no whitespace trimming, so sources
+        differing only by case or surrounding whitespace stay separate
+        entries. ``resources`` lists the ids of the resources carrying
+        that source in resource registration order, each one once, and
+        ``resource_count`` is that list's length. ``names`` collects those
+        resources' names, deduplicated in resource registration order and
+        echoed verbatim. ``categories`` collects the resources'
+        categories likewise: deduplicated in resource registration order
+        and listed in the stored lowercase form. Everything is derived on
+        the fly from the current registry.
+        """
+
+        order: list[str | None] = []
+        resources_by_source: dict[str | None, list[str]] = {}
+        seen_resources: dict[str | None, set[str]] = {}
+        names_by_source: dict[str | None, list[str]] = {}
+        seen_names: dict[str | None, set[str]] = {}
+        categories_by_source: dict[str | None, list[str]] = {}
+        seen_categories: dict[str | None, set[str]] = {}
+
+        for resource in self._resources:
+            source = resource.source
+            if source not in resources_by_source:
+                order.append(source)
+                resources_by_source[source] = []
+                seen_resources[source] = set()
+                names_by_source[source] = []
+                seen_names[source] = set()
+                categories_by_source[source] = []
+                seen_categories[source] = set()
+            if resource.id not in seen_resources[source]:
+                seen_resources[source].add(resource.id)
+                resources_by_source[source].append(resource.id)
+            # Names are deduplicated verbatim: case and surrounding
+            # whitespace are significant.
+            if resource.name not in seen_names[source]:
+                seen_names[source].add(resource.name)
+                names_by_source[source].append(resource.name)
+            # Categories are stored in their normalized lowercase form.
+            if resource.category not in seen_categories[source]:
+                seen_categories[source].add(resource.category)
+                categories_by_source[source].append(resource.category)
+
+        return [
+            {
+                "source": source,
+                "resources": resources_by_source[source],
+                "resource_count": len(resources_by_source[source]),
+                "names": names_by_source[source],
+                "categories": categories_by_source[source],
+            }
+            for source in order
+        ]
