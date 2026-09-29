@@ -3078,6 +3078,107 @@ def _handle_lifecycle_summary(
     )
 
 
+def _handle_state_usage(
+    method: str,
+    environ: dict[str, Any],
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Global lifecycle-state-grouped resource usage view at ``GET /state-usage``.
+
+    The current resources are grouped by their current lifecycle state,
+    one entry per state ordered by its first appearance in resource
+    registration order (redetermined from the remaining resources after
+    every registration, transition or deregistration). A resource still
+    in the default state reads as ``staged`` without a stored record.
+    Each entry carries the five fixed keys ``state``, ``resources``,
+    ``resource_count``, ``names`` and ``digests``: the state echoed
+    verbatim in lowercase, the resource ids in registration order each
+    once, that list's length, the resources' names deduplicated in
+    registration order and echoed verbatim, and their normalized
+    lowercase digests deduplicated by first appearance. Computed on the
+    fly from the remaining registry and recorded nowhere; lifecycle
+    reads and submissions and the other usage views keep their existing
+    behavior.
+    """
+
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    # The usage view is read-only: a declared non-empty (or malformed) body
+    # is a bad request without consulting any business data. An omitted
+    # header and an explicit zero length count as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    # Computed on the fly from the current registry and the current
+    # lifecycle records; nothing is recorded or cached. First-appearance
+    # order is walked in resource registration order, so it is
+    # redetermined from the remaining resources on every call: after a
+    # transition resources migrate between entries, and a state whose
+    # last resource leaves disappears altogether.
+    order: list[str] = []
+    resources_by_state: dict[str, list[str]] = {}
+    names_by_state: dict[str, list[str]] = {}
+    seen_names: dict[str, set[str]] = {}
+    digests_by_state: dict[str, list[str]] = {}
+    seen_digests: dict[str, set[str]] = {}
+
+    for resource in store.list_all():
+        state = lifecycle_store.get(resource.id).state
+        if state not in resources_by_state:
+            order.append(state)
+            resources_by_state[state] = []
+            names_by_state[state] = []
+            seen_names[state] = set()
+            digests_by_state[state] = []
+            seen_digests[state] = set()
+        # The registry holds each resource record exactly once, so every
+        # id appended here is unique by construction.
+        resources_by_state[state].append(resource.id)
+        # Names are deduplicated verbatim: case and surrounding
+        # whitespace are significant.
+        if resource.name not in seen_names[state]:
+            seen_names[state].add(resource.name)
+            names_by_state[state].append(resource.name)
+        # Digests are stored in their canonical lowercase form.
+        if resource.digest not in seen_digests[state]:
+            seen_digests[state].add(resource.digest)
+            digests_by_state[state].append(resource.digest)
+
+    usage = [
+        {
+            "state": state,
+            "resources": resources_by_state[state],
+            "resource_count": len(resources_by_state[state]),
+            "names": names_by_state[state],
+            "digests": digests_by_state[state],
+        }
+        for state in order
+    ]
+    return _json_response(
+        start_response,
+        "200 OK",
+        usage,
+        trailing_newline=True,
+    )
+
+
 def _handle_release_blockers(
     method: str,
     environ: dict[str, Any],
@@ -8870,6 +8971,12 @@ def application(
             # Global lifecycle summary; the handler answers the 405
             # (Allow: GET) for every other method.
             return _handle_lifecycle_summary(method, environ, start_response)
+
+        if path == "/state-usage":
+            # Global resource usage view grouped by current lifecycle
+            # state; the handler answers the 405 (Allow: GET) for every
+            # other method.
+            return _handle_state_usage(method, environ, start_response)
 
         if path == "/dependency-vulnerability-impact":
             # Global dependency vulnerability impact summary; the handler
