@@ -5000,6 +5000,154 @@ def _handle_admission_preview_summary(
     )
 
 
+def _admission_closure_node(resource_id: str) -> dict[str, object]:
+    """Build one admission-closure node for ``resource_id``.
+
+    The decision shares the admission-preview inputs and rules: the
+    resource's own policy, else the single global default policy, and
+    alerts verbatim matching a registered exemption never participate
+    in the severity ceiling. The node carries the four fixed keys
+    ``id``, ``policy_source``, ``allowed`` and ``reasons``; the policy
+    source is echoed as ``"resource"`` or ``"default"``, and a resource
+    that has neither policy yields ``allowed`` and ``policy_source`` of
+    ``None`` with ``reasons`` holding only ``policy_not_found``.
+    Read-only and computed on the fly; nothing is recorded.
+    """
+
+    # Matching follows the exemption rule exactly: advisory and component
+    # compared byte-for-byte, case-sensitive, just like the preview.
+    exempted_keys = vulnerability_exception_store.exempted_keys(resource_id)
+    active_severities = [
+        alert.severity
+        for alert in vulnerability_store.list_for(resource_id)
+        if (alert.advisory, alert.component) not in exempted_keys
+    ]
+
+    policy = policy_store.get(resource_id)
+    if policy is not None:
+        policy_source: str | None = "resource"
+    else:
+        # Same fallback as the admission evaluation and the preview.
+        policy = default_policy_store.get()
+        policy_source = "default" if policy is not None else None
+    if policy is None:
+        return {
+            "id": resource_id,
+            "policy_source": None,
+            "allowed": None,
+            "reasons": ["policy_not_found"],
+        }
+
+    license_record = sbom_store.get_license(resource_id)
+    allowed, reasons = evaluate_policy(
+        policy,
+        lifecycle_state=lifecycle_store.get(resource_id).state,
+        has_sbom=sbom_store.get_sbom(resource_id) is not None,
+        has_license=license_record is not None,
+        has_provenance=provenance_store.get(resource_id) is not None,
+        has_signature=signature_store.get(resource_id) is not None,
+        license_spdx_id=(
+            license_record.spdx_id if license_record is not None else None
+        ),
+        severities=active_severities,
+    )
+    return {
+        "id": resource_id,
+        "policy_source": policy_source,
+        "allowed": allowed,
+        "reasons": reasons,
+    }
+
+
+def _handle_admission_closure(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+
+    # Read-only: a declared non-empty (or malformed) body is a bad request
+    # without consulting any business data. An omitted header and an
+    # explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # The closure starts with the root and then follows the reachable
+    # dependencies in the same registration order the dependency query
+    # uses; every resource appears exactly once. Each node is judged on
+    # its own against its own policy or the global default, and nothing is
+    # recorded or reordered.
+    nodes = [
+        _admission_closure_node(node_id)
+        for node_id in [raw_id, *store.list_dependencies(raw_id)]
+    ]
+
+    # An explicit denial dominates; otherwise a node without any policy
+    # makes the aggregate undecided; only when every node is allowed does
+    # the closure allow.
+    if any(node["allowed"] is False for node in nodes):
+        allowed: bool | None = False
+    elif any(node["allowed"] is None for node in nodes):
+        allowed = None
+    else:
+        allowed = True
+
+    # Node reasons are concatenated in closure order and deduplicated by
+    # first appearance; the reason order inside each node is the existing
+    # fixed admission reason order.
+    reasons: list[str] = []
+    seen_reasons: set[str] = set()
+    for node in nodes:
+        for reason in node["reasons"]:  # type: ignore[index]
+            if reason not in seen_reasons:
+                seen_reasons.add(reason)
+                reasons.append(reason)
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {
+            "id": raw_id,
+            "allowed": allowed,
+            "reasons": reasons,
+            "resources": nodes,
+        },
+        trailing_newline=True,
+    )
+
+
 def _risk_report(resource_id: str) -> dict[str, object]:
     """Build one risk-score record for ``resource_id``.
 
@@ -9705,6 +9853,10 @@ def application(
                 return _handle_admission_preview(
                     method, environ, head, start_response
                 )
+            if separator and tail == "admission-closure":
+                return _handle_admission_closure(
+                    method, environ, head, start_response
+                )
             if separator and tail == "risk":
                 return _handle_risk(
                     method, environ, head, start_response
@@ -9939,6 +10091,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/admission-preview")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/admission-closure"):
+                # Same fallback so a separator in the id is rejected
+                # without computing a closure.
+                return _handle_admission_closure(
+                    method,
+                    environ,
+                    suffix[: -len("/admission-closure")],
                     start_response,
                 )
             if separator and suffix.endswith("/risk"):
