@@ -2078,6 +2078,55 @@ curl -s "http://127.0.0.1:8000/resources/$ID/admission-closure"
 
 本视图不改变单资源准入预览、准入评估、全局准入预览汇总、依赖查询与全局默认策略的响应和错误码；告警、豁免、策略、生命周期与依赖等既有接口的字段、排序与错误口径全部保持原样，也不新增任何原因代码或持久化记录。启动方式、健康检查与进程内存边界不变。
 
+## 依赖闭包证据打包视图
+
+在各类单资源只读视图之外，可以以一个已登记资源为根，一次性取得其**依赖闭包内每个资源**的登记信息、直接依赖、成品状态、证据、安全记录、策略、准入结论、风险评分与跨仓库引用，并附带整包摘要。该视图只接受 `GET`，入口挂在 `/resources/{id}/trace-bundle`，不接受请求体或任何查询参数；即时计算且只读，不落任何记录、不新建记录、不回写状态，也不写文件，不改变资源登记、依赖、内容、生命周期、告警与豁免、SBOM 与许可证、来源证明、策略、准入、风险、跨仓库引用与签名等既有接口的行为，其输入仍只存于当前进程内存，服务停止或重启后随之清空。
+
+### 查询证据包：`GET /resources/{id}/trace-bundle`
+
+路径 `id` 指定根资源。成功返回 HTTP 200，响应体是紧凑 UTF-8 JSON 并以单个换行结束。顶层固定三个键且键序不可变，依次为 `id`、`bundle_digest`、`resources`；`resources` 中根资源排在最前，其后按现有依赖查询（`GET /resources/{id}/dependencies`）给出的可达依赖顺序展开，同一资源只出现一次（含经多条路径可达的菱形依赖），没有任何依赖的根资源返回只含自身的单节点数组：
+
+```bash
+curl -s "http://127.0.0.1:8000/resources/$ID/trace-bundle"
+```
+
+```json
+{"id":"<根资源 id>","bundle_digest":"<64 位小写十六进制>","resources":[{"resource":{"id":"<根资源 id>","name":"…","category":"code","digest":"…","source":null},"dependencies":["<直接依赖 id>"],"content":{"complete":false,"size":null,"digest":null},"evidence":{"sbom":null,"license":null,"provenance":null,"signature":null},"security":{"vulnerabilities":[],"vulnerability_exceptions":[]},"policy":{"source":null,"record":null},"admission":null,"risk":{"id":"<根资源 id>","score":20,"level":"low"},"cross_references":[]}]}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 根资源标识，原样回显路径中的 `id` |
+| `bundle_digest` | 整包摘要：取**不含该字段**、按同一固定键序生成且不加换行的紧凑 UTF-8 JSON，以其 UTF-8 字节的 SHA-256 给出 64 位小写十六进制；数据不变则摘要不变，相关数据变化立即反映 |
+| `resources` | 闭包节点数组，根在前、可达依赖按依赖查询顺序排列，每个资源只出现一次 |
+
+每个节点固定九个键且键序不可变，依次为 `resource`、`dependencies`、`content`、`evidence`、`security`、`policy`、`admission`、`risk`、`cross_references`：
+
+| 字段 | 说明 |
+| --- | --- |
+| `resource` | 节点资源记录，形状与键序同 `GET /resources/{id}`（`id`、`name`、`category`、`digest`、`source`） |
+| `dependencies` | 该资源的**直接**依赖 id 数组，按依赖关系登记顺序排列；无直接依赖为 `[]` |
+| `content` | 成品状态，固定 `complete`、`size`、`digest` 三键：未组装（未开传、分块缺失、组装失败或会话已重置）为 `false`、`null`、`null`；已组装为 `true`、成品字节长度、成品重算 SHA-256 的 64 位小写值 |
+| `evidence` | 固定 `sbom`、`license`、`provenance`、`signature` 四键，各项沿用对应单资源查询的既有形状与键序；缺失的证据不报错，单项为 `null` |
+| `security` | 固定 `vulnerabilities`、`vulnerability_exceptions` 两键，分别为该资源已登记告警与豁免的数组（沿用既有形状与登记顺序）；没有记录时为 `[]` |
+| `policy` | 固定 `source`、`record` 两键：`source` 取 `"resource"`（自身策略）、`"default"`（全局默认策略）或 `null`（两者都没有）；`record` 为生效策略的内容（`name`、`evidence_requirements`、`license_allowlist`、`max_severity`），无策略时为 `null` |
+| `admission` | 该资源在生效策略下的只读准入结论，形状与键序同准入评估（`id`、`allowed`、`reasons`，全部已登记告警参与判定）；无任何策略时为 `null` |
+| `risk` | 该资源的即时风险评分，形状与键序同 `GET /resources/{id}/risk`（`id`、`score`、`level`） |
+| `cross_references` | 该资源已登记跨仓库引用的数组，沿用既有列出形状与登记顺序；没有引用时为 `[]` |
+
+该视图即时计算且只读：依赖增删、内容组装、告警与豁免变化、证据登记、策略或全局默认策略变化、生命周期跳转、跨仓库引用增删与资源注销之后，下一次查询立即按剩余数据重算，`bundle_digest` 同步变化；同一次数据下重复调用结果与摘要完全一致。任何请求失败都不改变任何既有状态，成功响应只即时读取当前数据。
+
+### 证据包接口的错误
+
+- 入口只接受 `GET`：`GET` 之外的方法返回 HTTP 405（错误码 `method_not_allowed`），`Allow` 头只给出 `GET`；方法判定先于请求体与查询参数检查。
+- 路径 `id` 为空或含路径分隔符（`/`、`\\`）时返回 HTTP 400（错误码 `invalid_request`）。
+- 请求声明非空或非法请求体（`Content-Length` 为正数或非法，如 `abc`、`-1`、`1.5`）时返回 HTTP 400（错误码 `invalid_request`），且不读取业务数据；省略 `Content-Length` 头或显式零长度（含空字符串长度头）都视为空请求体，按正常请求处理。
+- 携带任意或重复查询参数（含无值参数）返回 HTTP 400（错误码 `invalid_request`），且不读取业务数据。
+- 路径 `id` 格式合法但根资源不存在时返回 HTTP 404（错误码 `resource_not_found`）；闭包内依赖资源均由现有依赖边给出，不会出现未知节点。
+- 错误体沿用既有 JSON 错误形状（`{"error":"…","message":"…"}`），紧凑 JSON 并以单个换行结束。
+
+本视图不改变任何既有接口的响应、排序与错误码，也不新增任何持久化记录。启动方式、健康检查与进程内存边界不变。
+
 ## 风险评分
 
 可以对已登记的资源即时计算一次风险评分。评分只读取该资源当前的安全告警、SBOM、许可证声明、构建来源证明、内容签名记录、生命周期状态与准入策略，**不写入或修改任何状态**，也不留下任何评分记录；重启后随全部输入一起清空，不写入任何文件。
