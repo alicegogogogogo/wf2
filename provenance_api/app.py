@@ -5148,6 +5148,185 @@ def _handle_admission_closure(
     )
 
 
+def _trace_bundle_node(resource_id: str) -> dict[str, object]:
+    """Build one trace-bundle node for ``resource_id``.
+
+    The node gathers the resource's own record, its direct dependency ids
+    in relation registration order, its content readiness snapshot with the
+    recomputed assembled-artifact digest, its SBOM / license / provenance /
+    signature evidence, its recorded alerts and exemptions, the policy that
+    would govern it (its own, else the global default, else none), the
+    read-only admission decision and risk score computed from the very same
+    inputs and rules as the existing views, and its cross-repository
+    references. Missing evidence is reported as ``None`` for single items
+    and as an empty array for lists; nothing is recorded and no state is
+    touched.
+    """
+
+    resource = store.get(resource_id)
+    # The root was checked by the handler and every reachable dependency id
+    # comes from the registry itself, so the record always exists.
+    assert resource is not None
+
+    sbom = sbom_store.get_sbom(resource_id)
+    license_record = sbom_store.get_license(resource_id)
+    provenance = provenance_store.get(resource_id)
+    signature = signature_store.get(resource_id)
+
+    policy = policy_store.get(resource_id)
+    if policy is not None:
+        policy_source: str | None = "resource"
+    else:
+        # Same fallback as the admission evaluation and the closure.
+        policy = default_policy_store.get()
+        policy_source = "default" if policy is not None else None
+
+    content_status = content_store.content_status(resource_id)
+
+    # The decision and the score share the admission-closure and risk-view
+    # inputs and rules exactly; only the identifying keys are dropped here
+    # because the node already carries the resource record.
+    admission = _admission_closure_node(resource_id)
+    risk = _risk_report(resource_id)
+
+    return {
+        "resource": resource.to_dict(),
+        "dependencies": store.list_direct_dependencies(resource_id),
+        "content": {
+            "complete": content_status.complete,
+            "size": content_status.size,
+            "digest": content_store.recomputed_digest(resource_id),
+        },
+        "evidence": {
+            "sbom": sbom.to_dict(resource_id) if sbom is not None else None,
+            "license": (
+                license_record.to_dict(resource_id)
+                if license_record is not None
+                else None
+            ),
+            "provenance": (
+                provenance.to_dict(resource_id)
+                if provenance is not None
+                else None
+            ),
+            "signature": (
+                signature.to_dict(resource_id)
+                if signature is not None
+                else None
+            ),
+        },
+        "security": {
+            "vulnerabilities": [
+                alert.to_dict()
+                for alert in vulnerability_store.list_for(resource_id)
+            ],
+            "vulnerability_exceptions": [
+                exception.to_dict()
+                for exception in vulnerability_exception_store.list_for(
+                    resource_id
+                )
+            ],
+        },
+        "policy": {
+            "source": policy_source,
+            "record": (
+                policy.to_policy_dict() if policy is not None else None
+            ),
+        },
+        "admission": {
+            "allowed": admission["allowed"],
+            "reasons": admission["reasons"],
+        },
+        "risk": {
+            "score": risk["score"],
+            "level": risk["level"],
+        },
+        "cross_references": [
+            reference.to_dict()
+            for reference in cross_reference_store.list_for(resource_id)
+        ],
+    }
+
+
+def _handle_trace_bundle(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+
+    # Read-only: a declared non-empty (or malformed) body is a bad request
+    # without consulting any business data. An omitted header and an
+    # explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    # The bundle starts with the root and then follows the reachable
+    # dependencies in the same registration order the dependency query
+    # uses; every resource appears exactly once. Everything is computed on
+    # the fly and nothing is recorded.
+    nodes = [
+        _trace_bundle_node(node_id)
+        for node_id in [raw_id, *store.list_dependencies(raw_id)]
+    ]
+
+    # The digest covers the bundle without the digest field itself: the
+    # compact UTF-8 JSON of the remaining top-level keys in their fixed
+    # order, with no trailing newline, hashed as SHA-256.
+    unsigned = {"id": raw_id, "resources": nodes}
+    bundle_digest = hashlib.sha256(
+        json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {
+            "id": raw_id,
+            "bundle_digest": bundle_digest,
+            "resources": nodes,
+        },
+        trailing_newline=True,
+    )
+
+
 def _risk_report(resource_id: str) -> dict[str, object]:
     """Build one risk-score record for ``resource_id``.
 
@@ -9919,6 +10098,10 @@ def application(
                 return _handle_admission_closure(
                     method, environ, head, start_response
                 )
+            if separator and tail == "trace-bundle":
+                return _handle_trace_bundle(
+                    method, environ, head, start_response
+                )
             if separator and tail == "risk":
                 return _handle_risk(
                     method, environ, head, start_response
@@ -10177,6 +10360,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/admission-closure")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/trace-bundle"):
+                # Same fallback so a separator in the id is rejected
+                # without computing a bundle.
+                return _handle_trace_bundle(
+                    method,
+                    environ,
+                    suffix[: -len("/trace-bundle")],
                     start_response,
                 )
             if separator and suffix.endswith("/risk"):
