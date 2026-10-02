@@ -3150,6 +3150,45 @@ curl -s -X DELETE \
 
 引用不存在或已删除都返回 HTTP 404（错误码 `reference_not_found`），重复删除结果一致。起点资源不存在返回 HTTP 404（错误码 `resource_not_found`），其判定次序在引用查找之前。
 
+### 来源复核：`POST /resources/{id}/cross-references/verify`
+
+对该起点资源**当前登记的全部引用按登记顺序逐条复核**：沿用登记时的仓库绑定与 `remote_id` 百分号编码，向 `<upstream>/resources/<remote_id>` 重新发起 GET，并沿用登记时的远端元数据校验语义（200、JSON 对象、`name`/`category`/`digest`/`source` 四字段齐全且类型、类别、摘要格式合法）。各引用独立复核，前一条失败不阻断后续条目；整个复核只读——不写缓存、不改引用、不生成资源、不增删依赖、不改仓库绑定，引用、依赖或资源变化后下一次复核立即按当前数据重算。
+
+该入口只接受 `POST` 空请求体：省略 `Content-Length` 头与显式 `Content-Length: 0` 都视为空体并允许；声明非空或非法长度、携带查询参数、`{id}` 为空或含路径分隔符一律返回 HTTP 400（错误码 `invalid_request`）；起点资源不存在返回 HTTP 404（错误码 `resource_not_found`）；其他方法返回 HTTP 405（错误码 `method_not_allowed`，响应带 `Allow: POST`）。
+
+成功返回 HTTP 200，紧凑 UTF-8 JSON 以单个换行结束，顶层只有一个 `results` 数组；该资源没有任何引用时为 `{"results":[]}`。数组每项对应一条引用，按登记顺序展开，固定八个键且键序不可变，依次为 `resource_id`、`repository`、`upstream`、`remote_id`、`digest`、`status`、`remote`、`local_id`：
+
+```bash
+curl -s -X POST \
+  http://127.0.0.1:8000/resources/$LOCAL_ID/cross-references/verify
+```
+
+```json
+{"results":[{"resource_id":"<起点 id>","repository":"partner","upstream":"https://repo.example.invalid/","remote_id":"remote-42","digest":"aaaa…aaaa","status":"matched","remote":{"name":"remote-model","category":"model","digest":"aaaa…aaaa","source":"https://repo.example.invalid/sources/remote-42"},"local_id":"<登记时解析生成或复用的本地资源 id>"}]}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `resource_id` | 发起引用的起点本地资源标识，与引用列表一致 |
+| `repository` / `upstream` / `remote_id` | 登记值原样回显；复核按该绑定与编码重新取回 |
+| `digest` | 登记时记录的期望摘要（小写），原样回显，不被远端当前值改写 |
+| `status` | 本条引用的唯一复核结论（取值见下表） |
+| `remote` | 取不到合法远端文档时为 `null`；取到时依次给出 `name`、`category`、`digest`、`source` 四键，其中 `category` 与 `digest` 按小写规范化 |
+| `local_id` | 登记时解析生成或复用的本地资源标识，沿用登记值；该本地资源随后被注销也仍保留、不改写 |
+
+每条引用只给一个 `status`，按**远端文档 → 远端摘要 → 本地存在性 → name 与 category** 的顺序取首个命中的结论：
+
+| status | 命中条件 |
+| --- | --- |
+| `remote_unreachable` | 上游不可达、连接超时或返回非 200 |
+| `resolution_failed` | 远端有响应但文档不符合既有元数据格式（无法解码、不是对象、缺字段、类型/类别/摘要非法、值为空或为 `null`） |
+| `remote_digest_mismatch` | 文档合法，但其摘要不等于登记的 `digest` |
+| `local_resource_missing` | 摘要一致，但登记的 `local_id` 资源当前不存在（已被注销） |
+| `identity_mismatch` | 摘要一致且本地资源存在，但其 `name` 或 `category` 与远端文档不同 |
+| `matched` | 以上均不命中 |
+
+`name` 逐字区分大小写比较；`category` 双方都按小写规范化后比较；`source` 不参与 `identity_mismatch` 判断，`remote.source` 只照实回显远端当前值，本地资源的 `source` 保持本地原值不变。`remote_unreachable`、`resolution_failed` 与后续结论互斥：前两条命中时 `remote` 为 `null`，且不再检查摘要与本地状态；即使本地资源同时缺失，状态仍由最先命中的远端结论决定。
+
 ### 跨仓库引用接口的错误
 
 请求侧问题返回 HTTP 400（错误码 `invalid_request`），且不联系上游、不改变任何状态：
@@ -3168,6 +3207,8 @@ curl -s -X DELETE \
 | 方法不符（引用集合的 `GET`、`POST` 之外），响应带 `Allow: GET, POST` | 405 | `method_not_allowed` |
 | 删除时引用不存在或已删除（重复删除结果一致） | 404 | `reference_not_found` |
 | 删除入口的方法非 `DELETE`，响应带 `Allow: DELETE` | 405 | `method_not_allowed` |
+| 来源复核的方法非 `POST`，响应带 `Allow: POST` | 405 | `method_not_allowed` |
+| 来源复核声明非空或非法请求体（省略 `Content-Length` 与显式 `Content-Length: 0` 均视为空体）、携带查询参数，或起点 `{id}` 为空/含路径分隔符 | 400 | `invalid_request` |
 | 删除路径的仓库名或远端标识段为空，或解码后含 `/`、`\`；携带任意查询参数；声明非空或非法请求体（省略 `Content-Length` 与显式 `Content-Length: 0` 均视为空体） | 400 | `invalid_request` |
 | 同名仓库已绑定不同上游地址 | 409 | `repository_conflict` |
 | 同一仓库与远端标识重复登记 | 409 | `duplicate_reference` |

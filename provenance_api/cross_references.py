@@ -384,6 +384,91 @@ def resolve_remote(upstream: str, remote_id: str, expected_digest: str) -> Resol
     )
 
 
+def inspect_remote(upstream: str, remote_id: str) -> tuple[dict[str, object] | None, str | None]:
+    """Fetch and shape-check the remote document without digest enforcement.
+
+    Returns ``(metadata, None)`` with the normalized document (``category``
+    and ``digest`` lowercased) when the upstream is reachable and answers a
+    valid document, or ``(None, code)`` when the first verification
+    conclusion is already reached: ``remote_unreachable`` for a connection
+    failure, timeout or non-200 answer and ``resolution_failed`` for an
+    undecodable or malformed document. Unlike :func:`resolve_remote` the
+    reported digest is not compared against any expectation here, so a
+    document carrying a different digest is still returned for the caller
+    to report ``remote_digest_mismatch``.
+    """
+
+    try:
+        raw = fetch_remote_resource(upstream, remote_id)
+        metadata = parse_remote_metadata(raw)
+    except CrossReferenceError as exc:
+        return None, exc.code
+    return metadata, None
+
+
+def verify_reference(
+    resource_store: ResourceStore, record: CrossReference
+) -> dict[str, object]:
+    """Re-check one registered reference against the current data.
+
+    Contacts the bound upstream at ``/resources/<remote_id>`` and reports a
+    single ``status`` taken from the first rule that hits, in this order:
+    the remote document, its digest, the local resource's existence, then
+    its name and category. Nothing is mutated: no cache write, reference
+    edit, resource creation, dependency change or binding change.
+
+    ``remote`` is ``None`` when no valid document could be obtained;
+    otherwise it carries the document's ``name``, ``category``, ``digest``
+    and ``source`` (the last two normalized to lowercase). ``digest`` and
+    ``local_id`` always echo the registered values -- ``local_id`` is
+    rewritten never, not even when its resource has been deregistered.
+    """
+
+    metadata, fetch_status = inspect_remote(
+        record.upstream, record.remote_id
+    )
+
+    remote: dict[str, object] | None = None
+    if metadata is None:
+        # inspect_remote always reports the fetch error's stable code.
+        assert fetch_status is not None
+        status = fetch_status
+    else:
+        remote = {
+            "name": metadata["name"],
+            "category": metadata["category"],
+            "digest": metadata["digest"],
+            "source": metadata["source"],
+        }
+        remote_digest = str(metadata["digest"])
+        if remote_digest != record.digest:
+            status = "remote_digest_mismatch"
+        else:
+            local = resource_store.get(record.local_id)
+            if local is None:
+                status = "local_resource_missing"
+            elif (
+                local.name != metadata["name"]
+                or local.category.lower() != str(metadata["category"]).lower()
+            ):
+                # Name is matched verbatim (case-sensitive); category is
+                # compared after normalization. Source never participates.
+                status = "identity_mismatch"
+            else:
+                status = "matched"
+
+    return {
+        "resource_id": record.resource_id,
+        "repository": record.repository,
+        "upstream": record.upstream,
+        "remote_id": record.remote_id,
+        "digest": record.digest,
+        "status": status,
+        "remote": remote,
+        "local_id": record.local_id,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class _Plan:
     """The validated, not-yet-committed outcome of a registration."""
@@ -514,6 +599,23 @@ class CrossReferenceStore:
             record
             for record in self._records
             if record.resource_id == resource_id
+        ]
+
+    def verify_for(
+        self, resource_store: ResourceStore, resource_id: str
+    ) -> list[dict[str, object]]:
+        """Re-verify a resource's references in registration order.
+
+        Each reference is checked independently: a reference that is
+        unreachable, fails to resolve or reports a different status never
+        blocks the ones registered after it. Every result is recomputed
+        from the current records, resource registry and the upstream's
+        current answer; the verification writes nothing.
+        """
+
+        return [
+            verify_reference(resource_store, record)
+            for record in self.list_for(resource_id)
         ]
 
     def list_all(self) -> list[CrossReference]:

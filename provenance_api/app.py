@@ -8431,6 +8431,66 @@ def _handle_cross_references(
     )
 
 
+def _handle_cross_reference_verify(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Re-verify all references of a resource.
+
+    ``POST /resources/{id}/cross-references/verify`` re-contacts each
+    reference's bound upstream in registration order and reports one
+    status per reference. The check is read-only: it never writes the
+    cache, edits a reference, creates resources, changes dependencies or
+    rebinds a repository, and each reference is verified independently.
+    """
+
+    if method != "POST":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="POST",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    # Only an empty body is accepted: an omitted Content-Length header and
+    # an explicit zero length are both fine, a declared positive or
+    # malformed length is rejected.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    results = cross_reference_store.verify_for(store, raw_id)
+    return _json_response(
+        start_response,
+        "200 OK",
+        {"results": results},
+        trailing_newline=True,
+    )
+
+
 def _handle_cross_reference_item(
     method: str,
     environ: dict[str, Any],
@@ -9885,6 +9945,10 @@ def application(
                 return _handle_cross_references(
                     method, environ, head, start_response
                 )
+            if separator and tail == "cross-references/verify":
+                return _handle_cross_reference_verify(
+                    method, environ, head, start_response
+                )
             if separator and tail.startswith("cross-references/"):
                 return _handle_cross_reference_item(
                     method,
@@ -10170,6 +10234,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/cross-references")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/cross-references/verify"):
+                # Fallback for a separator inside the id segment so the
+                # verify handler rejects it without contacting any upstream.
+                return _handle_cross_reference_verify(
+                    method,
+                    environ,
+                    suffix[: -len("/cross-references/verify")],
                     start_response,
                 )
             if separator and "/cross-references/" in suffix:
