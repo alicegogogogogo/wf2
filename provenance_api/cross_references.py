@@ -516,6 +516,23 @@ class CrossReferenceStore:
             if record.resource_id == resource_id
         ]
 
+    def verify_for(
+        self, resource_store: ResourceStore, resource_id: str
+    ) -> list[dict[str, object]]:
+        """Re-verify a resource's references in registration order.
+
+        Every reference is checked independently against the current data;
+        an unreachable upstream or any other failure for one reference
+        never aborts the remaining ones. The outcome is computed on the
+        fly and nothing is read from or written to any cache.
+        """
+
+        return [
+            verify_record(resource_store, record)
+            for record in self._records
+            if record.resource_id == resource_id
+        ]
+
     def list_all(self) -> list[CrossReference]:
         """Return every reference in global registration order.
 
@@ -878,3 +895,99 @@ class CrossReferenceStore:
         self._repository_upstream.setdefault(plan.repository, plan.upstream)
         self._pairs.add((plan.repository, plan.remote_id))
         return record, dependency
+
+
+#: Status reported when the upstream cannot be contacted or times out.
+VERIFY_REMOTE_UNREACHABLE = "remote_unreachable"
+#: Status reported when the remote document fails the established format.
+VERIFY_RESOLUTION_FAILED = "resolution_failed"
+#: Status reported when the remote digest differs from the registered one.
+VERIFY_REMOTE_DIGEST_MISMATCH = "remote_digest_mismatch"
+#: Status reported when the registered local resource no longer exists.
+VERIFY_LOCAL_RESOURCE_MISSING = "local_resource_missing"
+#: Status reported when the local identity's name or category drifted.
+VERIFY_IDENTITY_MISMATCH = "identity_mismatch"
+#: Status reported when every check agrees.
+VERIFY_MATCHED = "matched"
+
+
+def verify_record(
+    resource_store: ResourceStore, record: CrossReference
+) -> dict[str, object]:
+    """Re-check one registered reference against the current data.
+
+    The reference's recorded ``repository`` binding, ``upstream`` address,
+    percent-encoded ``remote_id`` fetch and remote metadata validation are
+    reused unchanged. The first conclusion hit, in the fixed order remote
+    document, digest, local existence, then name/category, becomes the
+    single reported ``status``:
+
+    - ``remote_unreachable``: the upstream cannot be contacted, times out
+      or answers non-200;
+    - ``resolution_failed``: the fetched document fails the established
+      metadata format;
+    - ``remote_digest_mismatch``: the document digest differs from the
+      registered digest;
+    - ``local_resource_missing``: the digest agrees but the resource with
+      the registered ``local_id`` no longer exists;
+    - ``identity_mismatch``: that resource exists but its name (compared
+      case-sensitively) or category (compared after normalization) differs
+      from the document; ``source`` is not part of identity;
+    - ``matched``: everything agrees.
+
+    ``remote`` is ``None`` whenever no valid document is available; with a
+    valid document it carries ``name``, ``category``, ``digest`` and
+    ``source`` in that order, with category and digest lowercase. Nothing
+    is mutated: no cache writes, records, resources, edges or bindings.
+    """
+
+    result: dict[str, object] = {
+        "resource_id": record.resource_id,
+        "repository": record.repository,
+        "upstream": record.upstream,
+        "remote_id": record.remote_id,
+        "digest": record.digest,
+        "status": VERIFY_REMOTE_UNREACHABLE,
+        "remote": None,
+        "local_id": record.local_id,
+    }
+
+    try:
+        raw = fetch_remote_resource(record.upstream, record.remote_id)
+        metadata = parse_remote_metadata(raw)
+    except CrossReferenceError as exc:
+        # fetch raises remote_unreachable; metadata parsing raises
+        # resolution_failed. The first failing conclusion stands.
+        result["status"] = exc.code
+        result["remote"] = None
+        return result
+
+    remote_name = str(metadata["name"])
+    remote_category = str(metadata["category"])
+    remote_digest = str(metadata["digest"])
+    result["remote"] = {
+        "name": remote_name,
+        "category": remote_category,
+        "digest": remote_digest,
+        "source": str(metadata["source"]),
+    }
+
+    if remote_digest != record.digest:
+        result["status"] = VERIFY_REMOTE_DIGEST_MISMATCH
+        return result
+
+    local = resource_store.get(record.local_id)
+    if local is None:
+        # The reference keeps its registered local_id even after the
+        # resource was deregistered; it is echoed regardless.
+        result["status"] = VERIFY_LOCAL_RESOURCE_MISSING
+        return result
+
+    if local.name != remote_name or local.category != remote_category:
+        # Name is compared case-sensitively while both categories are
+        # already normalized to lowercase; source never participates.
+        result["status"] = VERIFY_IDENTITY_MISMATCH
+        return result
+
+    result["status"] = VERIFY_MATCHED
+    return result
