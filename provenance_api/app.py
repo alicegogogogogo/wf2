@@ -4492,6 +4492,105 @@ def _handle_provenance(
     )
 
 
+def _handle_provenance_materials(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+    record = provenance_store.get(raw_id)
+    if record is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "provenance_not_found",
+            "No provenance is registered for this resource.",
+        )
+
+    # Recomputed on every call from the current registry and graph; nothing
+    # is recorded or materialized. The closure excludes the root resource
+    # itself, so a resource is never its own dependency match.
+    closure = set(store.list_dependencies(raw_id))
+    materials: list[dict[str, object]] = []
+    resolved_count = 0
+    for material in record.materials:
+        # Candidates keep resource registration order; the name is matched
+        # verbatim (case-sensitive, no trimming) and the digest against the
+        # stored lowercase form, which is also how materials are stored.
+        candidates = [
+            resource.id
+            for resource in store.query(
+                name=material.name, digest=material.digest
+            )
+        ]
+        dependency_matches = [
+            candidate for candidate in candidates if candidate in closure
+        ]
+        if not candidates:
+            status = "missing"
+        elif not dependency_matches:
+            status = "outside_dependency"
+        elif len(dependency_matches) == 1:
+            status = "resolved"
+            resolved_count += 1
+        else:
+            status = "ambiguous"
+        materials.append(
+            {
+                "name": material.name,
+                "digest": material.digest,
+                "status": status,
+                "candidates": candidates,
+                "dependency_matches": dependency_matches,
+            }
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {
+            "id": raw_id,
+            "all_resolved": resolved_count == len(materials),
+            "material_count": len(materials),
+            "resolved_count": resolved_count,
+            "materials": materials,
+        },
+        trailing_newline=True,
+    )
+
+
 def _handle_policies_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -10095,6 +10194,10 @@ def application(
                 return _handle_provenance(
                     method, environ, head, start_response
                 )
+            if separator and tail == "provenance/materials":
+                return _handle_provenance_materials(
+                    method, environ, head, start_response
+                )
             if separator and tail == "policies":
                 return _handle_policies(
                     method, environ, head, start_response
@@ -10337,6 +10440,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/provenance")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/provenance/materials"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without computing any material check.
+                return _handle_provenance_materials(
+                    method,
+                    environ,
+                    suffix[: -len("/provenance/materials")],
                     start_response,
                 )
             if separator and suffix.endswith("/policies"):
