@@ -4492,6 +4492,124 @@ def _handle_provenance(
     )
 
 
+def _handle_provenance_materials(
+    method: str,
+    environ: dict[str, Any],
+    raw_id: str,
+    start_response: StartResponse,
+) -> Iterable[bytes]:
+    """Cross-check the recorded materials against the resource graph.
+
+    Read-only: each material of the resource's provenance record is matched
+    against every registered resource with the same name (verbatim,
+    case-sensitive) and the same digest (already stored lowercase), and the
+    candidates are intersected with the resource's transitive dependency
+    closure (the root itself never counts). Nothing is recorded and no
+    stored result is kept: every query recomputes from the current stores.
+    """
+
+    if method != "GET":
+        return _error(
+            start_response,
+            "405 Method Not Allowed",
+            "method_not_allowed",
+            f"Method {method} is not allowed for this path.",
+            allowed="GET",
+        )
+
+    id_error = _validate_path_id(raw_id)
+    if id_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", id_error
+        )
+
+    # Read-only: a declared non-empty (or malformed) body is a bad request
+    # without consulting any business data. An omitted header and an
+    # explicit zero length are accepted as an empty body.
+    body_error = _bodyless_request_error(environ)
+    if body_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", body_error
+        )
+
+    # No parameters whatsoever are accepted.
+    query_error = _query_parameter_error(environ)
+    if query_error is not None:
+        return _error(
+            start_response, "400 Bad Request", "invalid_request", query_error
+        )
+
+    if store.get(raw_id) is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "resource_not_found",
+            "No resource exists with the requested id.",
+        )
+
+    record = provenance_store.get(raw_id)
+    if record is None:
+        return _error(
+            start_response,
+            "404 Not Found",
+            "provenance_not_found",
+            "No provenance is registered for this resource.",
+        )
+
+    # The transitive dependency closure of the checked resource; the root
+    # itself is excluded by the dependency query, so a material that only
+    # matches the checked resource stays outside the closure.
+    closure = frozenset(store.list_dependencies(raw_id))
+    resources = store.list_all()
+
+    checks: list[dict[str, object]] = []
+    resolved_count = 0
+    for material in record.materials:
+        # Candidates unfold in resource registration order; names match
+        # verbatim (case-sensitive, untrimmed) and digests are already
+        # stored and compared in lowercase.
+        candidates = [
+            resource.id
+            for resource in resources
+            if resource.name == material.name
+            and resource.digest == material.digest
+        ]
+        dependency_matches = [
+            candidate for candidate in candidates if candidate in closure
+        ]
+        if not candidates:
+            status = "missing"
+        elif not dependency_matches:
+            status = "outside_dependency"
+        elif len(dependency_matches) == 1:
+            status = "resolved"
+            resolved_count += 1
+        else:
+            status = "ambiguous"
+        checks.append(
+            {
+                "name": material.name,
+                "digest": material.digest,
+                "status": status,
+                "candidates": candidates,
+                "dependency_matches": dependency_matches,
+            }
+        )
+
+    return _json_response(
+        start_response,
+        "200 OK",
+        {
+            "id": raw_id,
+            "all_resolved": resolved_count == len(record.materials),
+            "material_count": len(record.materials),
+            "resolved_count": resolved_count,
+            "materials": checks,
+        },
+        trailing_newline=True,
+    )
+
+
 def _handle_policies_post(
     environ: dict[str, Any], raw_id: str, start_response: StartResponse
 ) -> Iterable[bytes]:
@@ -10095,6 +10213,10 @@ def application(
                 return _handle_provenance(
                     method, environ, head, start_response
                 )
+            if separator and tail == "provenance/materials":
+                return _handle_provenance_materials(
+                    method, environ, head, start_response
+                )
             if separator and tail == "policies":
                 return _handle_policies(
                     method, environ, head, start_response
@@ -10337,6 +10459,15 @@ def application(
                     method,
                     environ,
                     suffix[: -len("/provenance")],
+                    start_response,
+                )
+            if separator and suffix.endswith("/provenance/materials"):
+                # Fallback for a separator inside the id segment so the
+                # handler rejects it without computing any cross-check.
+                return _handle_provenance_materials(
+                    method,
+                    environ,
+                    suffix[: -len("/provenance/materials")],
                     start_response,
                 )
             if separator and suffix.endswith("/policies"):
